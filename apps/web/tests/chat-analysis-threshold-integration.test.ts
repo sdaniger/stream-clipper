@@ -35,7 +35,7 @@ test('real analyzeChatEntries: high-baseline stream now produces candidates', ()
 
   assert.equal(result.summary.analyzedMessages, entries.length);
   assert.ok(result.candidates.length > 0, 'should find at least one candidate in high-baseline stream with real spikes');
-  assert.ok(result.candidates.length <= 6, 'should not exceed MAX_CANDIDATES (6)');
+  assert.ok(result.candidates.length <= 24, 'should not exceed MAX_CANDIDATES (24)');
 });
 
 test('real analyzeChatEntries: low-activity stream still catches bursts', () => {

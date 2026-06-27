@@ -56,7 +56,7 @@ type CandidateWindow = {
 const WINDOW_SECONDS = 30;
 const CONTEXT_BEFORE_SECONDS = 25;
 const CONTEXT_AFTER_SECONDS = 45;
-const MAX_CANDIDATES = 6;
+const MAX_CANDIDATES = 24;
 
 const reactionRules: Record<Exclude<ReactionKind, "general">, RegExp[]> = {
   laughter: [/草+/, /w{2,}/i, /ｗ{2,}/, /笑+/, /爆笑/, /lol/i, /lmao/i, /haha/i, /ハハ/],

@@ -93,7 +93,7 @@ export async function runArchiveAutoAnalysis(
   onProgress?: (event: ArchiveProgressEvent) => void
 ): Promise<ArchiveAutoAnalyzeResult> {
   const url = validateArchiveUrl(input.url);
-  const maxCandidates = clampInteger(input.maxCandidates ?? 3, 1, 6);
+  const maxCandidates = clampInteger(input.maxCandidates ?? 6, 1, 24);
   const clipMode = input.clipMode ?? "copy";
   const shouldTranscribe = input.transcribe !== false;
   const shouldGeneratePackages = input.generatePackages !== false;
