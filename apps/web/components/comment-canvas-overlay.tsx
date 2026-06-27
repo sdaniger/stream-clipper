@@ -3,8 +3,7 @@
 import { useEffect, useRef } from "react";
 import {
   getActiveCommentPosition,
-  getCommentY,
-  prepareOverlayComments
+  getCommentY
 } from "@/lib/comment-overlay";
 import type { CommentOverlayItem, CommentOverlaySettings } from "@/types/comment-overlay";
 
@@ -89,10 +88,12 @@ export function CommentCanvasOverlay({ comments, currentTime, duration, settings
       return;
     }
 
-    const preparedComments = prepareOverlayComments(state.comments, state.settings, height);
+    // Comments are pre-filtered (pipeline applies density/URL/long/repeated filters).
+    // Use them directly — no need to run prepareOverlayComments per frame.
+    const renderComments = state.comments;
     const renderTime = state.playing ? internalTimeRef.current : state.currentTime;
 
-    for (const comment of preparedComments) {
+    for (const comment of renderComments) {
       const fontSize = comment.size;
       context.font = `700 ${fontSize}px "Noto Sans JP", system-ui, sans-serif`;
       const text = state.settings.hideUserNames || !comment.userId ? comment.text : `${comment.userId}: ${comment.text}`;

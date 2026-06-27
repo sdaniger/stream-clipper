@@ -178,6 +178,13 @@ export type ClipCandidate = {
     weight?: number;
     category?: string;
   }>;
+  /** LLM evaluation results (summary + interestingness). */
+  llmEvaluation?: {
+    summary: string;
+    highlights: string[];
+    interestingness: number;
+    reason: string;
+  };
   representativeComments: RepresentativeComment[];
   detectionReasons: DetectionReason[];
   warnings: CandidateWarning[];

@@ -4,8 +4,8 @@ import type { CommentExportBundle, CommentExportPayload, CommentOverlayCategory,
 
 export const defaultCommentOverlaySettings: CommentOverlaySettings = {
   enabled: true,
-  density: "high",
-  syncOffsetSeconds: -4,
+  density: "danmaku",
+  syncOffsetSeconds: 0,
   displayArea: "full",
   fontSize: "medium",
   colorMode: "white",
@@ -156,9 +156,11 @@ export function generateCommentOverlayItemsFromChat(
     const absSeconds = entry.timestamp_seconds ?? 0;
     if (absSeconds < clipStartSeconds || absSeconds > clipEndSeconds) continue;
 
-    // sync offset (in seconds): user can shift the whole danmaku stream
-    const relativeSeconds = absSeconds - clipStartSeconds + settings.syncOffsetSeconds;
-    if (relativeSeconds < 0) continue;
+    // sync offset: shift the whole danmaku stream. Clamp early
+    // messages to 0 instead of dropping them — a syncOffset of -4
+    // means "show this message a bit earlier," not "delete it."
+    let relativeSeconds = absSeconds - clipStartSeconds + settings.syncOffsetSeconds;
+    if (relativeSeconds < 0) relativeSeconds = 0;
 
     if (settings.filterUrls && /(https?:\/\/|www\.)/i.test(text)) continue;
     if (settings.filterLongComments && text.length > 40) continue;
@@ -222,7 +224,10 @@ export function prepareOverlayComments(
   canvasHeight: number
 ): CommentOverlayItem[] {
   const fontSize = commentFontSizes[settings.fontSize];
-  const filtered = applyCommentFilters(comments, settings).filter((comment, index) => passesDensity(index, settings.density));
+  // Density is already applied in generateCommentOverlayItemsFromChat.
+  // Only re-apply content filters (URL / long / repeated) as a safety net
+  // for comments coming from the fallback synthetic generator.
+  const filtered = applyCommentFilters(comments, settings);
   const lanes = Math.max(1, Math.floor(getDisplayArea(canvasHeight, settings.displayArea).height / Math.max(fontSize + 8, 1)));
   const laneAvailability = Array.from({ length: lanes }, () => 0);
 
@@ -324,7 +329,7 @@ export function createCommentExportPayload({
 }): CommentExportBundle {
   const exportComments = prepareOverlayComments(comments, settings, height).map((comment) => ({
     ...comment,
-    time: roundTime(comment.time + settings.syncOffsetSeconds),
+    time: roundTime(comment.time),
     duration: roundTime(comment.duration)
   })).filter((comment) => comment.time + comment.duration >= 0 && comment.time <= duration);
 

@@ -664,6 +664,14 @@ function SimpleCandidateCard({
               </div>
             )}
 
+            {/* LLM evaluation */}
+            {hasTranscription && (
+              <LlmEvaluationBox
+                candidate={candidate}
+                onEvaluated={(evaluation) => onUpdate({ ...candidate, llmEvaluation: evaluation })}
+              />
+            )}
+
             {/* warnings */}
             {candidate.warnings.length > 0 && (
               <div>
@@ -862,6 +870,107 @@ function BurnButton({
         {isLoading ? "生成中..." : "コメント付き生成"}
       </button>
       {error && <p className="mt-1 text-[0.6rem] leading-4 text-rose-300">{error}</p>}
+    </div>
+  );
+}
+
+// ── LLM evaluation box ──
+
+function LlmEvaluationBox({
+  candidate,
+  onEvaluated
+}: {
+  candidate: ClipCandidate;
+  onEvaluated: (evaluation: NonNullable<ClipCandidate["llmEvaluation"]>) => void;
+}) {
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [statusChecked, setStatusChecked] = useState<boolean | null>(null);
+
+  // Check LLM availability on mount
+  useEffect(() => {
+    fetch("/api/transcription/summarize")
+      .then((r) => r.json())
+      .then((d) => setStatusChecked(d.available === true))
+      .catch(() => setStatusChecked(false));
+  }, []);
+
+  // Already evaluated
+  if (candidate.llmEvaluation) {
+    const eval_ = candidate.llmEvaluation;
+    return (
+      <div>
+        <p className="mb-1.5 text-xs font-semibold uppercase tracking-[0.2em] text-amber-100/70">
+          AI 評価 · {eval_.interestingness}/100
+        </p>
+        <div className="rounded-xl border border-amber-300/25 bg-amber-400/10 p-3 space-y-2">
+          <p className="text-xs leading-5 text-amber-100/90">{eval_.summary}</p>
+          {eval_.highlights.length > 0 && (
+            <div className="space-y-1">
+              {eval_.highlights.map((h, i) => (
+                <p key={i} className="text-[0.65rem] leading-4 text-amber-100/70">▸ {h}</p>
+              ))}
+            </div>
+          )}
+          <p className="text-[0.65rem] leading-4 text-amber-100/50">{eval_.reason}</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Not yet checked
+  if (statusChecked === null) {
+    return (
+      <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3 text-xs text-slate-500">
+        確認中...
+      </div>
+    );
+  }
+
+  // LLM not available
+  if (!statusChecked) {
+    return (
+      <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3 text-xs text-slate-500">
+        LLM API 未設定 · .env に LLM_API_KEY を追加すると AI 評価が使えます
+      </div>
+    );
+  }
+
+  const handleEvaluate = async () => {
+    if (!candidate.transcription) return;
+    setIsLoading(true);
+    setError(null);
+    try {
+      const response = await fetch("/api/transcription/summarize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          segments: candidate.transcription.segments
+        })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data?.error ?? "LLM evaluation failed");
+      onEvaluated(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "LLM error");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={handleEvaluate}
+        disabled={isLoading}
+        className="w-full rounded-xl border border-amber-200/40 bg-amber-300/10 px-3 py-2 text-xs font-semibold text-amber-50 transition hover:bg-amber-300/20 disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        {isLoading ? "AI 評価中..." : "✨ AI に面白さを評価させる"}
+      </button>
+      {error && (
+        <p className="mt-1 text-[0.6rem] leading-4 text-rose-300">{error}</p>
+      )}
     </div>
   );
 }
