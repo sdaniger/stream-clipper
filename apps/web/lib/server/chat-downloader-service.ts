@@ -58,7 +58,7 @@ export async function fetchChatWithChatDownloader(input: FetchChatDownloaderInpu
   }
 
   const maxMessages = clampInteger(input.maxMessages ?? 5000, 1, 50000);
-  const args = ["--message_groups", "messages", "--max_messages", maxMessages.toString(), "--output", "-", url];
+  const args = ["--message_groups", "messages", "--max_messages", maxMessages.toString(), "--output", "-", "--interruptible_retry", "False", "--retry_timeout", "5", url];
 
   await assertChatDownloaderInstalled();
 
@@ -268,13 +268,13 @@ function extractChatDownloaderError(error: unknown): string {
   // Filter stderr: remove Python traceback lines, termios noise, and blank lines
   const relevantLines = (stderr + "\n" + stdout)
     .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
     .filter((line) => !/^Traceback/.test(line))
     .filter((line) => !/^  File /.test(line))
     .filter((line) => !/^  /.test(line))
-    .filter((line) => !/termios\.error/.test(line))
-    .filter((line) => !/Inappropriate ioctl/.test(line));
+    .filter((line) => !/termios/.test(line))
+    .filter((line) => !/Inappropriate ioctl/.test(line))
+    .map((line) => line.trim())
+    .filter(Boolean);
 
   const cleaned = relevantLines.slice(-5).join("; ");
 
