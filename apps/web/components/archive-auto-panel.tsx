@@ -276,8 +276,14 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
                 <p className="mb-3 text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">{t("archive.pipelineProgress")}</p>
                 <div className="space-y-2">
                   {stages.map((stage) => (
-                    <div key={stage.id} className="flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-black/15 px-3 py-2">
-                      <div className="min-w-0 flex-1">
+                    <div key={stage.id} className={cn(
+                      "flex items-center justify-between gap-3 rounded-2xl border px-3 py-2 relative overflow-hidden",
+                      stage.status === "running" ? "border-cyan-300/15 bg-cyan-900/10" : "border-white/10 bg-black/15"
+                    )}>
+                      {stage.status === "running" && (
+                        <div className="absolute inset-0 -translate-x-full animate-[shimmer_2s_infinite] bg-gradient-to-r from-transparent via-cyan-300/5 to-transparent" />
+                      )}
+                      <div className="min-w-0 flex-1 relative">
                         <span className="text-sm text-slate-200">{t(stage.labelKey)}</span>
                         {stage.detail && <p className="mt-0.5 truncate text-xs text-slate-400">{stage.detail}</p>}
                       </div>

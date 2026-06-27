@@ -112,11 +112,12 @@ export async function runArchiveAutoAnalysis(
   emitProgress({ stage: "download", status: "done", message: `Downloaded ${downloadedVideo.filename}` });
 
   emitProgress({ stage: "chat", status: "running", message: "Fetching chat..." });
+  const maxChatMsgs = input.maxMessages ?? 5000;
   const fetchedChat = await fetchChatWithChatDownloader({
     url,
     maxMessages: input.maxMessages,
     onProgress: (count) => {
-      emitProgress({ stage: "chat", status: "running", message: `Fetching chat... ${count} messages` });
+      emitProgress({ stage: "chat", status: "running", message: `Fetching chat... ${count} / ${maxChatMsgs} messages` });
     }
   });
   emitProgress({ stage: "chat", status: "done", message: `Fetched ${fetchedChat.normalizedMessages.length} messages` });
