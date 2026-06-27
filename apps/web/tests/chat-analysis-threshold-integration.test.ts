@@ -6,6 +6,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { analyzeChatEntries, type ChatLogEntry } from '../lib/chat-analysis';
 
+// Suppress the [chat-analysis] debug log inside this test (it's noisy in TAP output).
+process.env.NODE_ENV = "test";
+
 function makeEntriesForBucket(startSec: number, count: number, msg = "草草草"): ChatLogEntry[] {
   return Array.from({ length: count }, (_, i) => ({
     timestamp_seconds: startSec + i % 30,

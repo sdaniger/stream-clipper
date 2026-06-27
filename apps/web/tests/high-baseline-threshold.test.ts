@@ -7,8 +7,11 @@
  * threshold would balloon to 130+ msg/30s, requiring 260+ msg/min spikes
  * to trigger — which essentially never happens in real streams.
  *
- * The NEW logic uses the 90th percentile of bucket counts, which auto-adapts
- * to any chat density.
+ * The NEW logic uses the 85th percentile of bucket counts (top 15% of
+ * activity windows), which auto-adapts to any chat density. 85th was chosen
+ * over 90th to be more inclusive: downstream `mergeHighlightedBuckets`
+ * already de-duplicates adjacent highlights into single candidate windows,
+ * so the extra 5% rarely produces additional user-visible candidates.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -36,11 +39,11 @@ type Bucket = { entries: { message: string }[]; signalScore: number };
 function computeThresholds(buckets: Bucket[]) {
   const counts = buckets.map((b) => b.entries.length);
   const sortedCounts = [...counts].sort((a, b) => a - b);
-  const p90Index = Math.floor(sortedCounts.length * 0.9);
-  const volumeThreshold = Math.max(4, sortedCounts[p90Index] ?? 0);
+  const p85Index = Math.floor(sortedCounts.length * 0.85);
+  const volumeThreshold = Math.max(4, sortedCounts[p85Index] ?? 0);
   const sortedSignals = buckets.map((b) => b.signalScore).sort((a, b) => a - b);
-  const p90SignalIndex = Math.floor(sortedSignals.length * 0.9);
-  const reactionThreshold = Math.max(10, sortedSignals[p90SignalIndex] ?? 0);
+  const p85SignalIndex = Math.floor(sortedSignals.length * 0.85);
+  const reactionThreshold = Math.max(10, sortedSignals[p85SignalIndex] ?? 0);
   return { volumeThreshold, reactionThreshold };
 }
 
@@ -83,10 +86,7 @@ test('regression: high-baseline stream with 28K messages no longer returns 0 can
   const oldT = oldThreshold(buckets);
   const { volumeThreshold: newT } = computeThresholds(buckets);
 
-  // OLD threshold: would be ~130+ msg/30s, both spikes (200, 250) would still
-  // be caught because they're extreme. But for many real streams the
-  // threshold is unreachable — that's the bug.
-  console.log(`  High-baseline: total=${totalMessages} msgs, OLD threshold=${oldT.toFixed(1)}, NEW threshold=${newT}`);
+  console.log(`  High-baseline: total=${totalMessages} msgs, OLD threshold=${oldT.toFixed(1)}, NEW (p85) threshold=${newT}`);
 
   // NEW threshold should be much lower and reachable
   assert.ok(newT < 100, `new threshold should be below 100, got ${newT}`);
@@ -105,7 +105,7 @@ test('regression: low-activity stream still catches small spikes', () => {
   assert.ok(totalMessages < 1000, 'should have low message count');
 
   const { volumeThreshold: newT } = computeThresholds(buckets);
-  console.log(`  Low-activity: total=${totalMessages} msgs, NEW threshold=${newT}`);
+  console.log(`  Low-activity: total=${totalMessages} msgs, NEW (p85) threshold=${newT}`);
 
   // The minimum is 4, so a spike of 15 will easily exceed it
   const spike100 = buckets[100].entries.length;
@@ -121,10 +121,10 @@ test('percentile threshold auto-adapts to distribution', () => {
   buckets[200] = { entries: Array.from({ length: 50 }, () => ({ message: "w" })), signalScore: 100 };
 
   const { volumeThreshold: newT } = computeThresholds(buckets);
-  console.log(`  Moderate: NEW threshold=${newT}, spike bucket size=${buckets[200].entries.length}`);
+  console.log(`  Moderate: NEW (p85) threshold=${newT}, spike bucket size=${buckets[200].entries.length}`);
 
-  // Should be roughly the 90th percentile (around 13-15)
-  assert.ok(newT >= 10, `moderate stream threshold should be >= 10, got ${newT}`);
+  // Should be roughly the 85th percentile (around 12-15)
+  assert.ok(newT >= 8, `moderate stream threshold should be >= 8, got ${newT}`);
   assert.ok(newT <= 20, `moderate stream threshold should be <= 20, got ${newT}`);
   assert.ok(buckets[200].entries.length >= newT, 'spike should be caught');
 });
@@ -138,8 +138,28 @@ test('minimum threshold of 4 prevents detection collapse on mostly-empty streams
   buckets[100] = { entries: Array.from({ length: 3 }, () => ({ message: "草" })), signalScore: 6 };
 
   const { volumeThreshold: newT } = computeThresholds(buckets);
-  console.log(`  Mostly-empty: NEW threshold=${newT}`);
+  console.log(`  Mostly-empty: NEW (p85) threshold=${newT}`);
 
-  // p90 would be 0 but min is 4, so 3-msg spike won't trigger (correct: too small to be a highlight)
+  // p85 would be 0 but min is 4, so 3-msg spike won't trigger (correct: too small to be a highlight)
   assert.equal(newT, 4, 'minimum should be 4 for mostly-empty streams');
+});
+
+test('85th percentile is more inclusive than 90th (top 15% vs top 10%)', () => {
+  // Stream with 100 buckets: count of buckets >= 85th vs 90th threshold
+  const buckets: Bucket[] = new Array(100).fill(0).map((_, i) => ({
+    entries: Array.from({ length: i + 1 }, () => ({ message: "w" })),
+    signalScore: i + 1
+  }));
+  const counts = buckets.map((b) => b.entries.length);
+
+  const p85 = counts[Math.floor(counts.length * 0.85)];
+  const p90 = counts[Math.floor(counts.length * 0.9)];
+
+  const p85Highlights = counts.filter((c) => c >= p85).length;
+  const p90Highlights = counts.filter((c) => c >= p90).length;
+
+  console.log(`  100 evenly-increasing buckets: p85=${p85} (${p85Highlights} highlighted), p90=${p90} (${p90Highlights} highlighted)`);
+
+  // 85th percentile should highlight at least as many buckets as 90th
+  assert.ok(p85Highlights >= p90Highlights, 'p85 should be at least as inclusive as p90');
 });

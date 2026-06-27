@@ -141,25 +141,41 @@ export function analyzeChatEntries(entries: ChatLogEntry[], idPrefix = `chat-${D
   const baselinePerMinute = Math.round(median(counts) * (60 / WINDOW_SECONDS));
   const peakPerMinute = Math.round(Math.max(...counts) * (60 / WINDOW_SECONDS));
 
-  // Percentile-based threshold: highlights the top ~10% of activity windows
-  // relative to the whole stream. This auto-adapts to any chat density —
-  // high-activity streams (e.g. 28K messages) no longer require impossible
-  // 250+ msg/30s spikes to be detected, while quiet streams still catch
-  // any reasonable burst of activity.
+  // Percentile-based threshold: highlights the top ~15% of activity windows
+  // (85th percentile) relative to the whole stream. This auto-adapts to any
+  // chat density — high-activity streams (e.g. 28K messages) no longer
+  // require impossible 250+ msg/30s spikes to be detected, while quiet
+  // streams still catch any reasonable burst of activity. 85th percentile
+  // (vs 90th) was chosen to be more inclusive since downstream clustering
+  // (`mergeHighlightedBuckets`) already de-duplicates adjacent highlights
+  // into single candidate windows, so 15% of buckets quickly collapses into
+  // 3-6 candidate windows.
   const sortedCounts = [...counts].sort((a, b) => a - b);
-  const p90Index = Math.floor(sortedCounts.length * 0.9);
-  const volumeThreshold = Math.max(4, sortedCounts[p90Index] ?? 0);
+  const p85Index = Math.floor(sortedCounts.length * 0.85);
+  const volumeThreshold = Math.max(4, sortedCounts[p85Index] ?? 0);
   const sortedSignals = buckets
     .map((bucket) => bucket.signalScore)
     .sort((a, b) => a - b);
-  const p90SignalIndex = Math.floor(sortedSignals.length * 0.9);
-  const reactionThreshold = Math.max(10, sortedSignals[p90SignalIndex] ?? 0);
+  const p85SignalIndex = Math.floor(sortedSignals.length * 0.85);
+  const reactionThreshold = Math.max(10, sortedSignals[p85SignalIndex] ?? 0);
 
   const highlightedBuckets = buckets.filter((bucket) => {
     const hasVolumeSpike = bucket.entries.length >= volumeThreshold;
     const hasReactionSpike = bucket.signalScore >= reactionThreshold && bucket.entries.length >= 4;
     return hasVolumeSpike || hasReactionSpike;
   });
+
+  // DEBUG (temporary): log threshold so we can verify the new logic in
+  // production without redeploying. Remove after the 0-candidate regression
+  // is fully diagnosed.
+  if (process.env.NODE_ENV !== "test" && typeof console !== "undefined") {
+    console.log(
+      `[chat-analysis] buckets=${buckets.length} messages=${normalizedEntries.length} ` +
+        `p85=${sortedCounts[p85Index]} volumeThreshold=${volumeThreshold} ` +
+        `p85Signal=${sortedSignals[p85SignalIndex]} reactionThreshold=${reactionThreshold} ` +
+        `highlighted=${highlightedBuckets.length}`
+    );
+  }
 
   if (highlightedBuckets.length === 0) {
     return {
