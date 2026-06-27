@@ -88,9 +88,14 @@ export async function fetchChatWithChatDownloader(input: FetchChatDownloaderInpu
   const pythonScript = [
     "from chat_downloader import ChatDownloader",
     "import json, sys",
-    `chat = ChatDownloader().get_chat(${safeUrl}, message_groups=['messages'], max_messages=${maxMessages}, interruptible_retry=False, retry_timeout=5)`,
-    "for message in chat:",
-    "    print(json.dumps(message, default=str))"
+    "try:",
+    `    chat = ChatDownloader().get_chat(${safeUrl}, message_groups=['messages'], max_messages=${maxMessages}, interruptible_retry=False, retry_timeout=5)`,
+    "    for message in chat:",
+    "        print(json.dumps(message, default=str))",
+    "except Exception as _cd_e:",
+    "    _cd_msg = str(_cd_e).replace(chr(10), ' ').strip()",
+    "    print(f'{type(_cd_e).__name__}: {_cd_msg}', file=sys.stderr)",
+    "    sys.exit(1)"
   ].join("\n");
 
   const { stdout, stderr } = await spawnPythonWithProgress(pythonScript, maxMessages, input.onProgress);
