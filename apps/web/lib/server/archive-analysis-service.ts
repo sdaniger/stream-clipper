@@ -113,16 +113,32 @@ export async function runArchiveAutoAnalysis(
 
   emitProgress({ stage: "chat", status: "running", message: "Fetching chat..." });
   const maxChatMsgs = input.maxMessages ?? 5000;
-  const fetchedChat = await fetchChatWithChatDownloader({
-    url,
-    maxMessages: input.maxMessages,
-    onProgress: (count) => {
-      emitProgress({ stage: "chat", status: "running", message: `Fetching chat... ${count} / ${maxChatMsgs} messages` });
-    }
-  });
-  emitProgress({ stage: "chat", status: "done", message: `Fetched ${fetchedChat.normalizedMessages.length} messages` });
+  let fetchedChat: FetchChatDownloaderResult;
+  try {
+    fetchedChat = await fetchChatWithChatDownloader({
+      url,
+      maxMessages: input.maxMessages,
+      onProgress: (count) => {
+        emitProgress({ stage: "chat", status: "running", message: `Fetching chat... ${count} / ${maxChatMsgs} messages` });
+      }
+    });
+    emitProgress({ stage: "chat", status: "done", message: `Fetched ${fetchedChat.normalizedMessages.length} messages` });
+  } catch (chatError) {
+    const chatErrMsg = chatError instanceof Error ? chatError.message : "Unknown chat-downloader error";
+    warnings.push({ stage: "chat", message: chatErrMsg });
+    emitProgress({ stage: "chat", status: "error", message: chatErrMsg });
+    fetchedChat = {
+      source: "chat_downloader" as const,
+      url,
+      normalizedMessages: [],
+      normalizedPath: "",
+      rawPath: "",
+      commandPreview: "",
+      fetchedAt: new Date().toISOString()
+    };
+  }
 
-  emitProgress({ stage: "analysis", status: "running", message: "Running rule-based chat analysis..." });
+  emitProgress({ stage: "analysis", status: "running", message: fetchedChat.normalizedMessages.length > 0 ? "Running rule-based chat analysis..." : "Skipping analysis (no chat data)..." });
   const analysis = analyzeChatEntries(fetchedChat.normalizedMessages, buildCandidatePrefix(metadata));
   const sourceCandidates = enrichArchiveCandidates(analysis.candidates, metadata).slice(0, maxCandidates);
   emitProgress({ stage: "analysis", status: "done", message: `Found ${sourceCandidates.length} candidates` });
