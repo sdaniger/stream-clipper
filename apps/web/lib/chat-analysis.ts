@@ -140,10 +140,24 @@ export function analyzeChatEntries(entries: ChatLogEntry[], idPrefix = `chat-${D
   const counts = buckets.map((bucket) => bucket.entries.length);
   const baselinePerMinute = Math.round(median(counts) * (60 / WINDOW_SECONDS));
   const peakPerMinute = Math.round(Math.max(...counts) * (60 / WINDOW_SECONDS));
-  const threshold = Math.max(6, median(counts) * 2.2, average(counts) * 1.6);
+
+  // Percentile-based threshold: highlights the top ~10% of activity windows
+  // relative to the whole stream. This auto-adapts to any chat density —
+  // high-activity streams (e.g. 28K messages) no longer require impossible
+  // 250+ msg/30s spikes to be detected, while quiet streams still catch
+  // any reasonable burst of activity.
+  const sortedCounts = [...counts].sort((a, b) => a - b);
+  const p90Index = Math.floor(sortedCounts.length * 0.9);
+  const volumeThreshold = Math.max(4, sortedCounts[p90Index] ?? 0);
+  const sortedSignals = buckets
+    .map((bucket) => bucket.signalScore)
+    .sort((a, b) => a - b);
+  const p90SignalIndex = Math.floor(sortedSignals.length * 0.9);
+  const reactionThreshold = Math.max(10, sortedSignals[p90SignalIndex] ?? 0);
+
   const highlightedBuckets = buckets.filter((bucket) => {
-    const hasVolumeSpike = bucket.entries.length >= threshold;
-    const hasReactionSpike = bucket.signalScore >= Math.max(10, threshold * 1.35) && bucket.entries.length >= 4;
+    const hasVolumeSpike = bucket.entries.length >= volumeThreshold;
+    const hasReactionSpike = bucket.signalScore >= reactionThreshold && bucket.entries.length >= 4;
     return hasVolumeSpike || hasReactionSpike;
   });
 
