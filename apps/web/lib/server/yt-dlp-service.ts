@@ -1,10 +1,17 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { getMediaPaths, probeVideo } from "@/lib/server/media-service";
 
 const execFileAsync = promisify(execFile);
+
+export type YtDlpProgressEvent = {
+  percent: number;
+  speed: string;
+  eta: string;
+  total: string;
+};
 
 export type VideoSourceType = "local_file" | "yt_dlp_url" | "future_platform_api" | "future_manual_upload";
 
@@ -15,6 +22,7 @@ export type YtDlpMetadataInput = {
 export type YtDlpDownloadInput = {
   url: string;
   format?: string;
+  onProgress?: (progress: YtDlpProgressEvent) => void;
 };
 
 export type YtDlpMetadata = {
@@ -102,13 +110,9 @@ export async function downloadVideoWithYtDlp(input: YtDlpDownloadInput): Promise
     url
   ];
 
-  let stdout = "";
-  try {
-    const result = await execFileAsync("yt-dlp", args, { timeout: 60 * 60_000, maxBuffer: 64 * 1024 * 1024 });
-    stdout = result.stdout;
-  } catch (error) {
-    throw new Error(`yt-dlp download failed: ${formatExecError(error)}. Install it with \`pip install yt-dlp\` and confirm \`yt-dlp\` is on PATH.`);
-  }
+  const stdout = input.onProgress
+    ? await spawnYtDlpWithProgress(args, input.onProgress)
+    : await execYtDlp(args);
 
   const absoluteDownloadedPath = resolveDownloadedFilePath(stdout, paths.inputDownloadsDir);
   const downloadedStat = await stat(absoluteDownloadedPath);
@@ -137,6 +141,85 @@ export async function downloadVideoWithYtDlp(input: YtDlpDownloadInput): Promise
     metadata,
     probe
   };
+}
+
+async function execYtDlp(args: string[]): Promise<string> {
+  try {
+    const result = await execFileAsync("yt-dlp", args, { timeout: 60 * 60_000, maxBuffer: 64 * 1024 * 1024 });
+    return result.stdout;
+  } catch (error) {
+    throw new Error(`yt-dlp download failed: ${formatExecError(error)}. Install it with \`pip install yt-dlp\` and confirm \`yt-dlp\` is on PATH.`);
+  }
+}
+
+async function spawnYtDlpWithProgress(args: string[], onProgress: (p: YtDlpProgressEvent) => void): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("yt-dlp", args, {
+      timeout: 60 * 60_000,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, TERM: "dumb", PYTHONUNBUFFERED: "1" }
+    });
+
+    let stdout = "";
+    let stderrBuffer = "";
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      reject(new Error("yt-dlp timed out after 60 minutes."));
+    }, 60 * 60_000);
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+
+    const PROGRESS_RE = /\[download\]\s+([\d.]+)%\s+of\s+~?(\S+)\s+at\s+(\S+)\s+ETA\s+(\S+)/;
+
+    child.stderr?.on("data", (chunk: Buffer) => {
+      const text = chunk.toString();
+      // yt-dlp uses \r to update the same line; split by both \r and \n
+      const lines = (stderrBuffer + text).split(/\r?\n|\r/);
+      stderrBuffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (line.includes("[download]") && line.includes("%")) {
+          const match = line.match(PROGRESS_RE);
+          if (match) {
+            try {
+              onProgress({
+                percent: parseFloat(match[1]),
+                total: match[2],
+                speed: match[3],
+                eta: match[4]
+              });
+            } catch {
+              // client disconnected
+            }
+          }
+        }
+      }
+    });
+
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (timedOut) return;
+      if (code === 0) {
+        resolve(stdout);
+      } else {
+        const tail = (stderrBuffer || "").trim().slice(-1000);
+        reject(new Error(`yt-dlp exited with code ${code}${tail ? `: ${tail}` : ""}`));
+      }
+    });
+
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        reject(new Error("yt-dlp is not installed. Install it with \`pip install yt-dlp\`."));
+      } else {
+        reject(err);
+      }
+    });
+  });
 }
 
 function validateUrl(value: string) {

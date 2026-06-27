@@ -1,17 +1,15 @@
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
 import type { ChatLogEntry } from "@/lib/chat-analysis";
 import { getMediaPaths } from "@/lib/server/media-service";
-
-const execFileAsync = promisify(execFile);
 
 export type ChatSourceType = "manual_json" | "chat_downloader" | "imported_file" | "future_twitch_live_capture" | "future_platform_api";
 
 export type FetchChatDownloaderInput = {
   url: string;
   maxMessages?: number;
+  onProgress?: (messageCount: number) => void;
 };
 
 export type FetchChatDownloaderResult = {
@@ -40,12 +38,7 @@ type RawChatDownloaderMessage = {
   };
 };
 
-/** Options that suppress terminal-dependent chat_downloader features. */
-const FETCH_OPTS = {
-  timeout: 5 * 60_000,
-  maxBuffer: 64 * 1024 * 1024,
-  env: { ...process.env, TERM: "dumb", PAGER: "cat", FORCE_COLOR: "0" }
-};
+const PYTHON_TIMEOUT = 5 * 60_000;
 
 export async function fetchChatWithChatDownloader(input: FetchChatDownloaderInput): Promise<FetchChatDownloaderResult> {
   const url = input.url.trim();
@@ -58,27 +51,17 @@ export async function fetchChatWithChatDownloader(input: FetchChatDownloaderInpu
   }
 
   const maxMessages = clampInteger(input.maxMessages ?? 5000, 1, 50000);
-  const args = ["--message_groups", "messages", "--max_messages", maxMessages.toString(), "--output", "-", "--interruptible_retry", "False", "--retry_timeout", "5", url];
+  const safeUrl = JSON.stringify(url);
 
-  await assertChatDownloaderInstalled();
+  const pythonScript = [
+    "from chat_downloader import ChatDownloader",
+    "import json, sys",
+    `chat = ChatDownloader().get_chat(${safeUrl}, message_groups=['messages'], max_messages=${maxMessages}, interruptible_retry=False, retry_timeout=5)`,
+    "for message in chat:",
+    "    print(json.dumps(message, default=str))"
+  ].join("\n");
 
-  let stdout = "";
-  let partialResult = false;
-
-  try {
-    const result = await execFileAsync("chat_downloader", args, FETCH_OPTS);
-    stdout = result.stdout;
-  } catch (error) {
-    const execError = error as { stdout?: string; stderr?: string };
-
-    if (typeof execError.stdout === "string" && execError.stdout.trim().length > 0) {
-      stdout = execError.stdout;
-      partialResult = true;
-    } else {
-      const detail = extractChatDownloaderError(error);
-      throw new Error(`chat-downloader failed while fetching chat: ${detail}`);
-    }
-  }
+  const { stdout, stderr } = await spawnPythonWithProgress(pythonScript, maxMessages, input.onProgress);
 
   const rawMessages = parseJsonLines(stdout, url);
   const normalizedMessages = rawMessages
@@ -87,7 +70,8 @@ export async function fetchChatWithChatDownloader(input: FetchChatDownloaderInpu
     .sort((a, b) => a.timestamp_seconds - b.timestamp_seconds);
 
   if (normalizedMessages.length === 0) {
-    throw new Error("chat-downloader returned no usable chat messages.");
+    const stderrHint = stderr.trim() ? ` Stderr: ${stderr.trim().slice(0, 500)}` : "";
+    throw new Error(`chat-downloader returned no usable chat messages.${stderrHint}`);
   }
 
   const paths = getMediaPaths();
@@ -108,21 +92,74 @@ export async function fetchChatWithChatDownloader(input: FetchChatDownloaderInpu
     normalizedMessages,
     normalizedPath,
     rawPath,
-    commandPreview: `chat_downloader ${args.map(shellQuote).join(" ")}`,
-    fetchedAt: new Date().toISOString(),
-    ...(partialResult ? { partialResult: true } : {})
+    commandPreview: `python3 -c "from chat_downloader ..."`,
+    fetchedAt: new Date().toISOString()
   };
 }
 
-async function assertChatDownloaderInstalled(): Promise<void> {
-  try {
-    await execFileAsync("chat_downloader", ["--version"], { timeout: 10_000, env: { ...process.env, TERM: "dumb" } });
-  } catch {
-    throw new Error(
-      "chat_downloader is not installed on the server PATH. " +
-      "Install it with `pip install chat-downloader` and restart the dev server."
-    );
-  }
+async function spawnPythonWithProgress(
+  script: string,
+  maxMessages: number,
+  onProgress?: (count: number) => void
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("python3", ["-u", "-c", script], {
+      timeout: PYTHON_TIMEOUT,
+      env: { ...process.env, TERM: "dumb", PAGER: "cat", PYTHONUNBUFFERED: "1" },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let lineCount = 0;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      reject(new Error("chat-downloader (Python) timed out after 5 minutes."));
+    }, PYTHON_TIMEOUT);
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+      if (!onProgress) return;
+      const text = chunk.toString();
+      for (let i = 0; i < text.length; i++) {
+        if (text[i] === "\n") lineCount++;
+      }
+      try {
+        onProgress(Math.min(lineCount, maxMessages));
+      } catch {
+        // client disconnected
+      }
+    });
+
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (timedOut) return;
+      if (code === 0 || (code === null && stdout.trim().length > 0)) {
+        resolve({ stdout, stderr });
+      } else {
+        const detail = stderr.trim().slice(-1000) || `exit code ${code}`;
+        reject(new Error(`chat-downloader failed: ${detail}`));
+      }
+    });
+
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        reject(new Error(
+          "python3 is required to fetch chat. Install Python 3 and \`pip install chat-downloader\`."
+        ));
+      } else {
+        reject(err);
+      }
+    });
+  });
 }
 
 function parseJsonLines(stdout: string, sourceUrl: string): RawChatDownloaderMessage[] {
@@ -256,43 +293,4 @@ function clampInteger(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, Math.round(value)));
 }
 
-function extractChatDownloaderError(error: unknown): string {
-  if (!error || typeof error !== "object") {
-    return "Unknown error";
-  }
 
-  const execError = error as { stderr?: unknown; stdout?: unknown; message?: unknown; code?: unknown };
-  const stderr = typeof execError.stderr === "string" ? execError.stderr : "";
-  const stdout = typeof execError.stdout === "string" ? execError.stdout : "";
-
-  // Filter stderr: remove Python traceback lines, termios noise, and blank lines
-  const relevantLines = (stderr + "\n" + stdout)
-    .split(/\r?\n/)
-    .filter((line) => !/^Traceback/.test(line))
-    .filter((line) => !/^  File /.test(line))
-    .filter((line) => !/^  /.test(line))
-    .filter((line) => !/termios/.test(line))
-    .filter((line) => !/Inappropriate ioctl/.test(line))
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  const cleaned = relevantLines.slice(-5).join("; ");
-
-  if (cleaned) {
-    return cleaned;
-  }
-
-  if (typeof execError.message === "string") {
-    return execError.message.replace(/^Command failed:\s*/i, "").slice(0, 500);
-  }
-
-  return "Unknown chat-downloader error";
-}
-
-function shellQuote(value: string) {
-  if (/^[a-zA-Z0-9_./:=+-]+$/.test(value)) {
-    return value;
-  }
-
-  return `'${value.replaceAll("'", "'\\''")}'`;
-}

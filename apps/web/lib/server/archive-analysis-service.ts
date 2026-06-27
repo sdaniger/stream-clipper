@@ -101,12 +101,24 @@ export async function runArchiveAutoAnalysis(
   const metadata = await extractYtDlpMetadata({ url });
   emitProgress({ stage: "metadata", status: "done", message: `${metadata.title ?? metadata.url}` });
 
-  emitProgress({ stage: "download", status: "running", message: `Downloading video (format: ${input.ytDlpFormat ?? "best"})...` });
-  const downloadedVideo = await downloadVideoWithYtDlp({ url, format: input.ytDlpFormat });
+  emitProgress({ stage: "download", status: "running", message: `Downloading video...` });
+  const downloadedVideo = await downloadVideoWithYtDlp({
+    url,
+    format: input.ytDlpFormat,
+    onProgress: (p) => {
+      emitProgress({ stage: "download", status: "running", message: `Downloading... ${p.percent.toFixed(1)}% at ${p.speed}, ETA ${p.eta}` });
+    }
+  });
   emitProgress({ stage: "download", status: "done", message: `Downloaded ${downloadedVideo.filename}` });
 
-  emitProgress({ stage: "chat", status: "running", message: "Fetching chat messages via chat-downloader..." });
-  const fetchedChat = await fetchChatWithChatDownloader({ url, maxMessages: input.maxMessages });
+  emitProgress({ stage: "chat", status: "running", message: "Fetching chat..." });
+  const fetchedChat = await fetchChatWithChatDownloader({
+    url,
+    maxMessages: input.maxMessages,
+    onProgress: (count) => {
+      emitProgress({ stage: "chat", status: "running", message: `Fetching chat... ${count} messages` });
+    }
+  });
   emitProgress({ stage: "chat", status: "done", message: `Fetched ${fetchedChat.normalizedMessages.length} messages` });
 
   emitProgress({ stage: "analysis", status: "running", message: "Running rule-based chat analysis..." });
