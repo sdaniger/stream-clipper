@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 
 type ClipCandidateCardProps = {
   candidate: ClipCandidate;
+  isNew?: boolean;
   onPreview: (candidateId: string) => void;
   onStatusChange: (candidateId: string, status: CandidateStatus) => void;
 };
@@ -27,7 +28,7 @@ const cardStatusTone: Record<CandidateStatus, string> = {
   rejected: "border-rose-300/20 opacity-75 grayscale-[0.25]"
 };
 
-export function ClipCandidateCard({ candidate, onPreview, onStatusChange }: ClipCandidateCardProps) {
+export function ClipCandidateCard({ candidate, isNew, onPreview, onStatusChange }: ClipCandidateCardProps) {
   const { t } = useI18n();
   const selectedVariant = candidate.variants.find((variant) => variant.id === candidate.selectedVariantId) ?? candidate.variants[0];
   const postingAssets = extractPostingAssets(candidate, selectedVariant);
@@ -35,7 +36,12 @@ export function ClipCandidateCard({ candidate, onPreview, onStatusChange }: Clip
   const thumbnailHint = postingAssets.thumbnailCandidates[0];
 
   return (
-    <article className={cn("glass-panel group flex min-h-full flex-col overflow-hidden rounded-3xl transition duration-300 hover:-translate-y-1 hover:border-white/20 hover:shadow-glow", cardStatusTone[candidate.status])}>
+    <article className={cn("glass-panel group relative flex min-h-full flex-col overflow-hidden rounded-3xl transition duration-300 hover:-translate-y-1 hover:border-white/20 hover:shadow-glow", cardStatusTone[candidate.status], isNew && "ring-2 ring-cyan-300/60 animate-pulse")}>
+      {isNew && (
+        <span className="absolute right-3 top-3 z-20 rounded-full border border-cyan-200/60 bg-cyan-300/20 px-2 py-0.5 text-[0.65rem] font-bold uppercase tracking-wider text-cyan-50 shadow-[0_0_18px_rgba(103,232,249,0.4)]">
+          {t("common.newBadge")}
+        </span>
+      )}
       <button
         type="button"
         onClick={() => onPreview(candidate.id)}

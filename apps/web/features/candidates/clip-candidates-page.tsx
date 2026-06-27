@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArchiveAutoPanel } from "@/components/archive-auto-panel";
 import { ChatJsonImportPanel } from "@/components/chat-json-import-panel";
 import { ClipCandidateCard } from "@/components/clip-candidate-card";
@@ -8,6 +8,7 @@ import { ClipCandidatePreviewModal } from "@/components/clip-candidate-preview-m
 import { LanguageSwitcher } from "@/components/language-switcher";
 import { LocalVideoPanel } from "@/components/local-video-panel";
 import { useI18n } from "@/lib/i18n";
+import { clearCandidates, loadCandidates, saveCandidates } from "@/lib/candidate-storage";
 import type { ChatAnalysisSummary, ChatImportMode } from "@/lib/chat-analysis";
 import type {
   CandidateStatus,
@@ -20,7 +21,7 @@ import type {
   GeneratedClipReference,
   ThumbnailCandidateReference
 } from "@/lib/mock-candidates";
-import { mockCandidates } from "@/lib/mock-candidates";
+
 import { cn } from "@/lib/utils";
 
 type StatusFilter = "all" | CandidateStatus;
@@ -34,12 +35,49 @@ const filters: StatusFilter[] = [
 
 export function ClipCandidatesPage() {
   const { t } = useI18n();
-  const [candidates, setCandidates] = useState<ClipCandidate[]>(mockCandidates);
+  // Restore previously-saved candidates on first render.
+  const [candidates, setCandidates] = useState<ClipCandidate[]>(() => {
+    const saved = loadCandidates();
+    return saved && saved.length > 0 ? saved : [];
+  });
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [minimumConfidence, setMinimumConfidence] = useState(60);
   const [search, setSearch] = useState("");
   const [previewId, setPreviewId] = useState<string | null>(null);
   const [lastImportSummary, setLastImportSummary] = useState<ChatAnalysisSummary | null>(null);
+  const [newCandidateIds, setNewCandidateIds] = useState<Set<string>>(new Set());
+  const [savedAt, setSavedAt] = useState<string | null>(null);
+  const [storageError, setStorageError] = useState<string | null>(null);
+  const newBadgesTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Debounced auto-save: write to localStorage 600ms after the last change.
+  // This avoids JSON.stringify on every keystroke during notes editing.
+  useEffect(() => {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      const result = saveCandidates(candidates);
+      if (result.ok) {
+        setSavedAt(result.savedAt);
+        setStorageError(null);
+      } else {
+        setStorageError(result.reason);
+      }
+    }, 600);
+    return () => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    };
+  }, [candidates]);
+
+  // Auto-clear "new" badges after 6 seconds.
+  useEffect(() => {
+    if (newCandidateIds.size === 0) return;
+    if (newBadgesTimerRef.current) clearTimeout(newBadgesTimerRef.current);
+    newBadgesTimerRef.current = setTimeout(() => setNewCandidateIds(new Set()), 6000);
+    return () => {
+      if (newBadgesTimerRef.current) clearTimeout(newBadgesTimerRef.current);
+    };
+  }, [newCandidateIds]);
 
   const normalizedSearch = search.trim().toLowerCase();
   const filteredCandidates = candidates.filter((candidate) => {
@@ -181,9 +219,23 @@ export function ClipCandidatesPage() {
   function importCandidates(importedCandidates: ClipCandidate[], mode: ChatImportMode, summary: ChatAnalysisSummary) {
     setCandidates((current) => (mode === "replace" ? importedCandidates : [...importedCandidates, ...current]));
     setLastImportSummary(summary);
-    setPreviewId(importedCandidates[0]?.id ?? null);
+    setNewCandidateIds(new Set(importedCandidates.map((c) => c.id)));
     setStatusFilter("all");
     setMinimumConfidence(0);
+  }
+
+  function handleResetSavedCandidates() {
+    const confirmed = typeof window === "undefined" || window.confirm(t("review.resetConfirm"));
+    if (!confirmed) return;
+    clearCandidates();
+    setSavedAt(null);
+    setStorageError(null);
+    setCandidates([]);
+    setLastImportSummary(null);
+    setNewCandidateIds(new Set());
+    setPreviewId(null);
+    setStatusFilter("all");
+    setMinimumConfidence(60);
   }
 
   function countForFilter(filter: StatusFilter) {
@@ -279,6 +331,34 @@ export function ClipCandidatesPage() {
               {t("review.lastImport", { candidates: lastImportSummary.candidateCount, messages: lastImportSummary.analyzedMessages.toLocaleString(), peak: lastImportSummary.peakPerMinute })}
             </div>
           )}
+
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-400">
+            <div className="flex items-center gap-2">
+              <span
+                className={cn(
+                  "inline-block h-2 w-2 rounded-full",
+                  storageError
+                    ? "bg-rose-400"
+                    : savedAt
+                      ? "bg-emerald-400"
+                      : "bg-slate-500"
+                )}
+                aria-hidden="true"
+              />
+              {storageError
+                ? <span className="text-rose-200">{t("review.persistError", { reason: storageError })}</span>
+                : savedAt
+                  ? <span>{t("review.persistedAt", { time: new Date(savedAt).toLocaleTimeString() })}</span>
+                  : <span>{t("review.persistPending")}</span>}
+            </div>
+            <button
+              type="button"
+              onClick={handleResetSavedCandidates}
+              className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-xs font-semibold text-slate-300 transition hover:border-rose-300/40 hover:bg-rose-400/10 hover:text-rose-100"
+            >
+              {t("review.resetSavedCandidates")}
+            </button>
+          </div>
         </section>
 
         <section>
@@ -295,6 +375,7 @@ export function ClipCandidatesPage() {
                 <ClipCandidateCard
                   key={candidate.id}
                   candidate={candidate}
+                  isNew={newCandidateIds.has(candidate.id)}
                   onPreview={setPreviewId}
                   onStatusChange={updateStatus}
                 />

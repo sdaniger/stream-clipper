@@ -1,15 +1,17 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useI18n } from "@/lib/i18n";
 import type { ChatAnalysisSummary, ChatImportMode } from "@/lib/chat-analysis";
 import type { ClipCandidate } from "@/lib/mock-candidates";
 import { cn } from "@/lib/utils";
 
+type StageStatus = "pending" | "running" | "done" | "error" | "cancelled";
+
 type PipelineStage = {
   id: string;
   labelKey: string;
-  status: "pending" | "running" | "done" | "error";
+  status: StageStatus;
   detail?: string;
 };
 
@@ -50,27 +52,111 @@ const initialStages: PipelineStage[] = [
   { id: "package", labelKey: "archive.stagePackage", status: "pending" }
 ];
 
+const MAX_MESSAGES_PRESETS = [0, 1000, 5000, 10000, 20000, 50000];
+
 export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
   const { t } = useI18n();
   const [isExpanded, setIsExpanded] = useState(false);
   const [url, setUrl] = useState("");
   const [maxCandidates, setMaxCandidates] = useState(3);
+  const [maxMessages, setMaxMessages] = useState(0);
   const [clipMode, setClipMode] = useState<"copy" | "reencode">("copy");
   const [transcribe, setTranscribe] = useState(true);
   const [generatePackages, setGeneratePackages] = useState(true);
+  const [autoOpenModal, setAutoOpenModal] = useState(true);
   const [isRunning, setIsRunning] = useState(false);
   const [stages, setStages] = useState<PipelineStage[]>(initialStages);
   const [result, setResult] = useState<ArchiveAutoResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const startedAtRef = useRef<number | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
-  function updateStage(id: string, status: PipelineStage["status"], detail?: string) {
-    setStages((current) => current.map((stage) => (stage.id === id ? { ...stage, status, detail } : stage)));
+  useEffect(() => {
+    if (!isRunning) {
+      setElapsedSeconds(0);
+      return;
+    }
+    const started = Date.now();
+    startedAtRef.current = started;
+    const timer = setInterval(() => {
+      setElapsedSeconds(Math.round((Date.now() - started) / 1000));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [isRunning]);
+
+  // Throttled stage updater so high-frequency chat progress events (~33/sec
+  // on a popular VOD) don't flood React with hundreds of renders per minute.
+  // The throttled callback drops intermediate detail strings and only keeps
+  // the latest one per 200ms window per stage.
+  const stageUpdateTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const pendingDetailsRef = useRef<Map<string, string | undefined>>(new Map());
+
+  /**
+   * Translate raw browser/Node error messages into user-friendly text.
+   * SSE connections can drop silently mid-stream and surface as a bare
+   * TypeError("network error") or "fetch failed"; we want to give the
+   * user actionable text instead of the raw DOMException name.
+   */
+  function humanizeError(raw: string): string {
+    const lowered = raw.toLowerCase();
+    if (!raw) return t("archive.unknownError");
+    if (
+      lowered.includes("networkerror") ||
+      lowered === "network error" ||
+      lowered.includes("fetch failed") ||
+      lowered.includes("failed to fetch") ||
+      lowered.includes("connection reset") ||
+      lowered.includes("connection aborted") ||
+      lowered.includes("econnreset") ||
+      lowered.includes("etimedout") ||
+      lowered.includes("enetunreach")
+    ) {
+      return t("archive.networkError");
+    }
+    if (lowered.includes("aborted") || lowered.includes("aborterror")) {
+      return t("archive.pipelineCancelled");
+    }
+    if (lowered.includes("timeout") || lowered.includes("timed out")) {
+      return t("archive.pipelineTimeout");
+    }
+    return raw;
+  }
+
+  function updateStage(id: string, status: StageStatus, detail?: string) {
+    // Always flush terminal statuses immediately so the user sees them.
+    if (status === "done" || status === "error" || status === "cancelled") {
+      const existingTimer = stageUpdateTimersRef.current.get(id);
+      if (existingTimer) {
+        clearTimeout(existingTimer);
+        stageUpdateTimersRef.current.delete(id);
+      }
+      pendingDetailsRef.current.delete(id);
+      setStages((current) => current.map((stage) => (stage.id === id ? { ...stage, status, detail } : stage)));
+      return;
+    }
+    pendingDetailsRef.current.set(id, detail);
+    if (stageUpdateTimersRef.current.has(id)) return;
+    const timer = setTimeout(() => {
+      const latestDetail = pendingDetailsRef.current.get(id);
+      pendingDetailsRef.current.delete(id);
+      stageUpdateTimersRef.current.delete(id);
+      setStages((current) => current.map((stage) => (stage.id === id ? { ...stage, status, detail: latestDetail } : stage)));
+    }, 200);
+    stageUpdateTimersRef.current.set(id, timer);
   }
 
   function resetPipeline() {
     setStages(initialStages.map((stage) => ({ ...stage, status: "pending" as const })));
     setResult(null);
     setError(null);
+    setWarning(null);
+  }
+
+  function handleCancel() {
+    abortControllerRef.current?.abort();
   }
 
   async function handleRun() {
@@ -88,6 +174,10 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
 
     setIsRunning(true);
     resetPipeline();
+    setCopied(false);
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
 
     try {
       const response = await fetch("/api/archive/analyze/stream", {
@@ -96,20 +186,22 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
         body: JSON.stringify({
           url: trimmedUrl,
           maxCandidates,
+          maxMessages,
           clipMode,
           transcribe,
           generatePackages
-        })
+        }),
+        signal: controller.signal
       });
 
-      if (!response.ok) {
+      if (!response.ok || !response.body) {
         const errorText = await response.text();
         const errorMatch = errorText.match(/data: (.+)/);
         const errorData = errorMatch ? JSON.parse(errorMatch[1]) : null;
         throw new Error(errorData?.error ?? t("archive.pipelineFailed"));
       }
 
-      const reader = response.body!.getReader();
+      const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
 
@@ -128,10 +220,17 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
       function handleSSEEvent(event: string, rawData: string) {
         if (event === "progress") {
           const progress = JSON.parse(rawData) as { stage: string; status: string; message?: string };
-          updateStage(progress.stage, progress.status as PipelineStage["status"], progress.message);
+          updateStage(progress.stage, progress.status as StageStatus, progress.message);
         } else if (event === "complete") {
           const pipelineResult = JSON.parse(rawData) as ArchiveAutoResult;
           setResult(pipelineResult);
+          if (pipelineResult.candidates.length === 0) {
+            setWarning(t("archive.noCandidates"));
+          } else if (pipelineResult.pipelineWarnings.length > 0) {
+            setWarning(t("archive.partialSuccess"));
+          }
+        } else if (event === "cancelled") {
+          setError(t("archive.pipelineCancelled"));
         } else if (event === "error") {
           const errData = JSON.parse(rawData) as { error: string };
           throw new Error(errData.error);
@@ -152,10 +251,19 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
         processLines(buffer.trim().split("\n"));
       }
     } catch (caughtError) {
-      const message = caughtError instanceof Error ? caughtError.message : t("archive.unknownError");
-      setError(message);
+      if (caughtError instanceof DOMException && caughtError.name === "AbortError") {
+        setError(t("archive.pipelineCancelled"));
+      } else {
+        const raw = caughtError instanceof Error ? caughtError.message : "";
+        setError(humanizeError(raw));
+      }
     } finally {
+      // Flush any pending throttled stage updates before the component may
+      // unmount, so terminal statuses aren't lost on quick cancellation.
+      stageUpdateTimersRef.current.forEach((timer) => clearTimeout(timer));
+      stageUpdateTimersRef.current.clear();
       setIsRunning(false);
+      abortControllerRef.current = null;
     }
   }
 
@@ -163,9 +271,27 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
     if (!result) {
       return;
     }
-
     onImport(result.candidates, mode, result.summary);
   }
+
+  function handleRetry() {
+    setError(null);
+    handleRun();
+  }
+
+  async function handleCopyError() {
+    if (!error) return;
+    try {
+      await navigator.clipboard.writeText(error);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // ignore
+    }
+  }
+
+  const completedStages = stages.filter((s) => s.status === "done").length;
+  const progressPct = Math.round((completedStages / stages.length) * 100);
 
   return (
     <section className="glass-panel rounded-3xl p-4 sm:p-5">
@@ -188,7 +314,7 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
         <div className="mt-5 grid gap-5 xl:grid-cols-[minmax(0,1fr)_24rem]">
           <div className="space-y-5">
             <div className="rounded-3xl border border-violet-300/25 bg-violet-400/10 p-4">
-              <div className="grid gap-4 lg:grid-cols-[1fr_0.35fr_0.45fr]">
+              <div className="grid gap-4 lg:grid-cols-[1.4fr_0.35fr_0.35fr_0.45fr]">
                 <label className="block">
                   <span className="mb-2 block text-xs font-semibold uppercase tracking-[0.2em] text-violet-100/75">{t("archive.url")}</span>
                   <input
@@ -198,7 +324,7 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
                       setError(null);
                     }}
                     className="h-11 w-full rounded-2xl border border-white/10 bg-slate-950/60 px-4 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-violet-200/60"
-                    placeholder="https://www.youtube.com/watch?v=..."
+                    placeholder={t("archive.urlPlaceholder")}
                   />
                 </label>
 
@@ -209,12 +335,33 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
                     onChange={(event) => setMaxCandidates(Number(event.target.value))}
                     className="h-11 w-full rounded-2xl border border-white/10 bg-slate-950/60 px-4 text-sm text-slate-100 outline-none focus:border-violet-200/60"
                   >
-                    {[1, 2, 3, 4, 5, 6].map((value) => (
+                    {[1, 2, 3, 4, 5, 6, 8, 10].map((value) => (
                       <option key={value} value={value}>
                         {value}
                       </option>
                     ))}
                   </select>
+                </label>
+
+                <label className="block">
+                  <span className="mb-2 block text-xs font-semibold uppercase tracking-[0.2em] text-violet-100/75">{t("archive.maxMessages")}</span>
+                  <select
+                    value={maxMessages}
+                    onChange={(event) => setMaxMessages(Number(event.target.value))}
+                    className="h-11 w-full rounded-2xl border border-white/10 bg-slate-950/60 px-4 text-sm text-slate-100 outline-none focus:border-violet-200/60"
+                    title={t("archive.maxMessagesHint")}
+                  >
+                    {MAX_MESSAGES_PRESETS.map((value) => (
+                      <option key={value} value={value}>
+                        {value === 0 ? t("archive.unlimited") : value.toLocaleString()}
+                      </option>
+                    ))}
+                  </select>
+                  {maxMessages === 0 && (
+                    <p className="mt-1 text-[0.65rem] leading-4 text-amber-100/80">
+                      {t("archive.maxMessagesHint")}
+                    </p>
+                  )}
                 </label>
 
                 <label className="block">
@@ -230,29 +377,61 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
                 </label>
               </div>
 
-              <div className="mt-3 flex flex-wrap items-center gap-4">
-                <label className="flex items-center gap-2 text-sm text-slate-200">
-                  <input
-                    type="checkbox"
-                    checked={transcribe}
-                    onChange={(event) => setTranscribe(event.target.checked)}
-                    className="h-4 w-4 accent-violet-300"
-                  />
-                  {t("archive.transcribe")}
-                </label>
+              <div className="mt-3 grid gap-3 lg:grid-cols-2">
+                <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-3">
+                  <label className="flex items-start gap-3">
+                    <input
+                      type="checkbox"
+                      checked={transcribe}
+                      onChange={(event) => setTranscribe(event.target.checked)}
+                      className="mt-1 h-4 w-4 accent-fuchsia-300"
+                    />
+                    <div className="min-w-0 flex-1">
+                      <span className="text-sm font-semibold text-slate-100">
+                        {t("archive.transcribe")}
+                      </span>
+                      <p className="mt-0.5 text-[0.7rem] leading-4 text-slate-400">
+                        {transcribe
+                          ? t("archive.transcribeEnabledHint")
+                          : t("archive.transcribeDisabledHint")}
+                      </p>
+                    </div>
+                  </label>
+                </div>
 
+                <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-3">
+                  <label className="flex items-start gap-3">
+                    <input
+                      type="checkbox"
+                      checked={generatePackages}
+                      onChange={(event) => setGeneratePackages(event.target.checked)}
+                      className="mt-1 h-4 w-4 accent-violet-300"
+                    />
+                    <div className="min-w-0 flex-1">
+                      <span className="text-sm font-semibold text-slate-100">
+                        {t("archive.generatePackages")}
+                      </span>
+                      <p className="mt-0.5 text-[0.7rem] leading-4 text-slate-400">
+                        {t("archive.generatePackagesHint")}
+                      </p>
+                    </div>
+                  </label>
+                </div>
+              </div>
+
+              <div className="mt-3">
                 <label className="flex items-center gap-2 text-sm text-slate-200">
                   <input
                     type="checkbox"
-                    checked={generatePackages}
-                    onChange={(event) => setGeneratePackages(event.target.checked)}
+                    checked={autoOpenModal}
+                    onChange={(event) => setAutoOpenModal(event.target.checked)}
                     className="h-4 w-4 accent-violet-300"
                   />
-                  {t("archive.generatePackages")}
+                  {t("archive.autoOpenModal")}
                 </label>
               </div>
 
-              <div className="mt-4">
+              <div className="mt-4 flex flex-wrap items-center gap-2">
                 <button
                   type="button"
                   onClick={handleRun}
@@ -261,19 +440,59 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
                 >
                   {isRunning ? t("archive.running") : t("archive.run")}
                 </button>
+                {isRunning && (
+                  <button
+                    type="button"
+                    onClick={handleCancel}
+                    className="rounded-2xl border border-rose-300/40 bg-rose-400/10 px-4 py-3 text-sm font-semibold text-rose-100 transition hover:bg-rose-400/20"
+                  >
+                    {t("archive.cancel")}
+                  </button>
+                )}
+                {error && !isRunning && (
+                  <button
+                    type="button"
+                    onClick={handleRetry}
+                    className="rounded-2xl border border-cyan-200/40 bg-cyan-400/10 px-4 py-3 text-sm font-semibold text-cyan-100 transition hover:bg-cyan-400/20"
+                  >
+                    {t("archive.retry")}
+                  </button>
+                )}
               </div>
 
               {error && (
                 <div className="mt-4 rounded-2xl border border-rose-300/35 bg-rose-400/10 p-3 text-sm leading-6 text-rose-100">
-                  <p className="font-semibold">{t("archive.pipelineFailed")}</p>
-                  <p className="mt-1">{error}</p>
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="font-semibold">{t("archive.pipelineFailed")}</p>
+                    <button
+                      type="button"
+                      onClick={handleCopyError}
+                      className="rounded-full border border-rose-200/40 px-2.5 py-0.5 text-xs font-semibold text-rose-50 transition hover:bg-rose-400/20"
+                    >
+                      {copied ? t("archive.copied") : t("archive.copyError")}
+                    </button>
+                  </div>
+                  <p className="mt-1 break-words text-xs leading-5">{error}</p>
                 </div>
               )}
             </div>
 
             {isRunning && (
               <div className="rounded-3xl border border-white/10 bg-white/[0.04] p-4">
-                <p className="mb-3 text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">{t("archive.pipelineProgress")}</p>
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">{t("archive.pipelineProgress")}</p>
+                  <div className="flex items-center gap-3 text-xs text-slate-300">
+                    <span className="font-mono">{progressPct}%</span>
+                    <span className="text-slate-500">·</span>
+                    <span className="font-mono">{Math.floor(elapsedSeconds / 60)}:{String(elapsedSeconds % 60).padStart(2, "0")}</span>
+                  </div>
+                </div>
+                <div className="mb-4 h-2 overflow-hidden rounded-full bg-white/10">
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-violet-300 via-cyan-200 to-emerald-200 transition-all duration-300"
+                    style={{ width: `${progressPct}%` }}
+                  />
+                </div>
                 <div className="space-y-2">
                   {stages.map((stage) => (
                     <div key={stage.id} className={cn(
@@ -293,12 +512,14 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
                           stage.status === "done" && "bg-emerald-300/15 text-emerald-100",
                           stage.status === "running" && "bg-cyan-300/15 text-cyan-100",
                           stage.status === "error" && "bg-rose-300/15 text-rose-100",
+                          stage.status === "cancelled" && "bg-amber-300/15 text-amber-100",
                           stage.status === "pending" && "bg-white/5 text-slate-500"
                         )}
                       >
                         {stage.status === "done" && t("archive.done")}
                         {stage.status === "running" && t("archive.runningStage")}
                         {stage.status === "error" && t("archive.errorStage")}
+                        {stage.status === "cancelled" && t("archive.cancelledStage")}
                         {stage.status === "pending" && t("archive.pendingStage")}
                       </span>
                     </div>
@@ -329,10 +550,23 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
                   </div>
                 </div>
 
+                {warning && (
+                  <div className="mt-3 rounded-2xl border border-amber-300/30 bg-amber-400/10 p-2.5 text-xs leading-5 text-amber-100">
+                    {warning}
+                  </div>
+                )}
+
                 <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                   <MiniStat label={t("archive.candidatesGenerated")} value={result.candidates.length.toString()} />
                   <MiniStat label={t("archive.clipsGenerated")} value={result.generatedClipCount.toString()} />
-                  <MiniStat label={t("archive.transcribed")} value={result.transcribedCount.toString()} />
+                  <MiniStat
+                    label={t("archive.transcribed")}
+                    value={
+                      transcribe
+                        ? result.transcribedCount.toString()
+                        : `0 (${t("archive.transcribeSkipped")})`
+                    }
+                  />
                   <MiniStat label={t("archive.packages")} value={result.packageCount.toString()} />
                 </div>
 
@@ -388,5 +622,3 @@ function MiniStat({ label, value }: { label: string; value: string }) {
     </div>
   );
 }
-
-

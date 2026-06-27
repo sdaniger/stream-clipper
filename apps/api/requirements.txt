@@ -2,6 +2,4 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 faster-whisper==1.1.1
 chat-downloader
-EOF
-
 

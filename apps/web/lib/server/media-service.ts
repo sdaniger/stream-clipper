@@ -69,6 +69,7 @@ export type GenerateClipInput = {
   duration: string;
   mode?: "copy" | "reencode";
   onProgress?: FfmpegProgressCallback;
+  signal?: AbortSignal;
 };
 
 export type GeneratedClip = {
@@ -288,7 +289,7 @@ export async function generateClip(input: GenerateClipInput): Promise<GeneratedC
   const args = buildFfmpegArgs(absoluteInputPath, outputPath, startSeconds, durationSeconds, mode);
 
   if (input.onProgress) {
-    await runFfmpegWithProgress(args, durationSeconds, input.onProgress);
+    await runFfmpegWithProgress(args, durationSeconds, input.onProgress, input.signal);
   } else {
     await execFileAsync("ffmpeg", args, { timeout: 10 * 60_000, maxBuffer: 16 * 1024 * 1024 });
   }
@@ -304,19 +305,39 @@ export async function generateClip(input: GenerateClipInput): Promise<GeneratedC
   };
 }
 
-async function runFfmpegWithProgress(args: string[], durationSeconds: number, onProgress: FfmpegProgressCallback): Promise<void> {
+async function runFfmpegWithProgress(args: string[], durationSeconds: number, onProgress: FfmpegProgressCallback, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     const ffmpegPath = resolveFfmpegPath();
     const child = spawn(ffmpegPath, args, { timeout: 10 * 60_000 });
     let stderrCollector = "";
     let stderrBuffer = "";
     let timedOut = false;
+    let aborted = false;
 
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGTERM");
       reject(new Error("FFmpeg process timed out after 10 minutes."));
     }, 10 * 60_000);
+
+    const onAbort = () => {
+      if (aborted) return;
+      aborted = true;
+      child.kill("SIGTERM");
+      reject(new DOMException("FFmpeg clip was cancelled.", "AbortError"));
+    };
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+    };
 
     child.stderr?.on("data", (chunk: Buffer) => {
       const text = chunk.toString();
@@ -360,8 +381,8 @@ async function runFfmpegWithProgress(args: string[], durationSeconds: number, on
     });
 
     child.on("close", (code) => {
-      clearTimeout(timer);
-      if (timedOut) return;
+      cleanup();
+      if (timedOut || aborted) return;
       if (code === 0) {
         resolve();
       } else {
@@ -371,7 +392,8 @@ async function runFfmpegWithProgress(args: string[], durationSeconds: number, on
     });
 
     child.on("error", (err) => {
-      clearTimeout(timer);
+      cleanup();
+      if (aborted) return;
       reject(err);
     });
   });

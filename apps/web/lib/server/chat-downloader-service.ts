@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -41,8 +41,29 @@ export type ChatSourceType = "manual_json" | "chat_downloader" | "imported_file"
 export type FetchChatDownloaderInput = {
   url: string;
   maxMessages?: number;
+  durationSeconds?: number | null;
   onProgress?: (messageCount: number) => void;
+  signal?: AbortSignal;
 };
+
+/** 0 means "as much as Twitch will return within the timeout". This is the
+ *  hard upper bound on a single fetch to keep the pipeline from running
+ *  forever on runaway pagination. 100K messages is more than enough for
+ *  highlight detection on any VOD (a 4-hour stream at 7 msg/sec ≈ 100K). */
+const PRACTICAL_MESSAGE_CAP = 100_000;
+const PYTHON_TIMEOUT = 10 * 60_000;
+
+/**
+ * Returns a sensible default chat limit for the given VOD duration (seconds).
+ * Assumption: popular streams run ~7 msg/sec average, so 1 second of VOD
+ * maps to ~7 messages. We cap the result at PRACTICAL_MESSAGE_CAP and
+ * enforce a minimum of 1000 so short VODs still get useful coverage.
+ */
+export function defaultChatLimitForDuration(durationSeconds: number | null | undefined): number {
+  if (!durationSeconds || durationSeconds <= 0) return 5000;
+  const estimated = Math.ceil(durationSeconds * 7);
+  return Math.max(1000, Math.min(PRACTICAL_MESSAGE_CAP, estimated));
+}
 
 export type FetchChatDownloaderResult = {
   source: ChatSourceType;
@@ -70,8 +91,6 @@ type RawChatDownloaderMessage = {
   };
 };
 
-const PYTHON_TIMEOUT = 5 * 60_000;
-
 export async function fetchChatWithChatDownloader(input: FetchChatDownloaderInput): Promise<FetchChatDownloaderResult> {
   const url = input.url.trim();
   if (!url) {
@@ -79,26 +98,23 @@ export async function fetchChatWithChatDownloader(input: FetchChatDownloaderInpu
   }
 
   if (!/^https?:\/\//i.test(url)) {
-    throw new Error("URL must start with http:// or https://.");
+    throw new Error("URL must start with http:// or https://");
   }
 
-  const maxMessages = clampInteger(input.maxMessages ?? 5000, 1, 50000);
-  const safeUrl = JSON.stringify(url);
+  // 0 (or undefined) means "no client cap" — we still apply a safety ceiling so a runaway
+  // loop can never exhaust disk. The Python script and GQL pagination are bounded by the
+  // wall-clock timeout below.
+  const requested = input.maxMessages ?? 0;
+  const maxMessages =
+    requested <= 0 ? PRACTICAL_MESSAGE_CAP : clampInteger(requested, 1, PRACTICAL_MESSAGE_CAP);
+  const isTwitch = /twitch\.tv/i.test(url);
 
-  const pythonScript = [
-    "from chat_downloader import ChatDownloader",
-    "import json, sys",
-    "try:",
-    `    chat = ChatDownloader().get_chat(${safeUrl}, message_groups=['messages'], max_messages=${maxMessages}, interruptible_retry=False, retry_timeout=5)`,
-    "    for message in chat:",
-    "        print(json.dumps(message, default=str))",
-    "except Exception as _cd_e:",
-    "    _cd_msg = str(_cd_e).replace(chr(10), ' ').strip()",
-    "    print(f'{type(_cd_e).__name__}: {_cd_msg}', file=sys.stderr)",
-    "    sys.exit(1)"
-  ].join("\n");
+  const pythonScript = isTwitch
+    ? buildTwitchScript(url, maxMessages, input.durationSeconds)
+    : buildChatDownloaderScript(url, maxMessages);
 
-  const { stdout, stderr } = await spawnPythonWithProgress(pythonScript, maxMessages, input.onProgress);
+  const pythonPath = isTwitch ? "python3" : await resolveChatDownloaderPython();
+  const { stdout, stderr } = await spawnPythonWithProgress(pythonScript, maxMessages, input.onProgress, pythonPath, input.signal);
 
   const rawMessages = parseJsonLines(stdout, url);
   const normalizedMessages = rawMessages
@@ -124,24 +140,238 @@ export async function fetchChatWithChatDownloader(input: FetchChatDownloaderInpu
   await writeFile(path.join(paths.outputChatLogsDir, normalizedFileName), JSON.stringify(normalizedMessages, null, 2) + "\n", "utf8");
 
   return {
-    source: "chat_downloader",
+    source: isTwitch ? "future_platform_api" : "chat_downloader",
     url,
     normalizedMessages,
     normalizedPath,
     rawPath,
-    commandPreview: `python3 -c "from chat_downloader ..."`,
+    commandPreview: isTwitch ? "Python GQL (std-lib)" : `python3 -c "from chat_downloader ..."`,
     fetchedAt: new Date().toISOString()
   };
 }
 
-async function spawnPythonWithProgress(
+function buildChatDownloaderScript(url: string, maxMessages: number): string {
+  const safeUrl = JSON.stringify(url);
+  return [
+    "from chat_downloader import ChatDownloader",
+    "import json, sys",
+    "try:",
+    `    chat = ChatDownloader().get_chat(${safeUrl}, message_groups=['messages'], max_messages=${maxMessages}, interruptible_retry=False, retry_timeout=5)`,
+    "    for message in chat:",
+    "        print(json.dumps(message, default=str))",
+    "except Exception as _cd_e:",
+    "    _cd_msg = str(_cd_e).replace(chr(10), ' ').strip()",
+    "    print(f'{type(_cd_e).__name__}: {_cd_msg}', file=sys.stderr)",
+    "    sys.exit(1)"
+  ].join("\n");
+}
+
+function buildTwitchScript(url: string, maxMessages: number, durationSeconds?: number | null): string {
+  const safeUrl = JSON.stringify(url);
+  const duration = Math.max(1, Math.round(durationSeconds ?? 0));
+  return (
+`import json, re, sys, time as _time, os, urllib.request, urllib.error
+from http.cookiejar import CookieJar
+
+GQL_URL = "https://gql.twitch.tv/gql"
+CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+HASH_COMMENTS = "b70a3591ff0f4e0313d126c6a1502d79a1c02baebb288227c582044aa76adf6a"
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+DURATION = ${duration}
+
+def extract_vod_id(url):
+    m = re.search(r'/videos?/(\\d+)', url)
+    if m:
+        return m.group(1)
+    m = re.search(r'/([^/]+)/video/(\\d+)', url)
+    if m:
+        return m.group(2)
+    print("Cannot extract VOD ID from URL", file=sys.stderr)
+    sys.exit(1)
+
+def fetch_chat(vod_id, max_messages, timeout_seconds=600):
+    cj = CookieJar()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(cj)
+    )
+    opener.addheaders = [("User-Agent", UA)]
+
+    try:
+        opener.open(urllib.request.Request(
+            "https://www.twitch.tv/videos/" + vod_id,
+            headers={"User-Agent": UA}
+        ), timeout=20)
+    except Exception as e:
+        print(f"Twitch visit: {str(e).strip().replace(chr(10), ' ')}", file=sys.stderr)
+
+    def get_integrity():
+        data = json.dumps({}).encode()
+        req = urllib.request.Request("https://gql.twitch.tv/integrity", data=data)
+        req.add_header("Client-ID", CLIENT_ID)
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Origin", "https://www.twitch.tv")
+        req.add_header("Referer", "https://www.twitch.tv/")
+        with opener.open(req, timeout=15) as resp:
+            result = json.loads(resp.read())
+        token = result.get("token")
+        if not token:
+            raise ValueError("No integrity token in response")
+        return token
+
+    try:
+        integrity_token = get_integrity()
+    except Exception as e:
+        print(f"Integrity token failed: {str(e).strip().replace(chr(10), ' ')}", file=sys.stderr)
+        sys.exit(1)
+
+    def gql_comments(video_id, offset):
+        query = [{
+            "operationName": "VideoCommentsByOffsetOrCursor",
+            "variables": {"videoID": video_id, "contentOffsetSeconds": offset},
+            "extensions": {"persistedQuery": {"version": 1, "sha256Hash": HASH_COMMENTS}}
+        }]
+        data = json.dumps(query).encode()
+        req = urllib.request.Request(GQL_URL, data=data)
+        req.add_header("Content-Type", "text/plain;charset=UTF-8")
+        req.add_header("Client-ID", CLIENT_ID)
+        req.add_header("Client-Integrity", integrity_token)
+        req.add_header("Origin", "https://www.twitch.tv")
+        req.add_header("Referer", "https://www.twitch.tv/")
+        with opener.open(req, timeout=20) as resp:
+            return json.loads(resp.read())
+
+    duration = DURATION
+    if duration <= 0:
+        try:
+            q = {"operationName": "VideoMetadata", "query": "query VideoMetadata($videoID: ID!) { video(id: $videoID) { lengthSeconds } }", "variables": {"videoID": vod_id}}
+            data = json.dumps(q).encode()
+            req = urllib.request.Request(GQL_URL, data=data)
+            req.add_header("Content-Type", "text/plain;charset=UTF-8")
+            req.add_header("Client-ID", CLIENT_ID)
+            req.add_header("Client-Integrity", integrity_token)
+            req.add_header("Origin", "https://www.twitch.tv")
+            req.add_header("Referer", "https://www.twitch.tv/")
+            meta = json.loads(opener.open(req, timeout=15).read())
+            duration = int(meta.get("data", {}).get("video", {}).get("lengthSeconds", 3600))
+        except Exception:
+            duration = 3600
+
+    if duration <= 0:
+        duration = 3600
+
+    segment_count = max(1, min(max_messages // 100, 200))
+    comments_per_segment = max(1, max_messages // segment_count)
+
+    seen_ids = set()
+    total = 0
+    deadline = _time.time() + timeout_seconds
+
+    for seg in range(segment_count):
+        if _time.time() >= deadline:
+            break
+        if total >= max_messages:
+            break
+
+        seg_offset = int(seg * duration / segment_count)
+        remaining = max_messages - total
+        seg_limit = min(comments_per_segment, remaining)
+
+        page_offset = seg_offset
+        seg_fetched = 0
+        stale = 0
+
+        while seg_fetched < seg_limit and total < max_messages:
+            if _time.time() >= deadline:
+                break
+
+            try:
+                resp_data = gql_comments(vod_id, page_offset)
+            except Exception as e:
+                if total > 0:
+                    break
+                print(f"GQL failed: {str(e).strip().replace(chr(10), ' ')}", file=sys.stderr)
+                sys.exit(1)
+
+            if isinstance(resp_data, list):
+                resp_data = resp_data[0]
+            if "errors" in resp_data:
+                if total == 0:
+                    err_msgs = [e.get("message", str(e)) for e in resp_data["errors"]]
+                    print(f"GQL errors: {'; '.join(err_msgs)}", file=sys.stderr)
+                    sys.exit(1)
+                break
+
+            edges = (resp_data.get("data", {}).get("video", {}).get("comments", {}).get("edges") or [])
+            if not edges:
+                stale += 1
+                if stale >= 3:
+                    break
+                page_offset += 30
+                continue
+
+            stale = 0
+            max_os = page_offset
+            for edge in edges:
+                node = edge.get("node")
+                if not node:
+                    continue
+                cid = node.get("id")
+                if cid and cid in seen_ids:
+                    continue
+                if cid:
+                    seen_ids.add(cid)
+
+                ts = node.get("contentOffsetSeconds")
+                if ts is None:
+                    continue
+                try:
+                    ts = round(float(ts), 3)
+                except (TypeError, ValueError):
+                    continue
+
+                commenter = node.get("commenter") or {}
+                user = str(commenter.get("displayName") or commenter.get("login") or "unknown")
+                fragments = node.get("message", {}).get("fragments") or []
+                if not fragments:
+                    continue
+
+                out = {
+                    "message": fragments,
+                    "time_in_seconds": ts,
+                    "author": {"display_name": user, "id": str(commenter.get("id", ""))},
+                    "message_type": "data"
+                }
+                print(json.dumps(out, default=str))
+                total += 1
+                seg_fetched += 1
+                if ts > max_os:
+                    max_os = ts
+                if total >= max_messages:
+                    break
+
+            if seg_fetched < seg_limit:
+                page_offset = int(max_os) + 3
+
+    if total == 0:
+        print("No comments collected", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"collected {total} comments", file=sys.stderr)
+
+fetch_chat(extract_vod_id(${safeUrl}), ${maxMessages})`
+  );
+}
+
+ async function spawnPythonWithProgress(
   script: string,
   maxMessages: number,
-  onProgress?: (count: number) => void
+  onProgress?: (count: number) => void,
+  pythonPath?: string,
+  signal?: AbortSignal
 ): Promise<{ stdout: string; stderr: string }> {
-  const pythonPath = await resolveChatDownloaderPython();
+  const py = pythonPath ?? await resolveChatDownloaderPython();
   return new Promise((resolve, reject) => {
-    const child = spawn(pythonPath, ["-u", "-c", script], {
+    const child = spawn(py, ["-u", "-c", script], {
       timeout: PYTHON_TIMEOUT,
       env: { ...process.env, TERM: "dumb", PAGER: "cat", PYTHONUNBUFFERED: "1" },
       stdio: ["ignore", "pipe", "pipe"]
@@ -150,13 +380,33 @@ async function spawnPythonWithProgress(
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let aborted = false;
     let lineCount = 0;
 
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGTERM");
-      reject(new Error("chat-downloader (Python) timed out after 5 minutes."));
+      reject(new Error(`chat-downloader (Python) timed out after ${Math.round(PYTHON_TIMEOUT / 60_000)} minutes.`));
     }, PYTHON_TIMEOUT);
+
+    const onAbort = () => {
+      if (aborted) return;
+      aborted = true;
+      child.kill("SIGTERM");
+      reject(new DOMException("Chat download was cancelled.", "AbortError"));
+    };
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+    };
 
     child.stdout?.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
@@ -177,8 +427,8 @@ async function spawnPythonWithProgress(
     });
 
     child.on("close", (code) => {
-      clearTimeout(timer);
-      if (timedOut) return;
+      cleanup();
+      if (aborted || timedOut) return;
       if (code === 0 || (code === null && stdout.trim().length > 0)) {
         resolve({ stdout, stderr });
       } else {
@@ -188,10 +438,11 @@ async function spawnPythonWithProgress(
     });
 
     child.on("error", (err) => {
-      clearTimeout(timer);
+      cleanup();
+      if (aborted) return;
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         reject(new Error(
-          `chat-downloader Python (${pythonPath}) not found. Install \`pip install chat-downloader\` or set CHAT_DOWNLOADER_PYTHON env var.`
+          `chat-downloader Python (${py}) not found. Install \`pip install chat-downloader\` or set CHAT_DOWNLOADER_PYTHON env var.`
         ));
       } else {
         reject(err);

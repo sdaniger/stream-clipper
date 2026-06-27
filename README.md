@@ -2,6 +2,33 @@
 
 Frontend mock UI plus local development foundations for chat analysis, FFmpeg clip generation, and faster-whisper transcription.
 
+## Quick start
+
+```bash
+# 1. Verify every dependency is present (and get exact install commands for what's missing)
+./scripts/check-deps.sh
+
+# 2. Install the Node workspace
+npm install
+
+# 3. Start the FastAPI transcription backend (in a separate terminal)
+cd apps/api
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+nohup uvicorn app.main:app --host 127.0.0.1 --port 8000 > /tmp/fastapi.log 2>&1 &
+# (verify)
+curl http://127.0.0.1:8000/api/transcription/health
+
+# 4. Start the web app
+cd ..
+npm run dev
+```
+
+Open `http://localhost:3000`.
+
+If the transcription backend is not running, the archive pipeline will still produce candidates but will print a clear warning per clip ("fetch failed — start the Python FastAPI backend on http://127.0.0.1:8000, or uncheck 'transcribe' in the archive panel").
+
 ## Web App
 
 ```bash

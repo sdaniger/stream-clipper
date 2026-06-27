@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { runArchiveAutoAnalysis, type ArchiveAutoAnalyzeInput } from "@/lib/server/archive-analysis-service";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const maxDuration = 600;
 
 export async function POST(request: Request) {
   try {

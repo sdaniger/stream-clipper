@@ -139,6 +139,74 @@ export function ClipCandidatePreviewModal({
     setGeneratedThumbnails(candidate.thumbnailCandidates ?? []);
   }, [candidate?.id, candidate?.duration, candidate?.peak.offset, candidate?.peak.sparkline.length, candidate?.commentBurnedClip, candidate?.exportPackage, candidate?.thumbnailCandidates]);
 
+  const showComments = previewMode === "comments" || previewMode === "combined";
+
+  const durationSeconds = useMemo(() => {
+    if (!candidate) return 1;
+    const variant = candidate.variants.find((v) => v.id === candidate.selectedVariantId) ?? candidate.variants[0];
+    return Math.max(1, parseTimeToSeconds(variant?.duration ?? candidate.duration));
+  }, [candidate]);
+
+  const overlayComments = useMemo(
+    () => (candidate ? generateCommentOverlayItems(candidate, durationSeconds) : []),
+    [candidate, durationSeconds]
+  );
+
+  const commentExportPayload = useMemo(
+    () =>
+      createCommentExportPayload({
+        candidate: candidate ?? ({
+          id: "",
+          title: "",
+          streamer: "",
+          archiveTitle: "",
+          detectedAt: "00:00",
+          duration: "00:00",
+          confidence: 0,
+          status: "pending",
+          summary: "",
+          whyDetected: [],
+          tags: [],
+          chat: { messages: 0, peakPerMinute: 0, topPhrases: [], sentiment: "" },
+          peak: { offset: "00:00", label: "", intensity: 0, sparkline: [] },
+          transcript: [],
+          transcriptSegments: [],
+          representativeComments: [],
+          detectionReasons: [],
+          warnings: [],
+          notes: { editPlan: "", titleIdea: "", thumbnailIdea: "", uploadText: "" },
+          markers: [],
+          variants: [],
+          selectedVariantId: "",
+          visualTone: ""
+        } as ClipCandidate),
+        comments: overlayComments,
+        settings: { ...commentSettings, enabled: showComments && Boolean(candidate) },
+        duration: durationSeconds
+      }),
+    [candidate, commentSettings, durationSeconds, overlayComments, showComments]
+  );
+
+  const commentsJson = useMemo(() => generateCommentsJson(commentExportPayload), [commentExportPayload]);
+  const commentsAss = useMemo(() => generateScrollingCommentsAss(commentExportPayload), [commentExportPayload]);
+
+  const postingAssets = useMemo(
+    () => {
+      if (!candidate) {
+        return {
+          titleMaterials: [],
+          titleKeywords: [],
+          thumbnailCandidates: [],
+          thumbnailTextIdeas: [],
+          oneLineSummary: ""
+        };
+      }
+      const variant = candidate.variants.find((v) => v.id === candidate.selectedVariantId) ?? candidate.variants[0];
+      return extractPostingAssets(candidate, variant);
+    },
+    [candidate]
+  );
+
   if (!candidate) {
     return null;
   }
@@ -147,25 +215,15 @@ export function ClipCandidatePreviewModal({
   const selectedVariant = candidate.variants.find((variant) => variant.id === candidate.selectedVariantId) ?? candidate.variants[0];
   const generatedClip = candidate.generatedClip;
   const selectedVariantDuration = selectedVariant?.duration ?? candidate.duration;
-  const durationSeconds = Math.max(1, parseTimeToSeconds(selectedVariantDuration));
   const currentMockTime = secondsToTime(
     Math.round((mockTimeIndex / Math.max(candidate.peak.sparkline.length - 1, 1)) * durationSeconds)
   );
   const currentMockSeconds = Math.round((mockTimeIndex / Math.max(candidate.peak.sparkline.length - 1, 1)) * durationSeconds);
-  const showComments = previewMode === "comments" || previewMode === "combined";
   const showSubtitles = previewMode === "subtitles" || previewMode === "combined";
-  const overlayComments = useMemo(() => generateCommentOverlayItems(candidate, durationSeconds), [candidate, durationSeconds]);
-  const commentExportPayload = useMemo(
-    () => createCommentExportPayload({ candidate, comments: overlayComments, settings: { ...commentSettings, enabled: showComments }, duration: durationSeconds }),
-    [candidate, commentSettings, durationSeconds, overlayComments, showComments]
-  );
-  const commentsJson = useMemo(() => generateCommentsJson(commentExportPayload), [commentExportPayload]);
-  const commentsAss = useMemo(() => generateScrollingCommentsAss(commentExportPayload), [commentExportPayload]);
   const sortedMarkers = [...candidate.markers].sort((a, b) => parseTimeToSeconds(a.time) - parseTimeToSeconds(b.time));
   const peakLabel = candidate.chat.peakPerMinute >= 500 ? "弾幕 高" : candidate.chat.peakPerMinute >= 250 ? "弾幕 中" : "弾幕 低";
   const moodLabel = candidate.tags.includes("funny") || candidate.tags.includes("comedy") ? "爆笑" : candidate.tags.includes("wholesome") ? "感動" : "盛り上がり";
   const activeSubtitle = getActiveSubtitle(candidate, currentMockSeconds);
-  const postingAssets = useMemo(() => extractPostingAssets(candidate, selectedVariant), [candidate, selectedVariant]);
 
   function handleAddMarker() {
     const label = newMarkerLabel.trim() || `${markerKindLabels[newMarkerKind]} marker at ${currentMockTime}`;

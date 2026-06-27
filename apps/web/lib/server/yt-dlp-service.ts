@@ -23,6 +23,7 @@ export type YtDlpDownloadInput = {
   url: string;
   format?: string;
   onProgress?: (progress: YtDlpProgressEvent) => void;
+  signal?: AbortSignal;
 };
 
 export type YtDlpMetadata = {
@@ -111,8 +112,8 @@ export async function downloadVideoWithYtDlp(input: YtDlpDownloadInput): Promise
   ];
 
   const stdout = input.onProgress
-    ? await spawnYtDlpWithProgress(args, input.onProgress)
-    : await execYtDlp(args);
+    ? await spawnYtDlpWithProgress(args, input.onProgress, input.signal)
+    : await execYtDlp(args, input.signal);
 
   const absoluteDownloadedPath = resolveDownloadedFilePath(stdout, paths.inputDownloadsDir);
   const downloadedStat = await stat(absoluteDownloadedPath);
@@ -143,16 +144,16 @@ export async function downloadVideoWithYtDlp(input: YtDlpDownloadInput): Promise
   };
 }
 
-async function execYtDlp(args: string[]): Promise<string> {
+async function execYtDlp(args: string[], signal?: AbortSignal): Promise<string> {
   try {
-    const result = await execFileAsync("yt-dlp", args, { timeout: 60 * 60_000, maxBuffer: 64 * 1024 * 1024 });
+    const result = await execFileAsync("yt-dlp", args, { timeout: 60 * 60_000, maxBuffer: 64 * 1024 * 1024, signal });
     return result.stdout;
   } catch (error) {
     throw new Error(`yt-dlp download failed: ${formatExecError(error)}. Install it with \`pip install yt-dlp\` and confirm \`yt-dlp\` is on PATH.`);
   }
 }
 
-async function spawnYtDlpWithProgress(args: string[], onProgress: (p: YtDlpProgressEvent) => void): Promise<string> {
+async function spawnYtDlpWithProgress(args: string[], onProgress: (p: YtDlpProgressEvent) => void, signal?: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn("yt-dlp", args, {
       timeout: 60 * 60_000,
@@ -161,8 +162,10 @@ async function spawnYtDlpWithProgress(args: string[], onProgress: (p: YtDlpProgr
     });
 
     let stdout = "";
+    let stderr = "";
     let stderrBuffer = "";
     let timedOut = false;
+    let aborted = false;
 
     const timer = setTimeout(() => {
       timedOut = true;
@@ -170,21 +173,50 @@ async function spawnYtDlpWithProgress(args: string[], onProgress: (p: YtDlpProgr
       reject(new Error("yt-dlp timed out after 60 minutes."));
     }, 60 * 60_000);
 
-    child.stdout?.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
+    const onAbort = () => {
+      if (aborted) return;
+      aborted = true;
+      child.kill("SIGTERM");
+      reject(new DOMException("yt-dlp download was cancelled.", "AbortError"));
+    };
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
 
-    const PROGRESS_RE = /\[download\]\s+([\d.]+)%\s+of\s+~?(\S+)\s+at\s+(\S+)\s+ETA\s+(\S+)/;
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+    };
 
-    child.stderr?.on("data", (chunk: Buffer) => {
-      const text = chunk.toString();
-      // yt-dlp uses \r to update the same line; split by both \r and \n
-      const lines = (stderrBuffer + text).split(/\r?\n|\r/);
-      stderrBuffer = lines.pop() ?? "";
+    // yt-dlp output: `[download]  12.3% of ~ 100.00MiB at 1.00MiB/s ETA 00:30 (frag 0/402)`
+    // The optional `~` may be followed by a space before the size value, hence `~?\s*`.
+    const PROGRESS_RE = /\[download\]\s+([\d.]+)%\s+of\s+~?\s*(\S+)\s+at\s+(\S+)\s+ETA\s+(\S+)/;
+    // Some yt-dlp versions/options echo the same line to both stdout and stderr; dedupe by signature.
+    const seenSignatures = new Set<string>();
+
+    function processChunk(text: string, isStderr: boolean) {
+      if (isStderr) {
+        // yt-dlp uses \r to update the same line on stderr; split by both \r and \n
+        const lines = (stderrBuffer + text).split(/\r?\n|\r/);
+        stderrBuffer = lines.pop() ?? "";
+        emitProgressLines(lines);
+      } else {
+        emitProgressLines(text.split(/\r?\n|\r/));
+      }
+    }
+
+    function emitProgressLines(lines: string[]) {
       for (const line of lines) {
         if (line.includes("[download]") && line.includes("%")) {
           const match = line.match(PROGRESS_RE);
           if (match) {
+            const signature = `${match[1]}|${match[2]}|${match[3]}|${match[4]}`;
+            if (seenSignatures.has(signature)) continue;
+            seenSignatures.add(signature);
             try {
               onProgress({
                 percent: parseFloat(match[1]),
@@ -198,11 +230,23 @@ async function spawnYtDlpWithProgress(args: string[], onProgress: (p: YtDlpProgr
           }
         }
       }
+    }
+
+    // yt-dlp mixes informational output and progress into both stdout and stderr
+    // depending on version/platform. Listen to both to be safe.
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+      processChunk(chunk.toString(), false);
+    });
+
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+      processChunk(chunk.toString(), true);
     });
 
     child.on("close", (code) => {
-      clearTimeout(timer);
-      if (timedOut) return;
+      cleanup();
+      if (timedOut || aborted) return;
       if (code === 0) {
         resolve(stdout);
       } else {
@@ -212,7 +256,8 @@ async function spawnYtDlpWithProgress(args: string[], onProgress: (p: YtDlpProgr
     });
 
     child.on("error", (err) => {
-      clearTimeout(timer);
+      cleanup();
+      if (aborted) return;
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         reject(new Error("yt-dlp is not installed. Install it with \`pip install yt-dlp\`."));
       } else {

@@ -66,11 +66,11 @@ const reactionRules: Record<Exclude<ReactionKind, "general">, RegExp[]> = {
 };
 
 const reactionLabels: Record<ReactionKind, string> = {
-  laughter: "Laughter burst",
-  surprise: "Surprise spike",
-  praise: "Praise wave",
-  clip: "Clip request spike",
-  general: "Chat activity spike"
+  laughter: "笑いスパイク",
+  surprise: "驚きスパイク",
+  praise: "称賛ウェーブ",
+  clip: "切り抜きリクエスト",
+  general: "チャット盛り上がり"
 };
 
 const reactionTags: Record<ReactionKind, string[]> = {
@@ -121,7 +121,19 @@ export function analyzeChatEntries(entries: ChatLogEntry[], idPrefix = `chat-${D
     .sort((a, b) => a.timestamp_seconds - b.timestamp_seconds);
 
   if (normalizedEntries.length === 0) {
-    throw new Error("No non-empty chat messages were found after parsing.");
+    // Empty input is a valid outcome (no chat or no non-empty messages).
+    // Return a zero-candidate summary so callers can degrade gracefully
+    // instead of crashing the pipeline.
+    return {
+      candidates: [],
+      summary: {
+        inputMessages: entries.length,
+        analyzedMessages: 0,
+        candidateCount: 0,
+        baselinePerMinute: 0,
+        peakPerMinute: 0
+      }
+    };
   }
 
   const buckets = buildBuckets(normalizedEntries);
@@ -282,23 +294,23 @@ function buildCandidateFromWindow(
   return {
     id,
     title: `${reactionLabel} around ${secondsToClock(window.peakBucket.start)}`,
-    streamer: "Imported chat log",
-    archiveTitle: "Chat JSON import",
+    streamer: "チャット JSON 取り込み",
+    archiveTitle: "チャット JSON 取り込み",
     detectedAt: secondsToClock(window.clipStart),
     duration: secondsToClock(durationSeconds),
     confidence,
     status: "pending",
-    summary: `Rule-based chat analysis found ${window.entries.length} messages from ${uniqueAuthors} users around ${secondsToClock(window.start)}-${secondsToClock(window.end)}. Peak activity reached ${peakPerMinute} messages/minute.`,
+    summary: `ルールベース解析: ${secondsToClock(window.start)}-${secondsToClock(window.end)} で ${window.entries.length} 件のメッセージ (${uniqueAuthors} ユーザー) を検出。ピーク時 ${peakPerMinute}/分。`,
     whyDetected: [
-      `Peak chat velocity: ${peakPerMinute}/min`,
-      `${reactionLabel} signals detected`,
-      repeatedPhrases[0] ? `Repeated phrase: ${repeatedPhrases[0]}` : `${uniqueAuthors} unique chatters`
+      `ピーク時のチャット速度: ${peakPerMinute}/分`,
+      `${reactionLabel} を検出`,
+      repeatedPhrases[0] ? `繰り返し語句: ${repeatedPhrases[0]}` : `${uniqueAuthors} 人のユニークユーザー`
     ],
     tags: reactionTags[window.dominantReaction],
     chat: {
       messages: window.entries.length,
       peakPerMinute,
-      topPhrases: repeatedPhrases.length > 0 ? repeatedPhrases : [reactionLabel, "CHAT SPIKE", "REVIEW"],
+      topPhrases: repeatedPhrases.length > 0 ? repeatedPhrases : [reactionLabel, "盛り上がり", "確認"],
       sentiment: reactionLabel
     },
     peak: {
@@ -308,19 +320,19 @@ function buildCandidateFromWindow(
       sparkline
     },
     transcript: [
-      "No transcript imported yet.",
-      "Review the source archive around this chat spike.",
-      "Use representative comments and markers to decide whether this is worth editing."
+      "まだ文字起こしはインポートされていません。",
+      "チャットが盛り上がった付近のソースアーカイブを確認してください。",
+      "代表コメントとマーカーを参考に、編集する価値があるか判断してください。"
     ],
     transcriptSegments: buildTranscriptPlaceholders(window, peakOffsetSeconds),
     representativeComments,
     detectionReasons: buildDetectionReasons(window, baselinePerMinute, globalPeakPerMinute, uniqueAuthors),
     warnings: buildWarnings(window, baselinePerMinute),
     notes: {
-      editPlan: `Review ${secondsToClock(window.clipStart)}-${secondsToClock(window.clipEnd)}. Start with context before the chat spike, then check whether the ${reactionLabel.toLowerCase()} has a clear visual or audio payoff.`,
-      titleIdea: `${reactionLabel} during stream at ${secondsToClock(window.peakBucket.start)}`,
-      thumbnailIdea: "Use the streamer reaction frame near the chat peak. Add one short chat phrase if it supports the moment.",
-      uploadText: "Generated from imported chat JSON. Confirm the source video context manually before publishing."
+      editPlan: `${secondsToClock(window.clipStart)}-${secondsToClock(window.clipEnd)} を確認。チャットスパイク前の文脈から始めて、${reactionLabel} に視覚的・音声的な見どころがあるかチェックする。`,
+      titleIdea: `${secondsToClock(window.peakBucket.start)} 頃に${reactionLabel}`,
+      thumbnailIdea: "チャットピーク付近の配信者のリアクションフレームを使用。一つ短いチャット語句を追加すると効果的。",
+      uploadText: "インポートしたチャット JSON から生成。公開前にソース動画の内容を必ず確認してください。"
     },
     markers: buildMarkers(id, peakOffsetSeconds, durationSeconds, window.dominantReaction),
     variants: buildVariants(id, window.clipStart, window.clipEnd, window.peakBucket.start, window.peakBucket.end),
@@ -403,18 +415,18 @@ function buildDetectionReasons(window: CandidateWindow, baselinePerMinute: numbe
 
   return [
     {
-      label: "Chat velocity spike",
-      detail: `Peak window reached ${peakPerMinute} messages/minute versus a baseline near ${baselinePerMinute}/minute.`,
+      label: "チャット速度スパイク",
+      detail: `ピーク時 ${peakPerMinute}/分 (ベースライン約 ${baselinePerMinute}/分)。`,
       score: clamp(Math.round(spikeRatio(peakPerMinute, baselinePerMinute) * 24), 50, 98)
     },
     {
       label: reactionLabels[dominant],
-      detail: `${reactionCounts[dominant]} messages matched ${reactionLabels[dominant].toLowerCase()} keywords or patterns.`,
+      detail: `${reactionCounts[dominant]} 件のメッセージが${reactionLabels[dominant]}のパターンに一致。`,
       score: clamp(55 + reactionCounts[dominant] * 4, 55, 95)
     },
     {
-      label: "Crowd participation",
-      detail: `${uniqueAuthors} unique chatters appeared in the candidate window. Global imported peak was ${globalPeakPerMinute}/minute.`,
+      label: "参加者の多さ",
+      detail: `候補ウィンドウ内に ${uniqueAuthors} 人のユニークユーザーが参加。全体のインポート済みピークは ${globalPeakPerMinute}/分。`,
       score: clamp(45 + uniqueAuthors * 3, 45, 92)
     }
   ];
@@ -423,8 +435,8 @@ function buildDetectionReasons(window: CandidateWindow, baselinePerMinute: numbe
 function buildWarnings(window: CandidateWindow, baselinePerMinute: number): CandidateWarning[] {
   const warnings: CandidateWarning[] = [
     {
-      label: "Chat-only signal",
-      detail: "This candidate was generated from chat JSON only. Confirm the source video has a visible or audible payoff.",
+      label: "チャットのみ",
+      detail: "この候補はチャット JSON のみから生成されています。元動画に見どころ (映像/音声) があるか確認してください。",
       severity: "medium"
     }
   ];
@@ -432,16 +444,16 @@ function buildWarnings(window: CandidateWindow, baselinePerMinute: number): Cand
 
   if (window.entries.length < 12) {
     warnings.push({
-      label: "Small sample",
-      detail: "Few comments were available in this range, so the highlight score may be unstable.",
+      label: "サンプル少数",
+      detail: "この範囲のコメントが少ないため、ハイライトスコアが不安定かもしれません。",
       severity: "low"
     });
   }
 
   if (spikeRatio(peakPerMinute, baselinePerMinute) < 1.8) {
     warnings.push({
-      label: "Weak spike ratio",
-      detail: "The peak is only moderately above baseline. Review before spending edit time.",
+      label: "スパイクが弱い",
+      detail: "ピークがベースラインをやや上回る程度です。編集時間をかける前に確認してください。",
       severity: "low"
     });
   }
@@ -454,21 +466,21 @@ function buildTranscriptPlaceholders(window: CandidateWindow, peakOffsetSeconds:
     {
       start: "00:00",
       end: secondsToClock(Math.min(10, Math.max(5, peakOffsetSeconds - 10))),
-      speaker: "System",
-      text: "Transcript not available yet. This candidate was generated from imported chat activity."
+      speaker: "システム",
+      text: "まだ文字起こしは利用できません。この候補はチャット活動から生成されました。"
     },
     {
       start: secondsToClock(Math.max(0, peakOffsetSeconds - 8)),
       end: secondsToClock(peakOffsetSeconds + 8),
-      speaker: "Chat signal",
-      text: `${reactionLabels[window.dominantReaction]} detected near the chat peak.`,
+      speaker: "チャットシグナル",
+      text: `チャットピーク付近で${reactionLabels[window.dominantReaction]}を検出。`,
       highlight: true
     },
     {
       start: secondsToClock(Math.max(0, peakOffsetSeconds + 10)),
       end: secondsToClock(Math.max(20, peakOffsetSeconds + 24)),
-      speaker: "Editor note",
-      text: "Check this range in the source archive before selecting the candidate."
+      speaker: "編集者メモ",
+      text: "この範囲をソースアーカイブで確認してから候補を選択してください。"
     }
   ];
 }
@@ -479,9 +491,9 @@ function buildMarkers(id: string, peakOffsetSeconds: number, durationSeconds: nu
   const endingTime = secondsToClock(Math.min(durationSeconds, peakOffsetSeconds + 25));
 
   return [
-    { id: `${id}-marker-setup`, time: setupTime, label: "Context before chat spike", kind: "setup" },
-    { id: `${id}-marker-peak`, time: peakTime, label: `${reactionLabels[reaction]} peak`, kind: reaction === "laughter" ? "funny" : "peak" },
-    { id: `${id}-marker-ending`, time: endingTime, label: "Check payoff / ending", kind: "ending" }
+    { id: `${id}-marker-setup`, time: setupTime, label: "スパイク前の文脈", kind: "setup" },
+    { id: `${id}-marker-peak`, time: peakTime, label: `${reactionLabels[reaction]} のピーク`, kind: reaction === "laughter" ? "funny" : "peak" },
+    { id: `${id}-marker-ending`, time: endingTime, label: "見どころ/ENDING を確認", kind: "ending" }
   ];
 }
 
@@ -496,31 +508,31 @@ function buildVariants(id: string, clipStart: number, clipEnd: number, peakStart
   return [
     {
       id: `${id}-short`,
-      label: "Spike only",
+      label: "スパイクのみ",
       start: secondsToClock(shortStart),
       end: secondsToClock(shortEnd),
       duration: secondsToClock(shortEnd - shortStart),
-      description: "Tight cut around the strongest chat reaction window.",
-      tradeoff: "Fast to review, but may miss setup context."
+      description: "最も強いチャット反応の時間帯を集中的に切り出し。",
+      tradeoff: "短時間で確認できるが、前後の文脈が抜ける可能性あり。"
     },
     {
       id: `${id}-standard`,
-      label: "Standard review",
+      label: "標準レビュー",
       start: secondsToClock(standardStart),
       end: secondsToClock(standardEnd),
       duration: secondsToClock(standardEnd - standardStart),
-      description: "Includes lead-in context, chat spike, and aftermath.",
-      tradeoff: "Best default for human review.",
+      description: "リードイン、チャットスパイク、その後の余韻までを含む。",
+      tradeoff: "人間のレビューには最適なデフォルト。",
       recommended: true
     },
     {
       id: `${id}-context`,
-      label: "Context review",
+      label: "文脈多め",
       start: secondsToClock(contextStart),
       end: secondsToClock(contextEnd),
       duration: secondsToClock(contextEnd - contextStart),
-      description: "Adds extra buffer before and after the generated candidate.",
-      tradeoff: "Safer context, slower to review."
+      description: "前後により長いバッファを追加。",
+      tradeoff: "文脈が安全だが、レビューに時間がかかる。"
     }
   ];
 }
