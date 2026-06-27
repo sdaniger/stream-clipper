@@ -12,7 +12,7 @@ import {
 import { clearCandidates, loadCandidates, saveCandidates } from "@/lib/candidate-storage";
 import { cn } from "@/lib/utils";
 import type { ClipCandidate } from "@/lib/mock-candidates";
-import type { CommentOverlaySettings } from "@/types/comment-overlay";
+import type { CommentOverlayItem, CommentOverlaySettings } from "@/types/comment-overlay";
 
 // ── SSE pipeline stage types ──
 
@@ -712,10 +712,15 @@ function VideoWithComments({
 
   const clipDuration = Math.max(1, parseTime(variant?.duration ?? candidate.duration));
 
-  const comments = useMemo(
-    () => (candidate ? generateCommentOverlayItems(candidate, clipDuration) : []),
-    [candidate, clipDuration]
-  );
+  // Use real pipeline-generated comments when available (chat at real
+  // timestamps, full clip span). Fall back to the synthetic representative
+  // comment generator for clips from localStorage or /dev manual imports.
+  const comments = useMemo(() => {
+    if (candidate.commentOverlayItems && candidate.commentOverlayItems.length > 0) {
+      return candidate.commentOverlayItems as CommentOverlayItem[];
+    }
+    return generateCommentOverlayItems(candidate, clipDuration);
+  }, [candidate, clipDuration]);
 
   const commentSettings: CommentOverlaySettings = {
     ...defaultCommentOverlaySettings,

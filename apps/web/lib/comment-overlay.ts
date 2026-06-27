@@ -82,15 +82,22 @@ export function categorizeComment(text: string): CommentOverlayCategory {
 export function generateCommentOverlayItems(candidate: ClipCandidate, durationSeconds: number): CommentOverlayItem[] {
   const sourceComments = buildSourceComments(candidate);
   const safeDuration = Math.max(12, durationSeconds);
-  const repeatedComments = sourceComments.flatMap((comment, sourceIndex) => {
+  // Spread all repeated comments evenly across the full clip span so the
+  // overlay doesn't cluster everything in the first 20 seconds.
+  let index = 0;
+  const totalCount = sourceComments.reduce(
+    (sum, c) => sum + (c.intensity === "high" ? 4 : c.intensity === "medium" ? 3 : 2),
+    0
+  );
+  const repeatedComments = sourceComments.flatMap((comment) => {
     const category = categorizeComment(comment.text);
     const repeatCount = comment.intensity === "high" ? 4 : comment.intensity === "medium" ? 3 : 2;
 
-    return Array.from({ length: repeatCount }, (_, repeatIndex) => {
-      const time = ((sourceIndex * 2.7 + repeatIndex * 3.4 + (sourceIndex % 3) * 0.8) % Math.max(5, safeDuration - 4)) + 0.6;
+    return Array.from({ length: repeatCount }, () => {
+      const time = ((index++ / totalCount) * Math.max(8, safeDuration - 2) + 1);
 
       return {
-        id: `${candidate.id}-overlay-${sourceIndex}-${repeatIndex}`,
+        id: `${candidate.id}-overlay-${index}`,
         time,
         text: comment.text,
         userId: comment.author,

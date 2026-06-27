@@ -324,7 +324,22 @@ export async function runArchiveAutoAnalysis(
           clipStartSeconds,
           clipStartSeconds + clipDurationSeconds
         );
-        generatedCandidate = { ...generatedCandidate, commentAssets };
+
+        // Also build the comment bundle for the overlay data so the
+        // frontend preview can render real chat-driven danmaku.
+        const commentBundle = buildCommentBundle(
+          generatedCandidate,
+          selectedVariant.duration,
+          fetchedChat.normalizedMessages,
+          clipStartSeconds,
+          clipStartSeconds + clipDurationSeconds
+        );
+
+        generatedCandidate = {
+          ...generatedCandidate,
+          commentAssets,
+          commentOverlayItems: commentBundle.comments as ClipCandidate["commentOverlayItems"]
+        };
         emitProgress({ stage: "comments", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Comment assets generated` });
       } catch (error) {
         warnings.push({ stage: "comments", candidateId: candidate.id, message: errorMessage(error, "Could not generate comment assets.") });

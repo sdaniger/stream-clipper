@@ -164,6 +164,20 @@ export type ClipCandidate = {
   exportPackage?: ExportPackageReference;
   thumbnailCandidates?: ThumbnailCandidateReference[];
   transcription?: ClipTranscription;
+  /** Real-time NicoNico comment overlay items generated during the pipeline. */
+  commentOverlayItems?: Array<{
+    id: string;
+    time: number;
+    text: string;
+    userId?: string;
+    mode: string;
+    color: string;
+    size: number;
+    lane?: number;
+    duration: number;
+    weight?: number;
+    category?: string;
+  }>;
   representativeComments: RepresentativeComment[];
   detectionReasons: DetectionReason[];
   warnings: CandidateWarning[];
