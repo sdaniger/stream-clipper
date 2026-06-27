@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { CommentCanvasOverlay } from "@/components/comment-canvas-overlay";
 import {
   createCommentExportPayload,
@@ -120,6 +120,10 @@ export function ClipCandidatePreviewModal({
   const [generatedThumbnails, setGeneratedThumbnails] = useState<ThumbnailCandidateReference[]>([]);
   const [newMarkerKind, setNewMarkerKind] = useState<ClipCandidateMarker["kind"]>("note");
   const [newMarkerLabel, setNewMarkerLabel] = useState("");
+  const [videoCurrentTime, setVideoCurrentTime] = useState(0);
+  const [videoDuration, setVideoDuration] = useState(0);
+  const [videoError, setVideoError] = useState<string | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
 
   useEffect(() => {
     if (!candidate) {
@@ -137,6 +141,9 @@ export function ClipCandidatePreviewModal({
     setCopyStatus(null);
     setThumbnailError(null);
     setGeneratedThumbnails(candidate.thumbnailCandidates ?? []);
+    setVideoCurrentTime(0);
+    setVideoDuration(0);
+    setVideoError(null);
   }, [candidate?.id, candidate?.duration, candidate?.peak.offset, candidate?.peak.sparkline.length, candidate?.commentBurnedClip, candidate?.exportPackage, candidate?.thumbnailCandidates]);
 
   const showComments = previewMode === "comments" || previewMode === "combined";
@@ -215,15 +222,41 @@ export function ClipCandidatePreviewModal({
   const selectedVariant = candidate.variants.find((variant) => variant.id === candidate.selectedVariantId) ?? candidate.variants[0];
   const generatedClip = candidate.generatedClip;
   const selectedVariantDuration = selectedVariant?.duration ?? candidate.duration;
-  const currentMockTime = secondsToTime(
-    Math.round((mockTimeIndex / Math.max(candidate.peak.sparkline.length - 1, 1)) * durationSeconds)
-  );
-  const currentMockSeconds = Math.round((mockTimeIndex / Math.max(candidate.peak.sparkline.length - 1, 1)) * durationSeconds);
+  const hasRealClip = Boolean(generatedClip?.outputPath);
+  // When a real clip is loaded, drive overlay times from the actual <video>
+  // currentTime so comments and subtitles stay in sync with playback. When
+  // there's no clip, fall back to the sparkline-based mock timeline.
+  const currentMockSeconds = hasRealClip
+    ? Math.round(videoCurrentTime)
+    : Math.round((mockTimeIndex / Math.max(candidate.peak.sparkline.length - 1, 1)) * durationSeconds);
+  const currentMockTime = secondsToTime(currentMockSeconds);
+  const playbackDuration = hasRealClip && videoDuration > 0 ? videoDuration : durationSeconds;
   const showSubtitles = previewMode === "subtitles" || previewMode === "combined";
   const sortedMarkers = [...candidate.markers].sort((a, b) => parseTimeToSeconds(a.time) - parseTimeToSeconds(b.time));
   const peakLabel = candidate.chat.peakPerMinute >= 500 ? "弾幕 高" : candidate.chat.peakPerMinute >= 250 ? "弾幕 中" : "弾幕 低";
   const moodLabel = candidate.tags.includes("funny") || candidate.tags.includes("comedy") ? "爆笑" : candidate.tags.includes("wholesome") ? "感動" : "盛り上がり";
   const activeSubtitle = getActiveSubtitle(candidate, currentMockSeconds);
+
+  function togglePlayback() {
+    const video = videoRef.current;
+    if (video) {
+      if (video.paused) {
+        void video.play().catch((err) => setVideoError(err instanceof Error ? err.message : "Playback failed"));
+      } else {
+        video.pause();
+      }
+    } else {
+      setIsPlaying((current) => !current);
+    }
+  }
+
+  function handleScrubTo(index: number) {
+    setMockTimeIndex(index);
+    if (videoRef.current && videoDuration > 0 && candidate) {
+      const targetSeconds = (index / Math.max(candidate.peak.sparkline.length - 1, 1)) * videoDuration;
+      videoRef.current.currentTime = targetSeconds;
+    }
+  }
 
   function handleAddMarker() {
     const label = newMarkerLabel.trim() || `${markerKindLabels[newMarkerKind]} marker at ${currentMockTime}`;
@@ -479,47 +512,129 @@ export function ClipCandidatePreviewModal({
             </div>
 
             <div className={cn("relative overflow-hidden rounded-[2rem] border border-white/10 bg-gradient-to-br shadow-violet", candidate.visualTone)}>
-              <div className="relative aspect-video min-h-64 bg-black/25">
-                <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_20%,rgba(255,255,255,0.22),transparent_18rem)]" />
-                {showComments && (
+              <div className="relative aspect-video min-h-64 bg-black/40">
+                {hasRealClip && generatedClip ? (
+                  <video
+                    ref={videoRef}
+                    src={`/api/media/files?path=${encodeURIComponent(generatedClip.outputPath)}`}
+                    className="absolute inset-0 h-full w-full bg-black object-contain"
+                    controls
+                    playsInline
+                    preload="metadata"
+                    onPlay={() => setIsPlaying(true)}
+                    onPause={() => setIsPlaying(false)}
+                    onTimeUpdate={(event) => setVideoCurrentTime(event.currentTarget.currentTime)}
+                    onLoadedMetadata={(event) => {
+                      setVideoDuration(event.currentTarget.duration);
+                      setVideoError(null);
+                    }}
+                    onError={() => {
+                      setVideoError(
+                        t("preview.currentMockTime", { time: currentMockTime })
+                      );
+                    }}
+                  />
+                ) : (
+                  <>
+                    <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_20%,rgba(255,255,255,0.22),transparent_18rem)]" />
+                    {showComments && (
+                      <CommentCanvasOverlay
+                        comments={overlayComments}
+                        currentTime={currentMockSeconds}
+                        duration={durationSeconds}
+                        settings={{ ...commentSettings, enabled: showComments }}
+                        playing={isPlaying}
+                      />
+                    )}
+                    <div className="absolute inset-0 flex items-center justify-center">
+                      <div className="text-center">
+                        <button
+                          type="button"
+                          onClick={togglePlayback}
+                          className="mx-auto flex h-20 w-20 items-center justify-center rounded-full border border-white/30 bg-white/10 text-3xl text-white shadow-2xl backdrop-blur-xl transition hover:scale-105 hover:bg-white/15 lg:h-24 lg:w-24"
+                        >
+                          {isPlaying ? "Ⅱ" : "▶"}
+                        </button>
+                        <p className="mt-4 text-sm font-semibold uppercase tracking-[0.2em] text-white/80">{t("preview.mockPreview")}</p>
+                        <p className="mt-2 rounded-full border border-white/15 bg-black/25 px-3 py-1 text-xs text-white/80 backdrop-blur">{t("preview.currentMockTime", { time: currentMockTime })}</p>
+                      </div>
+                    </div>
+                  </>
+                )}
+                {hasRealClip && showComments && (
                   <CommentCanvasOverlay
                     comments={overlayComments}
                     currentTime={currentMockSeconds}
-                    duration={durationSeconds}
+                    duration={playbackDuration}
                     settings={{ ...commentSettings, enabled: showComments }}
                     playing={isPlaying}
                   />
                 )}
-                <div className="absolute inset-0 flex items-center justify-center">
-                  <div className="text-center">
-                    <button
-                      type="button"
-                      onClick={() => setIsPlaying((current) => !current)}
-                      className="mx-auto flex h-20 w-20 items-center justify-center rounded-full border border-white/30 bg-white/10 text-3xl text-white shadow-2xl backdrop-blur-xl transition hover:scale-105 hover:bg-white/15 lg:h-24 lg:w-24"
-                    >
-                      {isPlaying ? "Ⅱ" : "▶"}
-                    </button>
-                    <p className="mt-4 text-sm font-semibold uppercase tracking-[0.2em] text-white/80">{t("preview.mockPreview")}</p>
-                    <p className="mt-2 rounded-full border border-white/15 bg-black/25 px-3 py-1 text-xs text-white/80 backdrop-blur">{t("preview.currentMockTime", { time: currentMockTime })}</p>
-                  </div>
-                </div>
                 {showSubtitles && (
                   <div className="absolute inset-x-5 bottom-6 z-20 rounded-2xl border border-white/15 bg-black/60 px-4 py-3 text-center text-sm font-semibold text-white backdrop-blur-md lg:text-lg">
                     {activeSubtitle}
                   </div>
                 )}
               </div>
-              <div className="border-t border-white/10 bg-black/25 p-4 backdrop-blur-xl">
+              <div className="border-t border-white/10 bg-black/40 p-4 backdrop-blur-xl">
                 <div className="mb-3 flex items-center justify-between gap-3 text-xs text-white/75">
                   <span>{selectedVariant?.start ?? candidate.detectedAt}</span>
-                  <span>{selectedVariant?.duration ?? candidate.duration}</span>
+                  <span>{hasRealClip && videoDuration > 0 ? secondsToTime(videoDuration) : (selectedVariant?.duration ?? candidate.duration)}</span>
                 </div>
                 <div className="relative h-3 overflow-hidden rounded-full bg-white/15">
-                  <div className="h-full rounded-full bg-gradient-to-r from-cyan-200 via-fuchsia-200 to-amber-200" style={{ width: `${candidate.peak.intensity}%` }} />
-                  <div className="absolute top-0 h-full w-1 rounded-full bg-white shadow-[0_0_16px_rgba(255,255,255,0.9)]" style={{ left: `${Math.min(candidate.peak.intensity, 96)}%` }} />
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-cyan-200 via-fuchsia-200 to-amber-200"
+                    style={{ width: `${hasRealClip && videoDuration > 0 ? Math.min(100, (videoCurrentTime / videoDuration) * 100) : candidate.peak.intensity}%` }}
+                  />
+                  {hasRealClip && videoDuration > 0 && (
+                    <div
+                      className="absolute top-0 h-full w-1 rounded-full bg-white shadow-[0_0_16px_rgba(255,255,255,0.9)]"
+                      style={{ left: `${Math.min(100, (videoCurrentTime / videoDuration) * 100)}%` }}
+                    />
+                  )}
                 </div>
               </div>
             </div>
+
+            <Panel title={t("preview.clipFile")}>
+              {hasRealClip && generatedClip ? (
+                <div className="space-y-3">
+                  <div className="grid gap-3 sm:grid-cols-3">
+                    <MiniStat label={t("preview.clipPath")} value={generatedClip.outputPath} />
+                    <MiniStat label={t("preview.clipDuration")} value={generatedClip.duration} />
+                    <MiniStat label={t("preview.clipMode")} value={generatedClip.mode} />
+                  </div>
+                  <div className="rounded-2xl border border-white/10 bg-black/20 p-3 font-mono text-xs leading-6 text-slate-300">
+                    <p className="text-slate-500">{t("media.absolutePath")}:</p>
+                    <p className="break-all text-slate-100">{generatedClip.absoluteOutputPath}</p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <a
+                      href={`/api/media/files?path=${encodeURIComponent(generatedClip.outputPath)}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="rounded-2xl border border-cyan-200/40 bg-cyan-300/15 px-4 py-2 text-xs font-semibold text-cyan-50 transition hover:bg-cyan-300/25"
+                    >
+                      {t("preview.clipOpenInPlayer")}
+                    </a>
+                    <a
+                      href={`/api/media/files?path=${encodeURIComponent(generatedClip.outputPath)}`}
+                      download={generatedClip.outputPath.split("/").pop()}
+                      className="rounded-2xl border border-emerald-200/40 bg-emerald-300/15 px-4 py-2 text-xs font-semibold text-emerald-50 transition hover:bg-emerald-300/25"
+                    >
+                      MP4 ダウンロード
+                    </a>
+                  </div>
+                  {videoError && (
+                    <p className="rounded-xl border border-rose-300/35 bg-rose-400/10 p-2 text-xs leading-5 text-rose-100">
+                      動画読み込みエラー: {videoError}
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <p className="text-sm text-slate-400">{t("preview.noClipYet")}</p>
+              )}
+            </Panel>
 
             <Panel title={t("preview.lengthVariants")}>
               <div className="grid gap-3 lg:grid-cols-3">
@@ -573,7 +688,7 @@ export function ClipCandidatePreviewModal({
             <Panel title={t("preview.heatmap")}>
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                 <MiniStat label="Peak" value={`+${candidate.peak.offset}`} />
-                <MiniStat label="Current mock time" value={`+${currentMockTime}`} />
+                <MiniStat label={hasRealClip ? t("preview.currentTime", { time: "" }) : t("preview.currentMockTime", { time: currentMockTime })} value={`+${currentMockTime}`} />
                 <MiniStat label="Intensity" value={`${candidate.peak.intensity}/100`} />
                 <MiniStat label="Chat / min" value={candidate.chat.peakPerMinute.toString()} />
               </div>
@@ -582,7 +697,7 @@ export function ClipCandidatePreviewModal({
                   const markerCount = sortedMarkers.filter((marker) => bucketForTime(marker.time, durationSeconds, candidate.peak.sparkline.length) === index).length;
 
                   return (
-                    <button key={`${candidate.id}-heat-${index}`} type="button" onClick={() => setMockTimeIndex(index)} className="group space-y-2 text-left">
+                    <button key={`${candidate.id}-heat-${index}`} type="button" onClick={() => handleScrubTo(index)} className="group space-y-2 text-left">
                       <span
                         className={cn(
                           "relative block h-20 rounded-xl border border-white/10 transition group-hover:border-white/30",
@@ -609,7 +724,7 @@ export function ClipCandidatePreviewModal({
                 max={candidate.peak.sparkline.length - 1}
                 step="1"
                 value={mockTimeIndex}
-                onChange={(event) => setMockTimeIndex(Number(event.target.value))}
+                onChange={(event) => handleScrubTo(Number(event.target.value))}
                 className="mt-4 w-full accent-cyan-300"
               />
               <p className="mt-3 text-sm text-slate-400">Click the heatmap or scrubber to change the mock current time, then add a marker from the marker panel.</p>
