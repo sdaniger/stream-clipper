@@ -1,8 +1,9 @@
-import { analyzeChatEntries, type ChatAnalysisSummary } from "@/lib/chat-analysis";
+import { analyzeChatEntries, type ChatAnalysisSummary, type ChatLogEntry } from "@/lib/chat-analysis";
 import {
   createCommentExportBundle,
   defaultCommentOverlaySettings,
   generateCommentOverlayItems,
+  generateCommentOverlayItemsFromChat,
   generateCommentsJson,
   generateScrollingCommentsAss
 } from "@/lib/comment-overlay";
@@ -307,10 +308,22 @@ export async function runArchiveAutoAnalysis(
         });
       }
 
-      // Stage 3: comment assets (CPU + small file I/O)
+      // Stage 3: comment assets (CPU + small file I/O).
+      // Comments are sourced from the REAL chat messages that fall in the
+      // clip's time window, not synthetic placeholders. This matches the
+      // narinico tool's behavior where every Twitch chat message at its
+      // real timestamp becomes a scrolling NicoNico comment in the output.
       emitProgress({ stage: "comments", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Generating comment JSON/ASS assets for ${indexLabel}...` });
       try {
-        const commentAssets = await generateCandidateCommentAssets(generatedCandidate, selectedVariant.duration);
+        const clipStartSeconds = parseTimecode(selectedVariant.start, "clip start");
+        const clipDurationSeconds = parseTimecode(selectedVariant.duration, "clip duration");
+        const commentAssets = await generateCandidateCommentAssets(
+          generatedCandidate,
+          selectedVariant.duration,
+          fetchedChat.normalizedMessages,
+          clipStartSeconds,
+          clipStartSeconds + clipDurationSeconds
+        );
         generatedCandidate = { ...generatedCandidate, commentAssets };
         emitProgress({ stage: "comments", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Comment assets generated` });
       } catch (error) {
@@ -322,7 +335,15 @@ export async function runArchiveAutoAnalysis(
       if (shouldGeneratePackages) {
         emitProgress({ stage: "package", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Generating editor package for ${indexLabel}...` });
         try {
-          const commentBundle = buildCommentBundle(generatedCandidate, selectedVariant.duration);
+          const clipStartSeconds = parseTimecode(selectedVariant.start, "clip start");
+          const clipDurationSeconds = parseTimecode(selectedVariant.duration, "clip duration");
+          const commentBundle = buildCommentBundle(
+            generatedCandidate,
+            selectedVariant.duration,
+            fetchedChat.normalizedMessages,
+            clipStartSeconds,
+            clipStartSeconds + clipDurationSeconds
+          );
           const exportPackage = await generateExportPackage({
             candidate: generatedCandidate,
             selectedVariant,
@@ -387,8 +408,14 @@ function enrichArchiveCandidates(candidates: ClipCandidate[], metadata: YtDlpMet
   }));
 }
 
-async function generateCandidateCommentAssets(candidate: ClipCandidate, duration: string) {
-  const bundle = buildCommentBundle(candidate, duration);
+async function generateCandidateCommentAssets(
+  candidate: ClipCandidate,
+  duration: string,
+  chatEntries: ChatLogEntry[],
+  clipStartSeconds: number,
+  clipEndSeconds: number
+) {
+  const bundle = buildCommentBundle(candidate, duration, chatEntries, clipStartSeconds, clipEndSeconds);
   return writeCommentAssets({
     candidateId: candidate.id,
     jsonContent: generateCommentsJson(bundle),
@@ -398,14 +425,30 @@ async function generateCandidateCommentAssets(candidate: ClipCandidate, duration
   });
 }
 
-function buildCommentBundle(candidate: ClipCandidate, duration: string) {
+function buildCommentBundle(
+  candidate: ClipCandidate,
+  duration: string,
+  chatEntries: ChatLogEntry[],
+  clipStartSeconds: number,
+  clipEndSeconds: number
+) {
   const durationSeconds = Math.max(1, parseTimecode(duration, "comment duration"));
-  const comments = generateCommentOverlayItems(candidate, durationSeconds);
+  const settings = defaultCommentOverlaySettings;
+  // Prefer the real-time chat as the source of comments. If the chat slice
+  // is empty (e.g. clip from a region with no chat), fall back to the
+  // synthetic representative-comment generator so the user still sees
+  // something rather than a blank overlay.
+  const inWindow = chatEntries.filter(
+    (entry) => entry.timestamp_seconds >= clipStartSeconds && entry.timestamp_seconds <= clipEndSeconds
+  );
+  const comments = inWindow.length > 0
+    ? generateCommentOverlayItemsFromChat(candidate, inWindow, clipStartSeconds, clipEndSeconds, settings)
+    : generateCommentOverlayItems(candidate, durationSeconds);
 
   return createCommentExportBundle({
     candidate,
     comments,
-    settings: defaultCommentOverlaySettings,
+    settings,
     duration: durationSeconds
   });
 }

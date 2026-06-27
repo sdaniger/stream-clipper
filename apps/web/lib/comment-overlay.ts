@@ -1,3 +1,4 @@
+import type { ChatLogEntry } from "@/lib/chat-analysis";
 import type { ClipCandidate, RepresentativeComment } from "@/lib/mock-candidates";
 import type { CommentExportBundle, CommentExportPayload, CommentOverlayCategory, CommentOverlayItem, CommentOverlaySettings } from "@/types/comment-overlay";
 
@@ -11,7 +12,10 @@ export const defaultCommentOverlaySettings: CommentOverlaySettings = {
   hideUserNames: true,
   filterUrls: true,
   filterLongComments: true,
-  filterRepeatedComments: true
+  filterRepeatedComments: true,
+  fontName: "Noto Sans JP",
+  outlineWidth: 4,
+  maxPerSecond: 12
 };
 
 export const commentCategoryColors: Record<CommentOverlayCategory, string> = {
@@ -34,6 +38,24 @@ const densityModulo: Record<CommentOverlaySettings["density"], number> = {
   high: 4,
   danmaku: 1
 };
+
+/**
+ * Cap on how many NicoNico-style comments can be on screen at the same
+ * moment. The narinico tool uses density to scale this. 12 is enough to
+ * fill the screen for a 1080p video with ~15-18 lanes without becoming
+ * unreadable.
+ */
+const MAX_CONCURRENT_COMMENTS = 12;
+
+/**
+ * How long each comment takes to scroll across the screen, in seconds.
+ * Longer comments = faster scroll (so they leave the screen before the
+ * next barrage arrives), matching the narinico tool's behavior where
+ * long comments are sped up.
+ */
+const BASE_SCROLL_SECONDS = 5.4;
+const LONGTEXT_SPEEDUP_PER_CHAR = 0.04;
+const MIN_SCROLL_SECONDS = 1.5;
 
 export function categorizeComment(text: string): CommentOverlayCategory {
   const normalized = text.toLowerCase();
@@ -83,6 +105,108 @@ export function generateCommentOverlayItems(candidate: ClipCandidate, durationSe
   });
 
   return repeatedComments.sort((a, b) => a.time - b.time || a.id.localeCompare(b.id));
+}
+
+/**
+ * Build a NicoNico-style comment overlay from the ACTUAL chat messages that
+ * fell in the candidate's clip time window. This matches the narinico tool's
+ * approach: every real message at its real timestamp gets its own scrolling
+ * comment, so the output video's danmaku timeline matches the live stream.
+ *
+ * The candidate is only used to derive a stable id prefix and the top
+ * representative comments for any fallback in case the chat slice is
+ * empty (very short windows with no chat).
+ *
+ * Settings applied here:
+ *  - syncOffsetSeconds: shifts every message forward (+) or backward (-)
+ *    in time. The narinico tool's COMMENT_OFFSET_SEC is wired through this.
+ *  - filterUrls / filterLongComments / filterRepeatedComments: drop junk
+ *    before they reach the renderer.
+ *  - maxPerSecond: rate-limit the danmaku stream so a chat explosion
+ *    doesn't crash the renderer. Excess messages are dropped with the
+ *    same dedup window as filterRepeatedComments to avoid noise.
+ *  - long comments speed up: the narinico tool's "long messages scroll
+ *    faster" trick, applied here so a 30-character comment doesn't sit
+ *    on screen forever.
+ */
+export function generateCommentOverlayItemsFromChat(
+  candidate: ClipCandidate,
+  chatEntries: ChatLogEntry[],
+  clipStartSeconds: number,
+  clipEndSeconds: number,
+  settings: CommentOverlaySettings
+): CommentOverlayItem[] {
+  const windowMs = settings.filterRepeatedComments ? 3000 : 0;
+  const recentText = new Map<string, number>();
+  const out: CommentOverlayItem[] = [];
+
+  for (let index = 0; index < chatEntries.length; index += 1) {
+    const entry = chatEntries[index];
+    const raw = entry.message ?? "";
+    const text = raw.trim();
+    if (!text) continue;
+
+    const absSeconds = entry.timestamp_seconds ?? 0;
+    if (absSeconds < clipStartSeconds || absSeconds > clipEndSeconds) continue;
+
+    // sync offset (in seconds): user can shift the whole danmaku stream
+    const relativeSeconds = absSeconds - clipStartSeconds + settings.syncOffsetSeconds;
+    if (relativeSeconds < 0) continue;
+
+    if (settings.filterUrls && /(https?:\/\/|www\.)/i.test(text)) continue;
+    if (settings.filterLongComments && text.length > 40) continue;
+
+    if (settings.filterRepeatedComments) {
+      const key = text.toLowerCase();
+      const lastTime = recentText.get(key);
+      if (lastTime !== undefined && relativeSeconds * 1000 - lastTime < windowMs) continue;
+      recentText.set(key, relativeSeconds * 1000);
+    }
+
+    const category = categorizeComment(text);
+    const duration = Math.max(
+      MIN_SCROLL_SECONDS,
+      BASE_SCROLL_SECONDS - text.length * LONGTEXT_SPEEDUP_PER_CHAR
+    );
+
+    out.push({
+      id: `${candidate.id}-chat-${index}`,
+      time: roundTime(relativeSeconds),
+      text,
+      userId: entry.author_name,
+      mode: "scroll",
+      color: settings.colorMode === "reaction" ? commentCategoryColors[category] : "#ffffff",
+      size: commentFontSizes[settings.fontSize],
+      duration: roundTime(duration),
+      weight: 1,
+      category
+    });
+  }
+
+  // Density filter (matches the narinico tool's "show fewer comments" option)
+  const modulo = densityModulo[settings.density];
+  const filtered = settings.density === "danmaku"
+    ? out
+    : out.filter((_, index) => index % modulo === 0);
+
+  // Per-second cap: drop excess if more than maxPerSecond in any 1s bucket
+  const capped = capByPerSecond(filtered, settings.maxPerSecond);
+
+  return capped.sort((a, b) => a.time - b.time || a.id.localeCompare(b.id));
+}
+
+function capByPerSecond(items: CommentOverlayItem[], maxPerSecond: number): CommentOverlayItem[] {
+  if (maxPerSecond <= 0) return items;
+  const counts = new Map<number, number>();
+  const out: CommentOverlayItem[] = [];
+  for (const item of items) {
+    const bucket = Math.floor(item.time);
+    const current = counts.get(bucket) ?? 0;
+    if (current >= maxPerSecond) continue;
+    counts.set(bucket, current + 1);
+    out.push(item);
+  }
+  return out;
 }
 
 export function prepareOverlayComments(
@@ -221,7 +345,7 @@ export function generateCommentsJson(payload: CommentExportPayload) {
 
 export function generateScrollingCommentsAss(payload: CommentExportPayload) {
   const { width, height } = payload.resolution;
-  const styles = buildAssStyles();
+  const styles = buildAssStyles(payload.settings);
   const events = payload.comments.map((comment) => {
     const fontSize = comment.size || commentFontSizes[payload.settings.fontSize];
     const lane = comment.lane ?? 0;
@@ -291,8 +415,10 @@ function buildSourceComments(candidate: ClipCandidate): RepresentativeComment[] 
   ];
 }
 
-function buildAssStyles() {
-  return "Style: NicoComment,Noto Sans JP,36,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,1,4,1,7,20,20,20,1";
+function buildAssStyles(settings: CommentOverlaySettings) {
+  const fontName = settings.fontName || "Noto Sans JP";
+  const outline = Math.max(0, Math.min(8, Math.round(settings.outlineWidth ?? 4)));
+  return `Style: NicoComment,${fontName},36,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,1,${outline},1,7,20,20,20,1`;
 }
 
 function formatAssTime(seconds: number) {

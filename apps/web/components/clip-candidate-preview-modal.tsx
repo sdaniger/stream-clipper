@@ -894,6 +894,34 @@ export function ClipCandidatePreviewModal({
                   <ToggleButton label="連投除外" enabled={commentSettings.filterRepeatedComments} onClick={() => setCommentSettings((current) => ({ ...current, filterRepeatedComments: !current.filterRepeatedComments }))} />
                   <ToggleButton label="ユーザー名非表示" enabled={commentSettings.hideUserNames} onClick={() => setCommentSettings((current) => ({ ...current, hideUserNames: !current.hideUserNames }))} />
                 </div>
+
+                <div className="space-y-2 rounded-2xl border border-white/10 bg-black/15 p-3">
+                  <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">フォント</p>
+                  <input
+                    value={commentSettings.fontName}
+                    onChange={(event) => setCommentSettings((current) => ({ ...current, fontName: event.target.value }))}
+                    placeholder="Noto Sans JP"
+                    className="h-10 w-full rounded-xl border border-white/10 bg-slate-950/60 px-3 text-sm text-slate-100 outline-none focus:border-cyan-200/60"
+                  />
+                  <p className="text-[0.65rem] leading-4 text-slate-500">FFmpeg burn-in で使用。MS PGothic や Noto Sans CJK を推奨。</p>
+                </div>
+
+                <RangeField
+                  label={`縁取り: ${commentSettings.outlineWidth}px`}
+                  min={0}
+                  max={8}
+                  step={1}
+                  value={commentSettings.outlineWidth}
+                  onChange={(value) => setCommentSettings((current) => ({ ...current, outlineWidth: value }))}
+                />
+                <RangeField
+                  label={`秒あたり上限: ${commentSettings.maxPerSecond}コメ`}
+                  min={1}
+                  max={30}
+                  step={1}
+                  value={commentSettings.maxPerSecond}
+                  onChange={(value) => setCommentSettings((current) => ({ ...current, maxPerSecond: value }))}
+                />
               </div>
             </Panel>
 

@@ -27,6 +27,9 @@ export type CommentOverlaySettings = {
   filterUrls: boolean;
   filterLongComments: boolean;
   filterRepeatedComments: boolean;
+  fontName: string;
+  outlineWidth: number;
+  maxPerSecond: number;
 };
 
 export type CommentExportBundle = {

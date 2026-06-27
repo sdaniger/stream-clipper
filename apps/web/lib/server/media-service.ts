@@ -89,6 +89,22 @@ export type BurnCommentsIntoClipInput = {
   assPath?: string;
   assContent?: string;
   assFileName?: string;
+  /**
+   * Optional FFmpeg knobs. Defaults to the narinico tool's values:
+   * libx264 veryfast crf=20, AAC 160k, +faststart. Set encoder to
+   * "h264_nvenc" on hosts with NVIDIA GPUs to use the hardware path.
+   */
+  encoder?: "libx264" | "h264_nvenc" | "libx265";
+  crf?: number;
+  preset?: string;
+  audioBitrate?: string;
+  /**
+   * Apply EBU R128 loudness normalization to the audio before muxing.
+   * Useful for VTubers who stream at low volume (matches the narinico
+   * tool's `loudnorm` pass). Defaults to false to avoid double-normalizing
+   * already-loud sources.
+   */
+  normalizeAudio?: boolean;
 };
 
 export type CommentBurnedClip = {
@@ -419,6 +435,18 @@ export async function burnCommentsIntoClip(input: BurnCommentsIntoClipInput): Pr
   const outputPath = path.join(paths.outputClipsWithCommentsDir, outputFileName);
   const outputRelativePath = path.join("output", "clips_with_comments", outputFileName).replaceAll(path.sep, "/");
   const filterRelativePath = toPosixPath(assRelativePath);
+
+  // Narinico-style defaults: libx264 veryfast crf=20, AAC 160k, +faststart.
+  // Override via input.encoder/preset/crf/audioBitrate if the user wants
+  // GPU encoding or a different quality knob.
+  const encoder = input.encoder ?? "libx264";
+  const preset = input.preset ?? "veryfast";
+  const crf = input.crf ?? 20;
+  const audioBitrate = input.audioBitrate ?? "160k";
+  const normalizeAudio = input.normalizeAudio === true;
+
+  const audioFilter = normalizeAudio ? "loudnorm=I=-16:TP=-1.5:LRA=11" : null;
+
   const args = [
     "-hide_banner",
     "-y",
@@ -426,16 +454,17 @@ export async function burnCommentsIntoClip(input: BurnCommentsIntoClipInput): Pr
     absoluteClipPath,
     "-vf",
     `ass=${quoteFfmpegFilterValue(filterRelativePath)}`,
+    ...(audioFilter ? ["-af", audioFilter] : []),
     "-c:v",
-    "libx264",
+    encoder,
     "-preset",
-    "veryfast",
+    preset,
     "-crf",
-    "20",
+    String(crf),
     "-c:a",
     "aac",
     "-b:a",
-    "160k",
+    audioBitrate,
     "-movflags",
     "+faststart",
     outputPath
