@@ -1,8 +1,40 @@
-import { spawn } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import type { ChatLogEntry } from "@/lib/chat-analysis";
 import { getMediaPaths } from "@/lib/server/media-service";
+
+const execFileAsync = promisify(execFile);
+
+let resolvedPythonPath: string | null = null;
+
+async function resolveChatDownloaderPython(): Promise<string> {
+  if (resolvedPythonPath) return resolvedPythonPath;
+
+  if (process.env.CHAT_DOWNLOADER_PYTHON) {
+    resolvedPythonPath = process.env.CHAT_DOWNLOADER_PYTHON;
+    return resolvedPythonPath;
+  }
+
+  try {
+    const { stdout: whichOut } = await execFileAsync("which", ["chat_downloader"], { timeout: 5_000 });
+    const scriptPath = whichOut.trim();
+    if (scriptPath) {
+      const content = await readFile(scriptPath, "utf8");
+      const shebang = content.match(/^#!(.+)/);
+      if (shebang) {
+        resolvedPythonPath = shebang[1].trim();
+        return resolvedPythonPath;
+      }
+    }
+  } catch {}
+
+  const fallback = path.join(os.homedir(), ".local/share/pipx/venvs/chat-downloader/bin/python3");
+  resolvedPythonPath = fallback;
+  return fallback;
+}
 
 export type ChatSourceType = "manual_json" | "chat_downloader" | "imported_file" | "future_twitch_live_capture" | "future_platform_api";
 
@@ -102,8 +134,9 @@ async function spawnPythonWithProgress(
   maxMessages: number,
   onProgress?: (count: number) => void
 ): Promise<{ stdout: string; stderr: string }> {
+  const pythonPath = await resolveChatDownloaderPython();
   return new Promise((resolve, reject) => {
-    const child = spawn("python3", ["-u", "-c", script], {
+    const child = spawn(pythonPath, ["-u", "-c", script], {
       timeout: PYTHON_TIMEOUT,
       env: { ...process.env, TERM: "dumb", PAGER: "cat", PYTHONUNBUFFERED: "1" },
       stdio: ["ignore", "pipe", "pipe"]
@@ -153,7 +186,7 @@ async function spawnPythonWithProgress(
       clearTimeout(timer);
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         reject(new Error(
-          "python3 is required to fetch chat. Install Python 3 and \`pip install chat-downloader\`."
+          `chat-downloader Python (${pythonPath}) not found. Install \`pip install chat-downloader\` or set CHAT_DOWNLOADER_PYTHON env var.`
         ));
       } else {
         reject(err);
