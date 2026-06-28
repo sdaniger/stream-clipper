@@ -157,15 +157,26 @@ export async function listOutputFiles(outputDir?: string): Promise<OutputFilesRe
 export interface StudioAnalyzeRequest {
   vod_url: string;
   top_n?: number;
+  window?: number;
+  min_gap?: number;
+  keywords?: string;
+  maxMessages?: number;
 }
 
 export interface StudioAnalyzeResponse {
   video_id: string;
   title: string | null;
   duration_seconds: number | null;
+  message_count: number;
   candidates: HighlightCandidate[];
-  metadata: Record<string, unknown>;
-  notice?: string;
+  timeline: TimelineRow[];
+  summary: {
+    inputMessages: number;
+    analyzedMessages: number;
+    candidateCount: number;
+    baselinePerMinute: number;
+    peakPerMinute: number;
+  };
 }
 
 export async function analyzeStudioVod(input: StudioAnalyzeRequest): Promise<StudioAnalyzeResponse> {
@@ -179,25 +190,4 @@ export async function analyzeStudioVod(input: StudioAnalyzeRequest): Promise<Stu
     throw new Error(err.error || `HTTP ${res.status}`);
   }
   return res.json();
-}
-
-function normalizeCandidate(raw: any): HighlightCandidate {
-  return {
-    rank: raw.rank ?? 0,
-    start: raw.start ?? raw.clip_start ?? 0,
-    end: raw.end ?? (raw.clip_start != null ? raw.clip_start + (raw.clip_duration ?? 30) : 30),
-    peak_time: raw.peak_time ?? raw.start ?? 0,
-    score: raw.score ?? 0,
-    chat_count: raw.chat_count ?? 0,
-    keyword_hits: raw.keyword_hits ?? 0,
-    matched_keywords: raw.matched_keywords ?? raw.matched_keywords ?? [],
-    reasons: raw.reasons ?? raw.reason ? [raw.reason] : [],
-    clip_start: raw.clip_start ?? raw.start ?? 0,
-    clip_duration: raw.clip_duration ?? raw.duration ?? 30,
-    output_file: raw.output_file ?? null,
-  };
-}
-
-export function normalizeCandidates(raw: any[]): HighlightCandidate[] {
-  return (raw ?? []).map(normalizeCandidate);
 }

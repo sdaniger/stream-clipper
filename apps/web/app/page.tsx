@@ -382,8 +382,6 @@ export default function Home() {
       const SSE_TIMEOUT_MS = 60_000;
       let lastEventTime = Date.now();
 
-      try {
-
       function processLines(lines: string[]) {
         let currentEvent = "";
         for (const line of lines) {
@@ -454,6 +452,7 @@ export default function Home() {
 
       keepaliveCheck = setInterval(() => {
         if (Date.now() - lastEventTime > SSE_TIMEOUT_MS) {
+          abort.abort();
           reader.cancel();
         }
       }, 10_000);
@@ -469,7 +468,6 @@ export default function Home() {
       }
       clearInterval(keepaliveCheck);
       if (buffer.trim()) processLines([buffer]);
-      } catch (innerErr) { /* inner SSE parse error — already handled in processLines */ }
     } catch (err) {
       if (abort.signal.aborted) {
         setError(t("archive.pipelineCancelled"));
@@ -483,7 +481,7 @@ export default function Home() {
       setIsRunning(false);
       abortRef.current = null;
     }
-  }, [url, effectiveMax, transcribe, withComments, encoder, llmProvider, autoEvaluateCandidates, pipelineMode, oauthToken, t]);
+  }, [url, effectiveMax, transcribe, withComments, burnComments, commentSettings, clipLength, useTimeRange, timeRangeStart, timeRangeEnd, encoder, llmProvider, autoEvaluateCandidates, pipelineMode, oauthToken, t]);
 
   const handleCancel = useCallback(() => {
     abortRef.current?.abort();

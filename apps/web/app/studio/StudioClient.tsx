@@ -1,30 +1,27 @@
 "use client";
 import React, { useState, useCallback } from "react";
 import { extractVideoId, getCandidateSeekTime, secondsToTwitchTime, type HighlightCandidate } from "@/lib/twitch-time";
-import { analyzeStudioVod, analyzeHighlights, createClip, transcribeAudio, normalizeCandidates } from "@/lib/studio-api";
+import { analyzeStudioVod, type TimelineRow } from "@/lib/studio-api";
 import TwitchVodPlayer from "@/components/studio/TwitchVodPlayer";
 import CandidateList from "@/components/studio/CandidateList";
 import CandidateDetails from "@/components/studio/CandidateDetails";
 import LogPanel from "@/components/studio/LogPanel";
 
 export default function StudioClient() {
-  // Inputs
   const [vodUrl, setVodUrl] = useState("");
-  const [videoPath, setVideoPath] = useState("");
-  const [logPath, setLogPath] = useState("");
   const [windowSec, setWindowSec] = useState(30);
   const [topN, setTopN] = useState(10);
   const [minGap, setMinGap] = useState(45);
   const [keywordsText, setKeywordsText] = useState("");
 
-  // State
   const [videoId, setVideoId] = useState<string | null>(null);
+  const [vodTitle, setVodTitle] = useState<string | null>(null);
   const [candidates, setCandidates] = useState<HighlightCandidate[]>([]);
+  const [timeline, setTimeline] = useState<TimelineRow[]>([]);
   const [selectedCandidate, setSelectedCandidate] = useState<HighlightCandidate | null>(null);
   const [playerStartTime, setPlayerStartTime] = useState(0);
   const [playerReloadKey, setPlayerReloadKey] = useState(0);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [isExporting, setIsExporting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [logs, setLogs] = useState<string[]>(["Ready"]);
 
@@ -53,6 +50,10 @@ export default function StudioClient() {
       return;
     }
     setVideoId(id);
+    setVodTitle(null);
+    setCandidates([]);
+    setTimeline([]);
+    setSelectedCandidate(null);
     setPlayerStartTime(0);
     setPlayerReloadKey((v) => v + 1);
     setErrorMessage(null);
@@ -64,28 +65,55 @@ export default function StudioClient() {
       setErrorMessage("先に Twitch VOD URL を読み込んでください");
       return;
     }
+    if (!vodUrl.trim()) {
+      setErrorMessage("Twitch VOD URL が必要です");
+      return;
+    }
     setIsAnalyzing(true);
     setErrorMessage(null);
+    setCandidates([]);
+    setTimeline([]);
+    setSelectedCandidate(null);
     addLog("分析を開始...");
 
     try {
-      // Try VOD analysis via Next.js API route
-      const result = await analyzeStudioVod({ vod_url: vodUrl, top_n: topN });
+      addLog("VOD metadata を取得中...");
+      const result = await analyzeStudioVod({
+        vod_url: vodUrl,
+        top_n: topN,
+        window: windowSec,
+        min_gap: minGap,
+        keywords: keywordsText.trim() || undefined,
+      });
+
+      setVodTitle(result.title);
+      addLog(`VOD metadata fetched: ${result.title ?? "unknown"}`);
+
+      addLog("Twitch チャットを取得中...");
+      const chatMsg = `Chat loaded: ${result.message_count} messages`;
+      addLog(chatMsg);
+
       if (result.candidates.length > 0) {
-        const normalized = normalizeCandidates(result.candidates);
-        setCandidates(normalized);
-        addLog(`分析完了: ${normalized.length} 件の候補`);
-        handleSelectCandidate(normalized[0]);
+        addLog(`候補生成完了: ${result.candidates.length} 件`);
+        setCandidates(result.candidates);
+        setTimeline(result.timeline ?? []);
+        handleSelectCandidate(result.candidates[0]);
+        addLog("分析完了");
       } else {
-        addLog(`VOD metadata fetched (${result.title ?? "unknown"}), but candidate generation requires local files.`);
-        setCandidates([]);
+        addLog("チャットから候補を生成できませんでした（チャット数が少なすぎる可能性があります）");
+        addLog("分析完了 (candidates: 0)");
       }
     } catch (e) {
-      addLog(`備考: ${e instanceof Error ? e.message : "Now showing player"}`);
+      const msg = e instanceof Error ? e.message : "分析に失敗しました";
+      setErrorMessage(msg);
+      addLog(`分析失敗: ${msg}`);
+      if (msg.includes("fetch") || msg.includes("timeout") || msg.includes("network")) {
+        addLog("チャット取得に失敗しました。VOD が公開されているか確認してください。");
+      }
     } finally {
       setIsAnalyzing(false);
     }
-  }, [videoId, vodUrl, topN, handleSelectCandidate, addLog]);
+  }, [videoId, vodUrl, topN, windowSec, minGap, keywordsText, handleSelectCandidate, addLog]);
 
   return (
     <div className="min-h-screen flex flex-col bg-[#050816]">
@@ -125,6 +153,12 @@ export default function StudioClient() {
               onChange={(e) => setMinGap(Number(e.target.value) || 45)}
               className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500" />
           </div>
+          <div className="flex flex-col gap-px w-32">
+            <label className="text-[10px] text-slate-500 uppercase tracking-wide">Keywords</label>
+            <input value={keywordsText} onChange={(e) => setKeywordsText(e.target.value)}
+              placeholder="comma,separated"
+              className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500" />
+          </div>
         </div>
 
         <div className="flex gap-1.5 ml-auto">
@@ -140,6 +174,16 @@ export default function StudioClient() {
         <div className="bg-red-950/80 border-b border-red-800 px-5 py-1.5 flex justify-between items-center text-red-300 text-xs">
           <span>⚠ {errorMessage}</span>
           <button onClick={() => setErrorMessage(null)} className="bg-none border-none text-red-300 cursor-pointer text-sm">✕</button>
+        </div>
+      )}
+
+      {/* VOD info bar */}
+      {vodTitle && (
+        <div className="bg-slate-800/50 border-b border-slate-700/30 px-5 py-1 text-xs text-slate-400">
+          {vodTitle} · {candidates.length} candidates · {timeline.length} timeline buckets
+          {!vodUrl.match(/\.(mp4|mkv|webm|avi|mov)$/i) && (
+            <span className="ml-3 text-amber-500">(preview via Twitch player)</span>
+          )}
         </div>
       )}
 
@@ -161,6 +205,14 @@ export default function StudioClient() {
           )}
 
           <CandidateDetails candidate={selectedCandidate} />
+
+          {/* Export info */}
+          {candidates.length > 0 && (
+            <div className="glass-panel rounded-lg p-2 text-[11px] text-slate-500">
+              mp4 書き出しにはローカル動画ファイルが必要です。
+              Twitch VOD プレイヤーはプレビュー専用です。
+            </div>
+          )}
         </div>
 
         <div className="flex-[2] flex flex-col min-w-[280px] max-w-[400px]">
