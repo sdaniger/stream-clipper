@@ -61,6 +61,8 @@ def transcribe_clip(request: TranscribeRequest) -> TranscribeResponse:
     if not clip_path.exists() or not clip_path.is_file():
         raise FileNotFoundError(f"Clip file not found under MEDIA_ROOT: {request.clip_path}")
 
+    validate_clip_file(clip_path)
+
     health = check_transcription_health()
     if not health.available:
         raise RuntimeError(health.error or "faster-whisper is not available.")
@@ -233,6 +235,25 @@ def get_optional_float(segment: Any, attribute: str) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def validate_clip_file(clip_path: Path) -> None:
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=format_name",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(clip_path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            raise ValueError(
+                f"Clip file is corrupted or unreadable (moov atom missing): {clip_path.name}"
+            )
+    except FileNotFoundError:
+        raise RuntimeError("ffprobe is not available on PATH.")
+    except subprocess.TimeoutExpired:
+        raise ValueError(f"Clip validation timed out for: {clip_path.name}")
 
 
 def sanitize_file_part(value: str) -> str:

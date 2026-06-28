@@ -311,6 +311,8 @@ export async function generateClip(input: GenerateClipInput): Promise<GeneratedC
     await execFileAsync("ffmpeg", args, { timeout: 10 * 60_000, maxBuffer: 16 * 1024 * 1024 });
   }
 
+  await assertClipValid(outputPath);
+
   return {
     inputPath: normalizeRelativePath(input.inputPath),
     outputPath: outputRelativePath.replaceAll(path.sep, "/"),
@@ -778,11 +780,12 @@ function buildFfmpegArgs(inputPath: string, outputPath: string, startSeconds: nu
     return [...baseArgs,
       "-c:v", encoder, "-preset", "p4", "-cq", String(quality), "-b:v", "0",
       "-pix_fmt", "yuv420p",
-      "-c:a", "aac", "-b:a", "128k", outputPath];
+      "-c:a", "aac", "-b:a", "128k",
+      "-movflags", "+faststart", outputPath];
   }
 
   // Default: CPU libx264
-  return [...baseArgs, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "128k", outputPath];
+  return [...baseArgs, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", outputPath];
 }
 
 function resolveMediaPath(relativePath: string) {
@@ -862,6 +865,25 @@ async function ensureMediaDirs() {
     mkdir(outputThumbnailsDir, { recursive: true })
   ]);
   dirsEnsured = true;
+}
+
+async function assertClipValid(absolutePath: string) {
+  try {
+    const { stdout } = await execFileAsync(
+      "ffprobe",
+      ["-v", "error", "-show_entries", "format=format_name", "-of", "default=noprint_wrappers=1:nokey=1", absolutePath],
+      { timeout: 15_000, maxBuffer: 1024 * 1024 }
+    );
+    const format = stdout.trim();
+    if (!format) {
+      throw new Error("Clip file is not a valid media container (moov atom missing).");
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("not a valid media container")) {
+      throw error;
+    }
+    throw new Error(`Generated clip is corrupted or unreadable: ${path.basename(absolutePath)}`);
+  }
 }
 
 async function assertFileExists(absolutePath: string, label = "Video file") {

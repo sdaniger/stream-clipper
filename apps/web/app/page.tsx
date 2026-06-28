@@ -72,6 +72,11 @@ export default function Home() {
   const [transcribe, setTranscribe] = useState(true);
   const [withComments, setWithComments] = useState(true);
   const [encoder, setEncoder] = useState<"libx264" | "h264_nvenc" | "hevc_nvenc">("h264_nvenc");
+  const [keepFilter, setKeepFilter] = useState<"all" | "keep" | "discard" | "unreviewed">("all");
+  const [minConfidence, setMinConfidence] = useState(50);
+  const [batchBurning, setBatchBurning] = useState(false);
+  const [batchProgress, setBatchProgress] = useState("");
+  const [stageTimestamps, setStageTimestamps] = useState<Record<string, number>>({});
 
   // pipeline
   const [isRunning, setIsRunning] = useState(false);
@@ -170,6 +175,8 @@ export default function Home() {
               if (currentEvent === "progress") {
                 const evt = data as SSEProgressEvent;
                 if (evt.stage && evt.status) {
+                  const now = Date.now();
+                  setStageTimestamps(prev => ({ ...prev, [evt.stage]: now }));
                   const newStatus: StageStatus =
                     evt.status === "running" ? "running"
                     : evt.status === "done" ? "done"
@@ -237,6 +244,42 @@ export default function Home() {
   const handleCancel = useCallback(() => {
     abortRef.current?.abort();
   }, []);
+
+  // Batch download all keep-marked candidates with comments
+  const handleBatchDownload = useCallback(async () => {
+    const toBurn = candidates.filter(c => (c as any).__editorStatus === "keep" && c.generatedClip);
+    if (toBurn.length === 0) return;
+    setBatchBurning(true);
+    for (let i = 0; i < toBurn.length; i++) {
+      setBatchProgress(`${i + 1}/${toBurn.length}`);
+      const c = toBurn[i];
+      const variant = c.variants.find(v => v.id === c.selectedVariantId) ?? c.variants[0];
+      if (!variant || c.commentBurnedClip) continue;
+      const dur = Math.max(1, parseTime(variant?.duration ?? c.duration));
+      const overlay = generateCommentOverlayItems(c, dur);
+      const bundle = createCommentExportPayload({ candidate: c, comments: overlay, settings: defaultCommentOverlaySettings, duration: dur });
+      try {
+        const res = await fetch("/api/media/clips-with-comments", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ clipPath: c.generatedClip!.outputPath, candidateId: c.id, variantId: variant?.id, assContent: generateScrollingCommentsAss(bundle), assFileName: bundle.files.assFileName, encoder: "h264_nvenc" }) });
+        const data = await res.json();
+        if (res.ok) {
+          setCandidates(prev => prev.map(x => x.id === c.id ? { ...x, commentBurnedClip: data } : x));
+        }
+      } catch {}
+    }
+    setBatchBurning(false);
+    setBatchProgress("");
+  }, [candidates]);
+
+  // ETA: average stage duration × remaining stages
+  const etaSeconds = (() => {
+    const timestamps = Object.values(stageTimestamps);
+    if (timestamps.length < 2) return null;
+    const durations = [];
+    for (let i = 1; i < timestamps.length; i++) durations.push((timestamps[i] - timestamps[i-1]) / 1000);
+    const avg = durations.reduce((a,b) => a+b, 0) / durations.length;
+    const remaining = STAGE_ORDER.filter(id => stages.find(s => s.id === id)?.status === "pending" || stages.find(s => s.id === id)?.status === "running").length;
+    return Math.round(avg * remaining);
+  })();
 
   // ── render ──
 
@@ -352,15 +395,13 @@ export default function Home() {
                       <input type="checkbox" checked={withComments} onChange={(e) => setWithComments(e.target.checked)} className="h-3.5 w-3.5 accent-cyan-300" />
                       コメント付き
                     </label>
-                    <select
-                      value={encoder}
-                      onChange={(e) => setEncoder(e.target.value as typeof encoder)}
-                      className="h-[34px] rounded-xl border border-white/10 bg-slate-950/60 px-2 text-xs text-slate-100 outline-none focus:border-cyan-200/60 cursor-pointer"
-                    >
-                      <option value="h264_nvenc">GPU (nvenc) 🚀</option>
-                      <option value="hevc_nvenc">GPU (hevc)</option>
-                      <option value="libx264">CPU (libx264)</option>
-                    </select>
+                    <label className={cn(
+                      "flex cursor-pointer items-center gap-2 rounded-xl border px-3 py-1.5 text-sm transition",
+                      encoder !== "libx264" ? "border-emerald-300/40 bg-emerald-400/10 text-emerald-100" : "border-white/10 text-slate-400"
+                    )}>
+                      <input type="checkbox" checked={encoder !== "libx264"} onChange={(e) => setEncoder(e.target.checked ? "h264_nvenc" : "libx264")} className="h-3.5 w-3.5 accent-emerald-300" />
+                      高速処理
+                    </label>
                   </div>
                   {result && (
                     <button
@@ -473,9 +514,40 @@ export default function Home() {
               </div>
             )}
 
+            {/* filter bar + batch actions */}
+            <div className="flex flex-wrap items-center gap-2">
+              {(["all", "keep", "discard", "unreviewed"] as const).map(f => (
+                <button key={f} type="button" onClick={() => setKeepFilter(f)} className={cn(
+                  "rounded-full border px-3 py-1 text-xs font-semibold transition",
+                  keepFilter === f ? "border-cyan-200/60 bg-cyan-300/15 text-cyan-50" : "border-white/10 text-slate-400 hover:text-slate-200"
+                )}>
+                  {f === "all" ? "すべて" : f === "keep" ? "✓ キープ" : f === "discard" ? "✕ 破棄" : "未判定"}
+                  <span className="ml-1 text-white/40">{f === "all" ? candidates.length : f === "keep" ? candidates.filter(c => (c as any).__editorStatus === "keep").length : f === "discard" ? candidates.filter(c => (c as any).__editorStatus === "discard").length : candidates.filter(c => !(c as any).__editorStatus).length}</span>
+                </button>
+              ))}
+              <div className="flex-1" />
+              <label className="flex items-center gap-2 text-xs text-slate-400">
+                最低信頼度 {minConfidence}%
+                <input type="range" min={0} max={100} step={5} value={minConfidence} onChange={e => setMinConfidence(Number(e.target.value))} className="w-20 accent-cyan-300" />
+              </label>
+              <button type="button" onClick={handleBatchDownload} disabled={batchBurning || candidates.filter(c => (c as any).__editorStatus === "keep" && c.generatedClip).length === 0} className="rounded-xl border border-emerald-200/40 bg-emerald-300/10 px-3 py-1.5 text-xs font-semibold text-emerald-50 transition hover:bg-emerald-300/20 disabled:opacity-30">
+                {batchBurning ? `コメント付き一括生成 ${batchProgress}` : "キープ全件を一括DL"}
+              </button>
+            </div>
+
+            {/* ETA display during pipeline */}
+            {isRunning && etaSeconds && (
+              <p className="text-xs text-slate-400">推定残り時間: 約 {Math.ceil(etaSeconds / 60)} 分</p>
+            )}
+
             {/* candidate grid */}
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {candidates.map((candidate) => (
+              {candidates.filter(c => {
+                if (keepFilter === "keep") return (c as any).__editorStatus === "keep";
+                if (keepFilter === "discard") return (c as any).__editorStatus === "discard";
+                if (keepFilter === "unreviewed") return !(c as any).__editorStatus;
+                return c.confidence >= minConfidence;
+              }).map((candidate) => (
                 <SimpleCandidateCard
                   key={candidate.id}
                   candidate={candidate}
@@ -542,11 +614,14 @@ function SimpleCandidateCard({
   const hasTranscription = Boolean(candidate.transcription);
   const hasBurnedClip = Boolean(candidate.commentBurnedClip);
   const variant = candidate.variants.find((v) => v.id === candidate.selectedVariantId) ?? candidate.variants[0];
+  const editorStatus = (candidate as any).__editorStatus as string | undefined;
+  const borderClass = editorStatus === "keep" ? "ring-2 ring-emerald-400/40" : editorStatus === "discard" ? "ring-1 ring-rose-400/20 opacity-60" : "";
 
   return (
     <div className={cn(
       "glass-panel rounded-2xl overflow-hidden transition",
-      isExpanded && "ring-2 ring-cyan-400/30"
+      isExpanded && "ring-2 ring-cyan-400/30",
+      borderClass
     )}>
       {/* preview area — NOT a button */}
       <div className="relative aspect-video w-full cursor-pointer bg-black/40" onClick={onToggle}>
@@ -584,7 +659,19 @@ function SimpleCandidateCard({
           </button>
         </div>
 
-        {/* toggle button — top right corner */}
+        {/* keep/discard — top center between edit/delete */}
+        <div className="absolute top-2 left-1/2 -translate-x-1/2 flex gap-1">
+          <button type="button" onClick={(e) => { e.stopPropagation(); onUpdate({ ...candidate, __editorStatus: editorStatus === "keep" ? undefined : "keep" } as any); }}
+            className={cn("flex h-7 items-center gap-1 rounded-lg px-2 text-xs backdrop-blur transition",
+              editorStatus === "keep" ? "bg-emerald-500/60 text-emerald-50" : "bg-black/40 text-white/50 hover:bg-emerald-700/50 hover:text-emerald-100")}>
+            ✓ キープ
+          </button>
+          <button type="button" onClick={(e) => { e.stopPropagation(); onUpdate({ ...candidate, __editorStatus: editorStatus === "discard" ? undefined : "discard" } as any); }}
+            className={cn("flex h-7 items-center gap-1 rounded-lg px-2 text-xs backdrop-blur transition",
+              editorStatus === "discard" ? "bg-rose-500/60 text-rose-50" : "bg-black/40 text-white/50 hover:bg-rose-700/50 hover:text-rose-100")}>
+            ✕ 破棄
+          </button>
+        </div>
         <div className="absolute top-2 right-2">
           <button
             type="button"
@@ -599,7 +686,15 @@ function SimpleCandidateCard({
 
       {/* info + actions */}
       <div className="p-3">
-        <p className="text-sm font-semibold leading-snug text-white truncate">{candidate.title}</p>
+        {isExpanded ? (
+          <input
+            value={candidate.title}
+            onChange={(e) => onUpdate({ ...candidate, title: e.target.value })}
+            className="w-full bg-transparent text-sm font-semibold leading-snug text-white outline-none"
+          />
+        ) : (
+          <p className="text-sm font-semibold leading-snug text-white truncate">{candidate.title}</p>
+        )}
         <div className="mt-1.5 flex items-center gap-2 flex-wrap">
           <span className="rounded-full bg-cyan-300/10 px-2 py-0.5 text-xs font-bold text-cyan-100">
             {candidate.confidence}%

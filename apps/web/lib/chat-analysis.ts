@@ -321,9 +321,14 @@ function buildCandidateFromWindow(
   const peakOffsetSeconds = Math.max(0, Math.round(window.peakBucket.start + WINDOW_SECONDS / 2 - window.clipStart));
   const reactionLabel = reactionLabels[window.dominantReaction];
 
+  const topPhrase = repeatedPhrases[0] ?? "";
+  const shortPhrase = topPhrase.length > 20 ? topPhrase.slice(0, 17) + "…" : topPhrase;
+
   return {
     id,
-    title: `${reactionLabel} around ${secondsToClock(window.peakBucket.start)}`,
+    title: topPhrase
+      ? `${shortPhrase} · ${reactionLabel} · ${secondsToClock(window.peakBucket.start)}`
+      : `${reactionLabel} · ${secondsToClock(window.peakBucket.start)}`,
     streamer: "チャット JSON 取り込み",
     archiveTitle: "チャット JSON 取り込み",
     detectedAt: secondsToClock(window.clipStart),
