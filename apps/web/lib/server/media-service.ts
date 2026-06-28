@@ -68,6 +68,8 @@ export type GenerateClipInput = {
   start: string;
   duration: string;
   mode?: "copy" | "reencode";
+  /** FFmpeg encoder. Defaults to libx264 (CPU). Use h264_nvenc for GPU. */
+  encoder?: "libx264" | "h264_nvenc" | "hevc_nvenc";
   onProgress?: FfmpegProgressCallback;
   signal?: AbortSignal;
 };
@@ -309,7 +311,7 @@ export async function generateClip(input: GenerateClipInput): Promise<GeneratedC
   const outputFileName = buildOutputFileName(input.candidateId, input.variantId, input.start, mode);
   const outputPath = path.join(getMediaPaths().outputClipsDir, outputFileName);
   const outputRelativePath = path.join("output", "clips", outputFileName);
-  const args = buildFfmpegArgs(absoluteInputPath, outputPath, startSeconds, durationSeconds, mode);
+  const args = buildFfmpegArgs(absoluteInputPath, outputPath, startSeconds, durationSeconds, mode, input.encoder);
 
   if (input.onProgress) {
     await runFfmpegWithProgress(args, durationSeconds, input.onProgress, input.signal);
@@ -429,22 +431,25 @@ function resolveFfmpegPath() {
 /**
  * Narinico-style seek optimization (CFR, short GOP, sc_threshold=0, faststart).
  * Re-encodes the given MP4 in-place so video players can seek instantly.
+ * Uses GPU encoder (h264_nvenc) when available, falling back to libx264.
  * Non-critical — failures are swallowed with a console.warn.
  */
-async function optimizeForSeeking(outputPath: string) {
+async function optimizeForSeeking(outputPath: string, encoder?: string) {
   const tmp = outputPath.replace(/\.mp4$/i, ".seekopt.tmp.mp4");
   const fps = 60;
-  const gop = fps * 2; // 2-second GOP (narinico default)
+  const gop = fps * 2; // 2-second GOP
+  const isNvenc = encoder === "h264_nvenc" || encoder === "hevc_nvenc";
   const args = [
     "-hide_banner", "-y", "-i", outputPath,
-    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+    ...(isNvenc
+      ? ["-c:v", encoder, "-preset", "p4", "-cq", "20", "-b:v", "0", "-pix_fmt", "yuv420p"]
+      : ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]),
     "-r", String(fps), "-g", String(gop), "-sc_threshold", "0",
     "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
     "-movflags", "+faststart",
     tmp
   ];
   await execFileAsync("ffmpeg", args, { timeout: 10 * 60_000, maxBuffer: 32 * 1024 * 1024 });
-  // Replace original with optimized version
   await rename(tmp, outputPath);
 }
 
@@ -509,7 +514,7 @@ export async function burnCommentsIntoClip(input: BurnCommentsIntoClipInput): Pr
   // seeking in video players. Disable with seekOptimize: false.
   if (input.seekOptimize !== false) {
     try {
-      await optimizeForSeeking(outputPath);
+      await optimizeForSeeking(outputPath, encoder);
     } catch (error) {
       // Seek optimization is non-critical; warn and continue.
       console.warn("Seek optimization failed (non-critical):", formatExecError(error));
@@ -805,13 +810,23 @@ export function parseTimecode(value: string, label: string) {
   return numbers[0] * 3600 + numbers[1] * 60 + numbers[2];
 }
 
-function buildFfmpegArgs(inputPath: string, outputPath: string, startSeconds: number, durationSeconds: number, mode: "copy" | "reencode") {
+function buildFfmpegArgs(inputPath: string, outputPath: string, startSeconds: number, durationSeconds: number, mode: "copy" | "reencode", encoder?: GenerateClipInput["encoder"]) {
   const baseArgs = ["-hide_banner", "-y", "-ss", startSeconds.toString(), "-i", inputPath, "-t", durationSeconds.toString(), "-avoid_negative_ts", "make_zero"];
 
   if (mode === "copy") {
     return [...baseArgs, "-c", "copy", outputPath];
   }
 
+  if (encoder === "h264_nvenc" || encoder === "hevc_nvenc") {
+    // NVENC GPU encoder — uses -cq instead of -crf, -preset p1..p7
+    const quality = encoder === "hevc_nvenc" ? 23 : 20; // HEVC benefits from slightly higher CQ
+    return [...baseArgs,
+      "-c:v", encoder, "-preset", "p4", "-cq", String(quality), "-b:v", "0",
+      "-pix_fmt", "yuv420p",
+      "-c:a", "aac", "-b:a", "160k", outputPath];
+  }
+
+  // Default: CPU libx264
   return [...baseArgs, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "160k", outputPath];
 }
 

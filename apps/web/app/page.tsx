@@ -71,6 +71,7 @@ export default function Home() {
   const [customMax, setCustomMax] = useState("");
   const [transcribe, setTranscribe] = useState(true);
   const [withComments, setWithComments] = useState(true);
+  const [encoder, setEncoder] = useState<"libx264" | "h264_nvenc" | "hevc_nvenc">("h264_nvenc");
 
   // pipeline
   const [isRunning, setIsRunning] = useState(false);
@@ -135,7 +136,9 @@ export default function Home() {
           url: trimmed,
           maxCandidates: effectiveMax,
           transcribe,
-          generatePackages: withComments
+          generatePackages: withComments,
+          encoder,
+          clipMode: encoder !== "libx264" ? "reencode" : "copy"
         }),
         signal: abort.signal
       });
@@ -349,6 +352,15 @@ export default function Home() {
                       <input type="checkbox" checked={withComments} onChange={(e) => setWithComments(e.target.checked)} className="h-3.5 w-3.5 accent-cyan-300" />
                       コメント付き
                     </label>
+                    <select
+                      value={encoder}
+                      onChange={(e) => setEncoder(e.target.value as typeof encoder)}
+                      className="h-[34px] rounded-xl border border-white/10 bg-slate-950/60 px-2 text-xs text-slate-100 outline-none focus:border-cyan-200/60 cursor-pointer"
+                    >
+                      <option value="h264_nvenc">GPU (nvenc) 🚀</option>
+                      <option value="hevc_nvenc">GPU (hevc)</option>
+                      <option value="libx264">CPU (libx264)</option>
+                    </select>
                   </div>
                   {result && (
                     <button
@@ -862,7 +874,8 @@ function BurnButton({
           candidateId: candidate.id,
           variantId: variant?.id,
           assContent: generateScrollingCommentsAss(bundle),
-          assFileName: bundle.files.assFileName
+          assFileName: bundle.files.assFileName,
+          encoder: "h264_nvenc"
         })
       });
       const data = await response.json();

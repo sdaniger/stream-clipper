@@ -32,6 +32,8 @@ export type ArchiveAutoAnalyzeInput = {
   maxMessages?: number;
   maxCandidates?: number;
   clipMode?: "copy" | "reencode";
+  /** FFmpeg encoder for clip generation. Defaults to libx264 (CPU). */
+  encoder?: "libx264" | "h264_nvenc" | "hevc_nvenc";
   transcribe?: boolean;
   transcriptionModel?: string;
   transcriptionLanguage?: string;
@@ -272,6 +274,7 @@ export async function runArchiveAutoAnalysis(
           start: selectedVariant.start,
           duration: selectedVariant.duration,
           mode: clipMode,
+          encoder: input.encoder,
           signal: input.signal,
           onProgress: (ffmpegProgress) => {
             const elapsed = Math.round((Date.now() - clipStartTime) / 1000);
