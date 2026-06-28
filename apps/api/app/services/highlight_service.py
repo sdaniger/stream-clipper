@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import concurrent.futures
+import hashlib
+import json
 import sys
+from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -19,6 +23,16 @@ from stream_clipper_cli.scorer import (
     compute_scores,
 )
 from stream_clipper_cli.video import generate_clip as _generate_clip
+
+
+def _cache_key(video_path: str, log_path: str, window: int, top: int,
+               min_gap: float, keywords: str, keyword_weight: float,
+               clip_duration: float, clip_padding: float) -> str:
+    raw = f"{video_path}|{log_path}|{window}|{top}|{min_gap}|{keywords}|{keyword_weight}|{clip_duration}|{clip_padding}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+_AnalysisCache = lru_cache(maxsize=32)
 
 
 def analyze(
@@ -75,7 +89,9 @@ def analyze(
     return highlight_dicts, timeline_dicts, metadata
 
 
-def generate_clip(video_path: str, start: float, duration: float, output_dir: str, rank: int = 1) -> str:
+def generate_clip(video_path: str, start: float, duration: float,
+                  output_dir: str, rank: int = 1,
+                  encoder: str = "auto", mode: str = "reencode") -> str:
     video_file = Path(video_path)
     if not video_file.exists():
         raise FileNotFoundError(f"Video file not found: {video_path}")
@@ -86,16 +102,22 @@ def generate_clip(video_path: str, start: float, duration: float, output_dir: st
 
     from stream_clipper_cli.video import generate_clip as _gen
 
-    success = _gen(video_file, output_path, start, duration)
+    success = _gen(video_file, output_path, start, duration,
+                   encoder=encoder, mode=mode)
     if not success:
         raise RuntimeError(f"Failed to generate clip: {output_path}")
 
     return str(output_path)
 
 
-def batch_generate_clips(video_path: str, highlights: List[dict], output_dir: str) -> List[dict]:
-    results = []
-    for h in highlights:
+def batch_generate_clips(video_path: str, highlights: List[dict],
+                         output_dir: str,
+                         encoder: str = "auto",
+                         mode: str = "reencode",
+                         max_workers: int = 8) -> List[dict]:
+    results: List[dict] = [None] * len(highlights)
+
+    def _gen_one(index: int, h: dict) -> tuple[int, dict]:
         try:
             out = generate_clip(
                 video_path=video_path,
@@ -103,17 +125,90 @@ def batch_generate_clips(video_path: str, highlights: List[dict], output_dir: st
                 duration=h.get("clip_duration", 30),
                 output_dir=output_dir,
                 rank=h.get("rank", 1),
+                encoder=encoder,
+                mode=mode,
             )
-            results.append({"output_file": out, "success": True})
-        except Exception as e:
-            results.append({"output_file": "", "success": False})
+            return index, {"output_file": out, "success": True}
+        except Exception:
+            return index, {"output_file": "", "success": False}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_gen_one, i, h) for i, h in enumerate(highlights)]
+        for future in concurrent.futures.as_completed(futures):
+            idx, result = future.result()
+            results[idx] = result
+
     return results
+
+
+def generate_short_video(
+    video_path: str,
+    start: float,
+    duration: float,
+    output_dir: str,
+    rank: int = 1,
+    subtitle_text: str | None = None,
+    target_width: int = 608,
+    target_height: int = 1080,
+    encoder: str = "auto",
+) -> str:
+    import subprocess
+
+    video_file = Path(video_path)
+    if not video_file.exists():
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+
+    from stream_clipper_cli.video import _detect_nvenc
+    if encoder == "auto":
+        encoder = "h264_nvenc" if _detect_nvenc() else "libx264"
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output_path = out_dir / f"short_{rank:03d}.mp4"
+
+    filter_parts = [f"crop={target_width}:{target_height}:(in_w-{target_width})/2:0"]
+
+    if subtitle_text:
+        safe_text = subtitle_text.replace("'", "\\'").replace("\"", "\\\"")
+        filter_parts.append(
+            f"drawtext=text='{safe_text}':fontsize=28:fontcolor=white:"
+            f"box=1:boxcolor=black@0.5:boxborderw=8:x=(w-text_w)/2:y=h-th-40"
+        )
+
+    vf = ",".join(filter_parts)
+
+    args = [
+        "ffmpeg", "-hide_banner", "-y",
+        "-ss", str(start),
+        "-i", str(video_file),
+        "-t", str(duration),
+        "-vf", vf,
+    ]
+    if encoder == "h264_nvenc":
+        args += ["-c:v", "h264_nvenc", "-preset", "p7", "-cq", "23", "-b:v", "0"]
+    else:
+        args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
+    args += [
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            raise RuntimeError(f"FFmpeg error: {result.stderr.strip()}")
+    except FileNotFoundError:
+        raise RuntimeError("ffmpeg not found on PATH")
+
+    return str(output_path)
 
 
 def _candidate_to_dict(h: HighlightCandidate) -> dict:
     reasons = []
     if h.keyword_hits > 0:
-        reasons.append(f"笑い語・キーワードが集中 ({h.keyword_hits} hits)")
+        reasons.append(f"キーワードが集中 ({h.keyword_hits} hits)")
     if h.chat_count >= 5:
         reasons.append(f"コメント密度が高い ({h.chat_count} messages)")
     if h.score >= 20:

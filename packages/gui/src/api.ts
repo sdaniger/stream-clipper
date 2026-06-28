@@ -37,6 +37,36 @@ export interface ClipBatchResponse {
   clips: ClipCreateResponse[];
 }
 
+export interface TranscribeResponse {
+  text: string;
+  segments: Array<{
+    id: number;
+    start: number;
+    end: number;
+    start_time: string;
+    end_time: string;
+    text: string;
+  }>;
+  language: string | null;
+  duration_seconds: number | null;
+}
+
+export interface ShortCreateResponse {
+  output_file: string;
+  success: boolean;
+}
+
+export interface OutputFileEntry {
+  name: string;
+  size: number;
+  path: string;
+}
+
+export interface OutputFilesResponse {
+  files: OutputFileEntry[];
+  path: string;
+}
+
 async function request<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, {
     method: "POST",
@@ -58,6 +88,7 @@ export async function analyzeHighlights(
     top?: number;
     min_gap?: number;
     keywords?: string;
+    keywords_list?: string[];
     keyword_weight?: number;
     clip_duration?: number;
     clip_padding?: number;
@@ -69,6 +100,7 @@ export async function analyzeHighlights(
     window: options.window ?? 30,
     top: options.top ?? 5,
     min_gap: options.min_gap ?? 30,
+    keywords_list: options.keywords_list ?? null,
     keywords: options.keywords ?? null,
     keyword_weight: options.keyword_weight ?? 2.0,
     clip_duration: options.clip_duration ?? 30,
@@ -81,9 +113,56 @@ export async function createClip(
   start: number,
   duration: number,
   outputDir: string,
-  rank: number
+  rank: number,
+  options?: { encoder?: string; mode?: string }
 ): Promise<ClipCreateResponse> {
   return request<ClipCreateResponse>("/api/gui/clips/create", {
+    video_path: videoPath,
+    start,
+    duration,
+    output_dir: outputDir,
+    rank,
+    encoder: options?.encoder ?? "auto",
+    mode: options?.mode ?? "reencode",
+  });
+}
+
+export async function batchCreateClips(
+  videoPath: string,
+  highlights: HighlightCandidate[],
+  outputDir: string,
+  options?: { encoder?: string; mode?: string }
+): Promise<ClipBatchResponse> {
+  return request<ClipBatchResponse>("/api/gui/clips/batch", {
+    video_path: videoPath,
+    highlights,
+    output_dir: outputDir,
+    encoder: options?.encoder ?? "auto",
+    mode: options?.mode ?? "reencode",
+  });
+}
+
+export async function transcribeAudio(
+  clipPath: string,
+  options?: { model?: string; language?: string }
+): Promise<TranscribeResponse> {
+  return request<TranscribeResponse>("/api/transcription/transcribe", {
+    clip_path: clipPath,
+    model: options?.model ?? "turbo",
+    language: options?.language ?? "ja",
+    device: "cuda",
+    compute_type: "float16",
+  });
+}
+
+export async function createShort(
+  videoPath: string,
+  start: number,
+  duration: number,
+  outputDir: string,
+  rank: number
+): Promise<ShortCreateResponse> {
+  return request<ShortCreateResponse>("/api/gui/short/create", {
     video_path: videoPath,
     start,
     duration,
@@ -92,20 +171,15 @@ export async function createClip(
   });
 }
 
-export async function batchCreateClips(
-  videoPath: string,
-  highlights: HighlightCandidate[],
-  outputDir: string
-): Promise<ClipBatchResponse> {
-  return request<ClipBatchResponse>("/api/gui/clips/batch", {
-    video_path: videoPath,
-    highlights,
-    output_dir: outputDir,
-  });
-}
-
 export async function checkHealth(): Promise<{ status: string }> {
   const res = await fetch("/api/gui/health");
   if (!res.ok) throw new Error("Backend not available");
+  return res.json();
+}
+
+export async function listOutputFiles(outputDir?: string): Promise<OutputFilesResponse> {
+  const params = outputDir ? `?output_dir=${encodeURIComponent(outputDir)}` : "";
+  const res = await fetch(`/api/gui/output-files${params}`);
+  if (!res.ok) throw new Error("Failed to list output files");
   return res.json();
 }

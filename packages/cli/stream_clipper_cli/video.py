@@ -8,12 +8,28 @@ from typing import List, Optional
 from stream_clipper_cli.models import HighlightCandidate
 
 
+def _detect_nvenc() -> bool:
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return "h264_nvenc" in result.stdout
+    except Exception:
+        return False
+
+
+_HAS_NVENC = _detect_nvenc()
+
+
 def generate_clip(
     video_path: Path,
     output_path: Path,
     start: float,
     duration: float,
     ffmpeg_args: Optional[List[str]] = None,
+    encoder: str = "auto",
+    mode: str = "reencode",
 ) -> bool:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -21,20 +37,44 @@ def generate_clip(
         print(f"Error: video file not found: {video_path}", file=sys.stderr)
         return False
 
-    args = [
-        "ffmpeg",
-        "-hide_banner",
-        "-y",
-        "-ss", str(start),
-        "-i", str(video_path),
-        "-t", str(duration),
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-    ]
+    if encoder == "auto":
+        encoder = "h264_nvenc" if _HAS_NVENC else "libx264"
+
+    if mode == "copy":
+        args = [
+            "ffmpeg", "-hide_banner", "-y",
+            "-ss", str(start),
+            "-i", str(video_path),
+            "-t", str(duration),
+            "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+        ]
+    else:
+        args = [
+            "ffmpeg", "-hide_banner", "-y",
+            "-ss", str(start),
+            "-i", str(video_path),
+            "-t", str(duration),
+        ]
+        if encoder == "h264_nvenc":
+            args += [
+                "-c:v", "h264_nvenc",
+                "-preset", "p7",
+                "-cq", "23",
+                "-b:v", "0",
+            ]
+        else:
+            args += [
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "23",
+            ]
+        args += [
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+        ]
+
     if ffmpeg_args:
         args.extend(ffmpeg_args)
     args.append(str(output_path))
@@ -63,6 +103,8 @@ def generate_clips(
     video_path: Path,
     output_dir: Path,
     ffmpeg_args: Optional[List[str]] = None,
+    encoder: str = "auto",
+    mode: str = "reencode",
 ) -> List[HighlightCandidate]:
     output_dir.mkdir(parents=True, exist_ok=True)
     results: List[HighlightCandidate] = []
@@ -70,7 +112,7 @@ def generate_clips(
     for h in highlights:
         filename = f"clip_{h.rank:03d}.mp4"
         output_path = output_dir / filename
-        success = generate_clip(video_path, output_path, h.clip_start, h.clip_duration, ffmpeg_args)
+        success = generate_clip(video_path, output_path, h.clip_start, h.clip_duration, ffmpeg_args, encoder, mode)
         if success:
             h.output_file = str(output_path)
         results.append(h)

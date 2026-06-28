@@ -8,10 +8,11 @@ import {
   generateScrollingCommentsAss
 } from "@/lib/comment-overlay";
 import type { ClipCandidate, ClipTranscription, GeneratedClipReference, TranscriptSegment } from "@/lib/mock-candidates";
-import { burnCommentsIntoClip, generateClip, generateExportPackage, parseTimecode, writeCommentAssets } from "@/lib/server/media-service";
+import { burnCommentsIntoClip, generateClip, generateExportPackage, getMediaRoot, parseTimecode, writeCommentAssets } from "@/lib/server/media-service";
 import { proxyJsonRequest } from "@/lib/server/api-proxy";
 import { fetchChatWithChatDownloader, defaultChatLimitForDuration, type FetchChatDownloaderResult } from "@/lib/server/chat-downloader-service";
 import { createLimiter } from "@/lib/concurrency";
+import path from "node:path";
 import { cpus } from "node:os";
 import { downloadVideoWithYtDlp, extractYtDlpMetadata, type YtDlpDownloadedVideo, type YtDlpMetadata } from "@/lib/server/yt-dlp-service";
 import { generateVodTimestampUrls, createTwitchClips, type PipelineModeContext } from "@/lib/server/pipeline-modes";
@@ -72,7 +73,7 @@ export type ArchiveAutoAnalyzeWarning = {
 export type ArchiveAutoAnalyzeResult = {
   sourceUrl: string;
   metadata: YtDlpMetadata;
-  downloadedVideo: YtDlpDownloadedVideo;
+  downloadedVideo: YtDlpDownloadedVideo | null;
   chat: Pick<FetchChatDownloaderResult, "source" | "url" | "normalizedPath" | "rawPath" | "commandPreview" | "fetchedAt"> & {
     messageCount: number;
   };
@@ -164,7 +165,7 @@ export async function runArchiveAutoAnalysis(
   // max(download, chat) instead of download + chat. The chat fetch
   // gracefully tolerates the video not being downloaded yet because it only
   // needs the VOD duration (already returned by metadata).
-  const needsFullDownload = pipelineMode === "full" || pipelineMode === "sections";
+  const needsFullDownload = pipelineMode === "full";
   emitProgress({ stage: "download", status: needsFullDownload ? "running" : "skipped", message: needsFullDownload ? `Downloading video...` : `Download skipped (${pipelineMode} mode)` });
   emitProgress({ stage: "chat", status: "running", message: "Fetching chat..." });
 
@@ -297,7 +298,7 @@ export async function runArchiveAutoAnalysis(
     return {
       sourceUrl: url,
       metadata,
-      downloadedVideo: downloadedVideo as YtDlpDownloadedVideo,
+      downloadedVideo,
       chat: { source: fetchedChat.source, url: fetchedChat.url, normalizedPath: fetchedChat.normalizedPath, rawPath: fetchedChat.rawPath, messageCount: fetchedChat.normalizedMessages.length, commandPreview: fetchedChat.commandPreview, fetchedAt: fetchedChat.fetchedAt },
       summary: { ...analysis.summary, candidateCount: candidates.length },
       candidates,
@@ -329,7 +330,7 @@ export async function runArchiveAutoAnalysis(
         return {
           sourceUrl: url,
           metadata,
-          downloadedVideo: downloadedVideo as YtDlpDownloadedVideo,
+          downloadedVideo,
           chat: { source: fetchedChat.source, url: fetchedChat.url, normalizedPath: fetchedChat.normalizedPath, rawPath: fetchedChat.rawPath, messageCount: fetchedChat.normalizedMessages.length, commandPreview: fetchedChat.commandPreview, fetchedAt: fetchedChat.fetchedAt },
           summary: { ...analysis.summary, candidateCount: candidates.length },
           candidates,
@@ -383,19 +384,26 @@ export async function runArchiveAutoAnalysis(
         return candidate;
       }
 
+      // Outer safety net: any unhandled error in one candidate must NOT
+      // crash the entire pipeline. If something slips past the inner
+      // try/catch blocks, this catch logs it and returns the original
+      // candidate so other candidates still get processed.
+      try {
+
       // Stage 1: clip generation (concurrency-limited)
       const clipStartTime = Date.now();
       emitProgress({ stage: "clip", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Generating clip for candidate ${indexLabel}...` });
       let generatedClip: GeneratedClipReference | undefined;
       let generatedCandidate = candidate;
+      let sectionInputPath: string | undefined;
       try {
-        let clipInputPath = downloadedVideo!.inputPath;
+        let clipInputPath: string;
 
         // In sections mode, download just this section instead of using the full VOD.
         if (pipelineMode === "sections") {
           const { parseTimecodeToSeconds } = await import("@/lib/server/pipeline-modes");
-          const startSeconds = parseTimecodeToSeconds(selectedVariant.start);
-          const endSeconds = startSeconds + parseTimecodeToSeconds(selectedVariant.duration);
+          const startSeconds = Math.max(0, parseTimecodeToSeconds(selectedVariant.start) - 5);
+          const endSeconds = startSeconds + parseTimecodeToSeconds(selectedVariant.duration) + 10;
           const { downloadSectionWithYtDlp } = await import("@/lib/server/yt-dlp-service");
           emitProgress({ stage: "clip", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Downloading section for ${indexLabel}...` });
           const section = await downloadSectionWithYtDlp({
@@ -406,6 +414,9 @@ export async function runArchiveAutoAnalysis(
             signal: input.signal,
           });
           clipInputPath = section.inputPath;
+          sectionInputPath = section.inputPath;
+        } else {
+          clipInputPath = downloadedVideo!.inputPath;
         }
 
         generatedClip = await clipLimit(() => generateClip({
@@ -425,6 +436,12 @@ export async function runArchiveAutoAnalysis(
           }
         }));
         generatedCandidate = { ...generatedCandidate, generatedClip };
+        // Fire-and-forget cleanup of the downloaded section file.
+        if (sectionInputPath) {
+          import("node:fs/promises").then(({ unlink }) =>
+            unlink(path.resolve(getMediaRoot(), sectionInputPath!)).catch(() => undefined)
+          );
+        }
         const totalElapsed = Math.round((Date.now() - clipStartTime) / 1000);
         emitProgress({ stage: "clip", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Clip generated in ${totalElapsed}s` });
       } catch (error) {
@@ -549,6 +566,16 @@ export async function runArchiveAutoAnalysis(
       }
 
       return generatedCandidate;
+
+      } catch (error) {
+        // Safety net: any unexpected error in this candidate (e.g. from
+        // parseTimecode, buildCommentBundle, or code between try blocks)
+        // is caught here so other candidates still get processed.
+        const msg = errorMessage(error, "Unexpected candidate processing error");
+        warnings.push({ stage: "clip", candidateId: candidate.id, message: msg });
+        emitProgress({ stage: "clip", status: "error", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: errorMessage(error, "Candidate processing failed") });
+        return candidate;
+      }
     })
   );
   for (const result of processed) candidates.push(result);
@@ -566,7 +593,7 @@ export async function runArchiveAutoAnalysis(
   return {
     sourceUrl: url,
     metadata,
-    downloadedVideo: downloadedVideo as YtDlpDownloadedVideo,
+    downloadedVideo,
     chat: {
       source: fetchedChat.source,
       url: fetchedChat.url,

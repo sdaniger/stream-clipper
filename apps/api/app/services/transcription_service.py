@@ -57,9 +57,11 @@ def check_transcription_health() -> TranscriptionHealth:
 
 
 def transcribe_clip(request: TranscribeRequest) -> TranscribeResponse:
-    clip_path = resolve_media_path(request.clip_path)
+    clip_path = Path(request.clip_path)
     if not clip_path.exists() or not clip_path.is_file():
-        raise FileNotFoundError(f"Clip file not found under MEDIA_ROOT: {request.clip_path}")
+        clip_path = resolve_media_path(request.clip_path)
+    if not clip_path.exists() or not clip_path.is_file():
+        raise FileNotFoundError(f"Clip file not found: {request.clip_path}")
 
     validate_clip_file(clip_path)
 

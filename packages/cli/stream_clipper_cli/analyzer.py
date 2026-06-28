@@ -13,8 +13,7 @@ from stream_clipper_cli.scorer import (
     DEFAULT_KEYWORD_WEIGHT,
     compile_keyword_patterns,
     compute_scores,
-    count_keyword_hits,
-    extract_matched_keywords,
+    count_and_extract_keywords,
 )
 
 
@@ -97,9 +96,8 @@ def analyze_highlights(
         total_hits = 0
         all_matched: List[str] = []
         for entry in entries:
-            hits = count_keyword_hits(entry.message, pattern)
+            hits, matched = count_and_extract_keywords(entry.message, pattern, keywords)
             total_hits += hits
-            matched = extract_matched_keywords(entry.message, keywords)
             all_matched.extend(matched)
         keyword_hits_dict[bucket_id] = total_hits
         matched_keywords_dict[bucket_id] = list(set(all_matched))

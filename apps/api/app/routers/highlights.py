@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import csv
+import io
+import json
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
@@ -14,8 +18,10 @@ from app.schemas.highlights import (
     ClipCreateResponse,
     ClipBatchRequest,
     ClipBatchResponse,
+    ShortCreateRequest,
+    ShortCreateResponse,
 )
-from app.services.highlight_service import analyze, generate_clip, batch_generate_clips
+from app.services.highlight_service import analyze, generate_clip, batch_generate_clips, generate_short_video
 
 router = APIRouter(prefix="/api/gui", tags=["gui"])
 
@@ -84,14 +90,20 @@ async def analyze_highlights(req: AnalyzeRequest):
     if not Path(req.log_path).exists():
         raise HTTPException(status_code=404, detail=f"Chat log not found: {req.log_path}")
 
+    # Support keywords as list
+    kw = req.keywords
+    if req.keywords_list:
+        kw = ",".join(req.keywords_list)
+
     try:
-        highlights, timeline, metadata = analyze(
+        highlights, timeline, metadata = await asyncio.to_thread(
+            analyze,
             video_path=req.video_path,
             log_path=req.log_path,
             window=req.window,
             top=req.top,
             min_gap=req.min_gap,
-            keywords=req.keywords,
+            keywords=kw,
             keyword_weight=req.keyword_weight,
             clip_duration=req.clip_duration,
             clip_padding=req.clip_padding,
@@ -116,12 +128,15 @@ async def create_clip(req: ClipCreateRequest):
         raise HTTPException(status_code=404, detail=f"Video file not found: {req.video_path}")
 
     try:
-        output = generate_clip(
+        output = await asyncio.to_thread(
+            generate_clip,
             video_path=req.video_path,
             start=req.start,
             duration=req.duration,
             output_dir=req.output_dir,
             rank=req.rank,
+            encoder=req.encoder,
+            mode=req.mode,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Clip generation failed: {e}")
@@ -135,10 +150,13 @@ async def batch_clips(req: ClipBatchRequest):
         raise HTTPException(status_code=404, detail=f"Video file not found: {req.video_path}")
 
     try:
-        results = batch_generate_clips(
+        results = await asyncio.to_thread(
+            batch_generate_clips,
             video_path=req.video_path,
             highlights=[h.model_dump() for h in req.highlights],
             output_dir=req.output_dir,
+            encoder=req.encoder,
+            mode=req.mode,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Batch clip generation failed: {e}")
@@ -146,3 +164,93 @@ async def batch_clips(req: ClipBatchRequest):
     return ClipBatchResponse(
         clips=[ClipCreateResponse(**r) for r in results]
     )
+
+
+@router.post("/short/create", response_model=ShortCreateResponse)
+async def create_short(req: ShortCreateRequest):
+    if not Path(req.video_path).exists():
+        raise HTTPException(status_code=404, detail=f"Video file not found: {req.video_path}")
+
+    try:
+        output = await asyncio.to_thread(
+            generate_short_video,
+            video_path=req.video_path,
+            start=req.start,
+            duration=req.duration,
+            output_dir=req.output_dir,
+            rank=req.rank,
+            subtitle_text=req.subtitle_text,
+            target_width=req.target_width,
+            target_height=req.target_height,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Short video generation failed: {e}")
+
+    return ShortCreateResponse(output_file=output, success=True)
+
+
+@router.get("/export/json")
+async def export_json(video_path: str, log_path: str, window: int = 30, top: int = 10):
+    """Analyze and return JSON export."""
+    try:
+        highlights, timeline, metadata = await asyncio.to_thread(
+            analyze,
+            video_path=video_path,
+            log_path=log_path,
+            window=window,
+            top=top,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    content = json.dumps({"highlights": highlights, "timeline": timeline, "metadata": metadata}, indent=2, ensure_ascii=False)
+    return StreamingResponse(
+        iter([content]),
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=highlights.json"},
+    )
+
+
+@router.get("/export/csv")
+async def export_csv(video_path: str, log_path: str, window: int = 30, top: int = 10):
+    """Analyze and return CSV export of timeline."""
+    try:
+        highlights, timeline, metadata = await asyncio.to_thread(
+            analyze,
+            video_path=video_path,
+            log_path=log_path,
+            window=window,
+            top=top,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["start", "end", "score", "chat_count", "keyword_hits", "matched_keywords"])
+    for t in timeline:
+        writer.writerow([t["start"], t["end"], t["score"], t["chat_count"], t["keyword_hits"], ";".join(t["matched_keywords"])])
+    content = "\ufeff" + output.getvalue()
+
+    return StreamingResponse(
+        iter([content]),
+        media_type="text/csv;charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=timeline.csv"},
+    )
+
+
+@router.get("/output-files")
+async def list_output_files(output_dir: str = "output"):
+    """List generated files in the output directory."""
+    out_path = Path(output_dir)
+    if not out_path.exists() or not out_path.is_dir():
+        return {"files": [], "path": str(out_path.resolve())}
+    files = []
+    for f in sorted(out_path.iterdir()):
+        if f.is_file() and f.suffix in (".mp4", ".json", ".csv", ".srt", ".txt"):
+            files.append({
+                "name": f.name,
+                "size": f.stat().st_size,
+                "path": str(f.resolve()),
+            })
+    return {"files": files, "path": str(out_path.resolve())}

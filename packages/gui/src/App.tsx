@@ -1,172 +1,307 @@
 import React, { useState, useRef, useCallback, useEffect } from "react";
 import {
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-  ReferenceLine,
-  ReferenceArea,
-} from "recharts";
-import {
-  analyzeHighlights,
-  createClip,
-  batchCreateClips,
-  type HighlightCandidate,
-  type TimelineRow,
-  type AnalyzeResponse,
+  analyzeHighlights, createClip, batchCreateClips, createShort,
+  transcribeAudio, listOutputFiles,
+  type HighlightCandidate, type AnalyzeResponse, type OutputFileEntry,
 } from "./api";
+import VideoPreview from "./components/VideoPreview";
+import HighlightChart from "./components/HighlightChart";
+import HighlightRanking from "./components/HighlightRanking";
+import HighlightEditor from "./components/HighlightEditor";
+import LogPanel from "./components/LogPanel";
 
-function App() {
+export default function App() {
+  // ---- Input state ----
   const [videoPath, setVideoPath] = useState("");
   const [logPath, setLogPath] = useState("");
-  const [window, setWindow] = useState(30);
-  const [top, setTop] = useState(5);
-  const [minGap, setMinGap] = useState(30);
-  const [keywords, setKeywords] = useState("");
-  const [keywordWeight, setKeywordWeight] = useState(2.0);
-  const [clipDuration, setClipDuration] = useState(30);
-  const [clipPadding, setClipPadding] = useState(5);
-  const [outputDir, setOutputDir] = useState("output");
+  const [windowSec, setWindowSec] = useState(30);
+  const [topN, setTopN] = useState(10);
+  const [minGap, setMinGap] = useState(45);
+  const [keywordsText, setKeywordsText] = useState("");
+  const [encoder, setEncoder] = useState("auto");
+  const [clipMode, setClipMode] = useState("reencode");
 
-  const [loading, setLoading] = useState(false);
-  const [clipping, setClipping] = useState(false);
+  // ---- UI state ----
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [isPreviewing, setIsPreviewing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<AnalyzeResponse | null>(null);
-  const [selectedHighlight, setSelectedHighlight] = useState<HighlightCandidate | null>(null);
-  const [logs, setLogs] = useState<string[]>(["Ready"]);
+  const [selectedRank, setSelectedRank] = useState<number | null>(null);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [editedStart, setEditedStart] = useState(0);
+  const [editedEnd, setEditedEnd] = useState(30);
   const [generatedFiles, setGeneratedFiles] = useState<string[]>([]);
-  const [editStart, setEditStart] = useState("");
-  const [editEnd, setEditEnd] = useState("");
+  const [exportProgress, setExportProgress] = useState("");
+
+  // ---- Transcription state ----
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [transcriptText, setTranscriptText] = useState<string | null>(null);
+
+  // ---- Output files state ----
+  const [outputFiles, setOutputFiles] = useState<OutputFileEntry[]>([]);
+  const [outputPath, setOutputPath] = useState("");
+
+  const [logs, setLogs] = useState<string[]>(["Ready — select video and chat log to start"]);
 
   const videoRef = useRef<HTMLVideoElement>(null);
 
   const addLog = useCallback((msg: string) => {
-    setLogs((prev) => [...prev.slice(-49), `[${new Date().toLocaleTimeString()}] ${msg}`]);
+    setLogs((prev) => [...prev.slice(-99), `[${new Date().toLocaleTimeString()}] ${msg}`]);
   }, []);
 
-  // ------- Analyze -------
+  const seekVideo = useCallback((t: number) => {
+    setCurrentTime(t);
+  }, []);
+
+  // ---- Analysis ----
   const handleAnalyze = useCallback(async () => {
+    if (!videoPath.trim()) { setError("Video path is required"); return; }
+    if (!logPath.trim()) { setError("Chat log path is required"); return; }
+
     setError(null);
     setResult(null);
-    setSelectedHighlight(null);
+    setSelectedRank(null);
     setGeneratedFiles([]);
-
-    if (!videoPath.trim()) {
-      setError("Video path is required");
-      return;
-    }
-    if (!logPath.trim()) {
-      setError("Chat log path is required");
-      return;
-    }
-
-    setLoading(true);
+    setTranscriptText(null);
+    setExportProgress("");
+    setIsAnalyzing(true);
     addLog("Starting analysis...");
+
     try {
+      const kwList = keywordsText.split(",").map((s) => s.trim()).filter(Boolean);
       const res = await analyzeHighlights(videoPath, logPath, {
-        window,
-        top,
-        min_gap: minGap,
-        keywords: keywords || undefined,
-        keyword_weight: keywordWeight,
-        clip_duration: clipDuration,
-        clip_padding: clipPadding,
+        window: windowSec, top: topN, min_gap: minGap,
+        keywords_list: kwList.length > 0 ? kwList : undefined,
+        keyword_weight: 2.0, clip_padding: 5,
       });
       setResult(res);
-      addLog(`Analysis complete: ${res.highlights.length} highlights found`);
+      addLog(`Analysis complete: ${res.highlights.length} candidates found`);
+
       if (res.highlights.length > 0) {
-        setSelectedHighlight(res.highlights[0]);
-        setEditStart(String(res.highlights[0].clip_start));
-        setEditEnd(String(res.highlights[0].clip_start + res.highlights[0].clip_duration));
+        selectHighlight(res.highlights[0].rank, res.highlights);
       }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Analysis failed";
       setError(msg);
       addLog(`Error: ${msg}`);
     } finally {
-      setLoading(false);
+      setIsAnalyzing(false);
     }
-  }, [videoPath, logPath, window, top, minGap, keywords, keywordWeight, clipDuration, clipPadding, addLog]);
+  }, [videoPath, logPath, windowSec, topN, minGap, keywordsText, addLog]);
 
-  // ------- Select highlight -------
-  const handleSelectHighlight = useCallback((h: HighlightCandidate) => {
-    setSelectedHighlight(h);
-    setEditStart(String(h.clip_start));
-    setEditEnd(String(h.clip_start + h.clip_duration));
-    if (videoRef.current) {
-      videoRef.current.currentTime = h.clip_start;
-      videoRef.current.play().catch(() => {});
+  // ---- Select highlight ----
+  const selectHighlight = useCallback((rank: number, highlights?: HighlightCandidate[]) => {
+    const list = highlights || result?.highlights;
+    if (!list) return;
+    const h = list.find((c) => c.rank === rank);
+    if (!h) return;
+    setSelectedRank(rank);
+    setEditedStart(h.clip_start);
+    setEditedEnd(h.clip_start + h.clip_duration);
+    seekVideo(h.clip_start);
+  }, [result, seekVideo]);
+
+  const handleSelectHighlight = useCallback((rank: number) => {
+    selectHighlight(rank);
+  }, [selectHighlight]);
+
+  // ---- Chart click seek ----
+  const handleChartClick = useCallback((nextState: Record<string, unknown>) => {
+    const label = nextState?.activeLabel;
+    const t = typeof label === "number" ? label : typeof label === "string" ? parseFloat(label) : undefined;
+    if (t != null && !Number.isNaN(t)) {
+      seekVideo(t);
+      setCurrentTime(t);
     }
+  }, [seekVideo]);
+
+  // ---- Video time sync ----
+  const handleTimeUpdate = useCallback((t: number) => {
+    setCurrentTime(t);
   }, []);
 
-  // ------- Seek video -------
-  const handleChartClick = useCallback((data: { activeLabel?: number } | null) => {
-    if (data?.activeLabel != null && videoRef.current) {
-      videoRef.current.currentTime = data.activeLabel;
-      videoRef.current.play().catch(() => {});
-    }
+  const handleSeek = useCallback((t: number) => {
+    setCurrentTime(t);
   }, []);
 
-  // ------- Generate single clip -------
-  const handleGenerateClip = useCallback(async () => {
-    if (!selectedHighlight) return;
-    setClipping(true);
-    addLog(`Generating clip #${selectedHighlight.rank}...`);
+  // ---- Preview play ----
+  const handlePreviewPlay = useCallback(() => {
+    if (isPreviewing) {
+      setIsPreviewing(false);
+      return;
+    }
+    setIsPreviewing(true);
+    addLog(`Preview playing: ${editedStart.toFixed(1)}s – ${editedEnd.toFixed(1)}s`);
+  }, [isPreviewing, editedStart, editedEnd, addLog]);
+
+  // ---- Preview auto-stop ----
+  useEffect(() => {
+    if (!isPreviewing) return;
+    const video = videoRef.current;
+    if (!video) return;
+    const check = () => {
+      if (video.currentTime >= editedEnd || video.paused) {
+        setIsPreviewing(false);
+      }
+    };
+    video.addEventListener("timeupdate", check);
+    video.currentTime = editedStart;
+    video.play().catch(() => setIsPreviewing(false));
+    return () => {
+      video.removeEventListener("timeupdate", check);
+      video.pause();
+    };
+  }, [isPreviewing, editedStart, editedEnd]);
+
+  // ---- Set start/end from current time ----
+  const handleSetStartToCurrent = useCallback(() => {
+    setEditedStart(currentTime);
+    addLog(`Start set to ${currentTime.toFixed(1)}s`);
+  }, [currentTime, addLog]);
+
+  const handleSetEndToCurrent = useCallback(() => {
+    setEditedEnd(currentTime);
+    addLog(`End set to ${currentTime.toFixed(1)}s`);
+  }, [currentTime, addLog]);
+
+  // ---- Toggle play/pause ----
+  const handleTogglePlay = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.paused) video.play().catch(() => {});
+    else video.pause();
+  }, []);
+
+  // ---- Export single clip ----
+  const handleExportClip = useCallback(async (h?: HighlightCandidate) => {
+    const target = h ?? (selectedRank != null ? result?.highlights.find((c) => c.rank === selectedRank) : null);
+    if (!target) return;
+
+    const st = selectedRank === target.rank ? editedStart : target.clip_start;
+    const en = selectedRank === target.rank ? editedEnd : target.clip_start + target.clip_duration;
+    const dur = Math.max(1, en - st);
+
+    setIsGenerating(true);
+    addLog(`Exporting clip #${target.rank} (${st.toFixed(1)}s – ${en.toFixed(1)}s, ${encoder}/${clipMode})...`);
     try {
-      const res = await createClip(
-        videoPath,
-        parseFloat(editStart) || selectedHighlight.clip_start,
-        parseFloat(editEnd) - parseFloat(editStart) || selectedHighlight.clip_duration,
-        outputDir,
-        selectedHighlight.rank
-      );
+      const res = await createClip(videoPath, st, dur, "output", target.rank, { encoder, mode: clipMode });
       setGeneratedFiles((prev) => [...prev, res.output_file]);
-      addLog(`Clip generated: ${res.output_file}`);
+      addLog(`Exported: ${res.output_file}`);
+      refreshOutputFiles();
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Clip generation failed";
+      const msg = e instanceof Error ? e.message : "Export failed";
       setError(msg);
       addLog(`Error: ${msg}`);
     } finally {
-      setClipping(false);
+      setIsGenerating(false);
     }
-  }, [selectedHighlight, videoPath, editStart, editEnd, outputDir, addLog]);
+  }, [selectedRank, result, videoPath, editedStart, editedEnd, encoder, clipMode, addLog]);
 
-  // ------- Batch generate -------
-  const handleBatchGenerate = useCallback(async () => {
+  // ---- Batch export top N ----
+  const handleBatchExport = useCallback(async () => {
     if (!result?.highlights.length) return;
-    setClipping(true);
-    addLog(`Batch generating ${result.highlights.length} clips...`);
+    const count = Math.min(topN, result.highlights.length);
+    setIsGenerating(true);
+    setExportProgress(`0/${count}`);
+    addLog(`Batch exporting top ${count} clips (${encoder}/${clipMode})...`);
     try {
-      const res = await batchCreateClips(videoPath, result.highlights, outputDir);
-      const files = res.clips.map((c) => c.output_file).filter(Boolean);
+      const res = await batchCreateClips(videoPath, result.highlights.slice(0, count), "output", { encoder, mode: clipMode });
+      const files = res.clips.filter((c) => c.success).map((c) => c.output_file);
       setGeneratedFiles((prev) => [...prev, ...files]);
-      addLog(`Generated ${files.length}/${result.highlights.length} clips`);
+      setExportProgress(`${files.length}/${count}`);
+      addLog(`Exported ${files.length}/${count} clips`);
+      refreshOutputFiles();
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Batch generation failed";
+      const msg = e instanceof Error ? e.message : "Batch export failed";
       setError(msg);
       addLog(`Error: ${msg}`);
     } finally {
-      setClipping(false);
+      setIsGenerating(false);
+      setExportProgress("");
     }
-  }, [result, videoPath, outputDir, addLog]);
+  }, [result, videoPath, topN, encoder, clipMode, addLog]);
 
-  // ------- Save JSON -------
+  // ---- Create Short ----
+  const handleCreateShort = useCallback(async (h: HighlightCandidate) => {
+    const st = selectedRank === h.rank ? editedStart : h.clip_start;
+    const en = selectedRank === h.rank ? editedEnd : h.clip_start + h.clip_duration;
+    const dur = Math.max(1, en - st);
+
+    setIsGenerating(true);
+    addLog(`Creating short video #${h.rank}...`);
+    try {
+      const res = await createShort(videoPath, st, dur, "output", h.rank);
+      setGeneratedFiles((prev) => [...prev, res.output_file]);
+      addLog(`Short created: ${res.output_file}`);
+      refreshOutputFiles();
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Short creation failed";
+      setError(msg);
+      addLog(`Error: ${msg}`);
+    } finally {
+      setIsGenerating(false);
+    }
+  }, [videoPath, selectedRank, editedStart, editedEnd, addLog]);
+
+  // ---- Transcribe ----
+  const handleTranscribe = useCallback(async () => {
+    if (!videoPath.trim()) { setError("Video path required"); return; }
+    setIsTranscribing(true);
+    setTranscriptText(null);
+    addLog("Starting transcription (GPU)...");
+    try {
+      const data = await transcribeAudio(videoPath);
+      setTranscriptText(data.text);
+      addLog(`Transcription complete: ${data.segments?.length || 0} segments, ${(data.duration_seconds || 0).toFixed(1)}s`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Transcription failed";
+      setError(msg);
+      addLog(`Error: ${msg}`);
+    } finally {
+      setIsTranscribing(false);
+    }
+  }, [videoPath, addLog]);
+
+  // ---- Output files ----
+  const refreshOutputFiles = useCallback(async () => {
+    try {
+      const res = await listOutputFiles("output");
+      setOutputFiles(res.files);
+      setOutputPath(res.path);
+    } catch {
+      // silently ignore
+    }
+  }, []);
+
+  const handleOpenOutputFolder = useCallback(async () => {
+    await refreshOutputFiles();
+    addLog(`Output folder: ${outputPath || "output/"}`);
+  }, [refreshOutputFiles, outputPath, addLog]);
+
+  // ---- Drag & drop / paste ----
+  const handlePaste = useCallback((type: "video" | "log") => async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (type === "video") setVideoPath(text.trim());
+      else setLogPath(text.trim());
+    } catch {
+      addLog("Cannot read clipboard (permission denied)");
+    }
+  }, [addLog]);
+
+  // ---- Save JSON ----
   const handleSaveJson = useCallback(() => {
     if (!result) return;
     const blob = new Blob([JSON.stringify(result.highlights, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url;
-    a.download = "highlights.json";
-    a.click();
+    a.href = url; a.download = "highlights.json"; a.click();
     URL.revokeObjectURL(url);
     addLog("Saved highlights.json");
   }, [result, addLog]);
 
-  // ------- Save CSV -------
+  // ---- Save CSV ----
   const handleSaveCsv = useCallback(() => {
     if (!result) return;
     const headers = ["start", "end", "score", "chat_count", "keyword_hits", "matched_keywords"];
@@ -177,230 +312,161 @@ function App() {
     const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url;
-    a.download = "timeline.csv";
-    a.click();
+    a.href = url; a.download = "timeline.csv"; a.click();
     URL.revokeObjectURL(url);
     addLog("Saved timeline.csv");
   }, [result, addLog]);
 
-  // ------- Format helpers -------
-  const fmt = (s: number) => {
-    const m = Math.floor(s / 60);
-    const sec = Math.floor(s % 60);
-    return `${m.toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`;
-  };
+  // ---- Selected highlight ----
+  const selectedHighlight = selectedRank != null
+    ? result?.highlights.find((h) => h.rank === selectedRank) ?? null
+    : null;
 
+  // ---- Render ----
   return (
-    <div style={{ fontFamily: "'Segoe UI', system-ui, sans-serif", background: "#0f0f11", color: "#e0e0e0", minHeight: "100vh" }}>
+    <div className="app">
       {/* Header */}
-      <header style={{ background: "#1a1a2e", padding: "12px 24px", borderBottom: "1px solid #333", display: "flex", alignItems: "center", gap: 12 }}>
-        <h1 style={{ margin: 0, fontSize: 20, fontWeight: 700, color: "#c084fc" }}>Stream Clipper GUI</h1>
-        <span style={{ fontSize: 12, color: "#888" }}>Highlight detection &amp; clipping tool</span>
-      </header>
+      <header className="app-header">
+        <h1 className="app-title">Stream Clipper Studio</h1>
 
-      <div style={{ display: "flex", gap: 16, padding: 16, height: "calc(100vh - 56px)" }}>
-        {/* Left column */}
-        <div style={{ flex: 3, display: "flex", flexDirection: "column", gap: 12, minWidth: 0 }}>
-          {/* Video preview */}
-          <div style={{ background: "#1c1c1f", borderRadius: 8, padding: 12, border: "1px solid #333" }}>
-            <video
-              ref={videoRef}
-              controls
-              style={{ width: "100%", maxHeight: 320, borderRadius: 4, background: "#000", display: "block" }}
-            >
-              {videoPath && <source src={`/api/gui/video?path=${encodeURIComponent(videoPath)}`} />}
-            </video>
-            {selectedHighlight && (
-              <div style={{ marginTop: 8, display: "flex", gap: 8, alignItems: "center", fontSize: 13 }}>
-                <label>start:</label>
-                <input value={editStart} onChange={(e) => setEditStart(e.target.value)}
-                  style={{ width: 70, background: "#2a2a2e", border: "1px solid #444", color: "#eee", borderRadius: 4, padding: "2px 6px" }} />
-                <label>end:</label>
-                <input value={editEnd} onChange={(e) => setEditEnd(e.target.value)}
-                  style={{ width: 70, background: "#2a2a2e", border: "1px solid #444", color: "#eee", borderRadius: 4, padding: "2px 6px" }} />
-                <span style={{ color: "#888" }}>({fmt(parseFloat(editStart) || 0)} – {fmt(parseFloat(editEnd) || 0)})</span>
-              </div>
-            )}
+        <div className="header-inputs">
+          <div className="header-field">
+            <label className="field-label">Video</label>
+            <input value={videoPath} onChange={(e) => setVideoPath(e.target.value)}
+              placeholder="/path/to/video.mp4" className="input input-sm" style={{ width: 240 }} />
           </div>
-
-          {/* Graph */}
-          <div style={{ background: "#1c1c1f", borderRadius: 8, padding: 12, border: "1px solid #333", flex: 1 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-              <span style={{ fontSize: 13, fontWeight: 600, color: "#aaa" }}>Engagement Timeline</span>
-              <div style={{ display: "flex", gap: 6 }}>
-                <button onClick={handleSaveJson} disabled={!result}
-                  style={{ padding: "4px 12px", background: "#2a2a3e", border: "1px solid #555", borderRadius: 4, color: "#ccc", cursor: result ? "pointer" : "not-allowed", fontSize: 12 }}>
-                  Save JSON
-                </button>
-                <button onClick={handleSaveCsv} disabled={!result}
-                  style={{ padding: "4px 12px", background: "#2a2a3e", border: "1px solid #555", borderRadius: 4, color: "#ccc", cursor: result ? "pointer" : "not-allowed", fontSize: 12 }}>
-                  Save CSV
-                </button>
-              </div>
-            </div>
-            {result?.timeline ? (
-              <div onClick={() => handleChartClick(null)}>
-                <ResponsiveContainer width="100%" height={180}>
-                  <LineChart data={result.timeline} onClick={(e) => e?.activeLabel != null && handleChartClick({ activeLabel: Number(e.activeLabel) })}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#333" />
-                    <XAxis dataKey="start" tick={{ fill: "#888", fontSize: 10 }} tickFormatter={(v: number) => fmt(v)} />
-                    <YAxis tick={{ fill: "#888", fontSize: 10 }} />
-                    <Tooltip
-                      contentStyle={{ background: "#222", border: "1px solid #444", borderRadius: 6, fontSize: 12 }}
-                      labelFormatter={(v: number) => fmt(v)}
-                    />
-                    <Line type="monotone" dataKey="score" stroke="#c084fc" strokeWidth={2} dot={false} activeDot={{ r: 4, fill: "#c084fc" }} />
-                    {result.highlights.map((h) => (
-                      <ReferenceArea key={h.rank} x1={h.start} x2={h.end} fill="rgba(192, 132, 252, 0.08)" />
-                    ))}
-                    {selectedHighlight && (
-                      <>
-                        <ReferenceLine x={selectedHighlight.start} stroke="#fbbf24" strokeDasharray="4 2" />
-                        <ReferenceLine x={selectedHighlight.end} stroke="#fbbf24" strokeDasharray="4 2" />
-                      </>
-                    )}
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-            ) : (
-              <div style={{ height: 180, display: "flex", alignItems: "center", justifyContent: "center", color: "#555", fontSize: 13 }}>
-                Run analysis to see timeline
-              </div>
-            )}
-          </div>
-
-          {/* Log panel */}
-          <div style={{ background: "#1c1c1f", borderRadius: 8, padding: "4px 12px", border: "1px solid #333", maxHeight: 100, overflow: "auto" }}>
-            <div style={{ fontSize: 11, color: "#666", marginBottom: 2 }}>Log</div>
-            {logs.map((log, i) => (
-              <div key={i} style={{ fontSize: 11, color: "#777", fontFamily: "monospace", lineHeight: 1.4 }}>{log}</div>
-            ))}
+          <div className="header-field">
+            <label className="field-label">Chat Log</label>
+            <input value={logPath} onChange={(e) => setLogPath(e.target.value)}
+              placeholder="/path/to/chat.json" className="input input-sm" style={{ width: 240 }} />
           </div>
         </div>
 
-        {/* Right column */}
-        <div style={{ flex: 2, display: "flex", flexDirection: "column", gap: 12, minWidth: 280, maxWidth: 420 }}>
-          {/* Input panel */}
-          <div style={{ background: "#1c1c1f", borderRadius: 8, padding: 12, border: "1px solid #333" }}>
-            <h2 style={{ margin: "0 0 8px", fontSize: 14, fontWeight: 600, color: "#ccc" }}>Input</h2>
-            <label style={{ fontSize: 12, color: "#888", display: "block", marginBottom: 2 }}>Video file path</label>
-            <input value={videoPath} onChange={(e) => setVideoPath(e.target.value)}
-              placeholder="/path/to/video.mp4"
-              style={{ width: "100%", background: "#2a2a2e", border: "1px solid #444", color: "#eee", borderRadius: 4, padding: "6px 8px", marginBottom: 6, fontSize: 13 }} />
-            <label style={{ fontSize: 12, color: "#888", display: "block", marginBottom: 2 }}>Chat log path (.json / .csv)</label>
-            <input value={logPath} onChange={(e) => setLogPath(e.target.value)}
-              placeholder="/path/to/chat_log.json"
-              style={{ width: "100%", background: "#2a2a2e", border: "1px solid #444", color: "#eee", borderRadius: 4, padding: "6px 8px", marginBottom: 8, fontSize: 13 }} />
-
-            <details style={{ marginBottom: 8 }}>
-              <summary style={{ fontSize: 12, color: "#888", cursor: "pointer", userSelect: "none" }}>Advanced settings</summary>
-              <div style={{ marginTop: 6, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
-                {[
-                  { label: "Window (s)", val: window, set: setWindow, min: 10, step: 5 },
-                  { label: "Top N", val: top, set: setTop, min: 1, step: 1 },
-                  { label: "Min gap (s)", val: minGap, set: setMinGap, min: 0, step: 5 },
-                  { label: "Clip duration (s)", val: clipDuration, set: setClipDuration, min: 5, step: 5 },
-                  { label: "Clip padding (s)", val: clipPadding, set: setClipPadding, min: 0, step: 1 },
-                  { label: "Keyword weight", val: keywordWeight, set: setKeywordWeight, min: 0, step: 0.5 },
-                ].map((f) => (
-                  <div key={f.label}>
-                    <label style={{ fontSize: 11, color: "#888" }}>{f.label}</label>
-                    <input type="number" value={f.val} min={f.min} step={f.step}
-                      onChange={(e) => (f.set as React.Dispatch<React.SetStateAction<number>>)(parseFloat(e.target.value) || f.min)}
-                      style={{ width: "100%", background: "#2a2a2e", border: "1px solid #444", color: "#eee", borderRadius: 4, padding: "3px 6px", fontSize: 12 }} />
-                  </div>
-                ))}
-              </div>
-              <label style={{ fontSize: 11, color: "#888", display: "block", marginTop: 4 }}>Custom keywords (comma-separated)</label>
-              <input value={keywords} onChange={(e) => setKeywords(e.target.value)}
-                placeholder="草,www,爆笑,lol"
-                style={{ width: "100%", background: "#2a2a2e", border: "1px solid #444", color: "#eee", borderRadius: 4, padding: "3px 6px", fontSize: 12 }} />
-              <label style={{ fontSize: 11, color: "#888", display: "block", marginTop: 4 }}>Output directory</label>
-              <input value={outputDir} onChange={(e) => setOutputDir(e.target.value)}
-                style={{ width: "100%", background: "#2a2a2e", border: "1px solid #444", color: "#eee", borderRadius: 4, padding: "3px 6px", fontSize: 12 }} />
-            </details>
-
-            <div style={{ display: "flex", gap: 6 }}>
-              <button onClick={handleAnalyze} disabled={loading}
-                style={{ flex: 1, padding: "8px 0", background: loading ? "#444" : "#7c3aed", border: "none", borderRadius: 6, color: "#fff", fontWeight: 600, cursor: loading ? "not-allowed" : "pointer", fontSize: 14 }}>
-                {loading ? "Analyzing..." : "Analyze"}
-              </button>
-              <button onClick={handleBatchGenerate} disabled={!result?.highlights.length || clipping}
-                style={{ flex: 1, padding: "8px 0", background: clipping ? "#444" : "#2563eb", border: "none", borderRadius: 6, color: "#fff", fontWeight: 600, cursor: !result?.highlights.length || clipping ? "not-allowed" : "pointer", fontSize: 14 }}>
-                {clipping ? "Generating..." : `Top ${top} Generate`}
-              </button>
-            </div>
+        <div className="header-actions">
+          <div className="header-field" style={{ width: 60 }}>
+            <label className="field-label">Window</label>
+            <input type="number" value={windowSec} min={10} step={5}
+              onChange={(e) => setWindowSec(Number(e.target.value) || 30)} className="input input-sm" />
           </div>
+          <div className="header-field" style={{ width: 50 }}>
+            <label className="field-label">Top N</label>
+            <input type="number" value={topN} min={1} step={1}
+              onChange={(e) => setTopN(Number(e.target.value) || 10)} className="input input-sm" />
+          </div>
+          <div className="header-field" style={{ width: 60 }}>
+            <label className="field-label">Min gap</label>
+            <input type="number" value={minGap} min={0} step={5}
+              onChange={(e) => setMinGap(Number(e.target.value) || 45)} className="input input-sm" />
+          </div>
+        </div>
 
-          {/* Error */}
-          {error && (
-            <div style={{ background: "#3b1a1a", borderRadius: 8, padding: "8px 12px", border: "1px solid #a33", color: "#f88", fontSize: 13 }}>
-              {error}
-              <button onClick={() => setError(null)} style={{ marginLeft: 8, background: "none", border: "none", color: "#f88", cursor: "pointer", fontSize: 13 }}>✕</button>
-            </div>
-          )}
+        <div className="header-buttons">
+          <button className="btn btn-primary" onClick={handleAnalyze} disabled={isAnalyzing}>
+            {isAnalyzing ? "⏳ Analyzing..." : "🔍 Analyze"}
+          </button>
+          <button className="btn btn-accent" onClick={handleBatchExport}
+            disabled={!result?.highlights.length || isGenerating}>
+            {isGenerating ? `⏳ ${exportProgress || "..."}` : `📦 Top ${topN} Export`}
+          </button>
+        </div>
+      </header>
 
-          {/* Highlight list */}
-          <div style={{ background: "#1c1c1f", borderRadius: 8, padding: 12, border: "1px solid #333", flex: 1, overflow: "auto" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
-              <span style={{ fontSize: 13, fontWeight: 600, color: "#aaa" }}>Highlights</span>
-              {generatedFiles.length > 0 && <span style={{ fontSize: 11, color: "#4ade80" }}>{generatedFiles.length} generated</span>}
-            </div>
-            {result?.highlights.map((h) => (
-              <div key={h.rank}
-                onClick={() => handleSelectHighlight(h)}
-                style={{
-                  background: selectedHighlight?.rank === h.rank ? "#2a2a3e" : "#222",
-                  border: selectedHighlight?.rank === h.rank ? "1px solid #7c3aed" : "1px solid #333",
-                  borderRadius: 6, padding: "6px 10px", marginBottom: 4, cursor: "pointer", transition: "all 0.1s",
-                }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <span style={{ fontSize: 14, fontWeight: 600, color: "#c084fc" }}>#{h.rank}</span>
-                  <span style={{ fontSize: 12, color: "#fbbf24" }}>score: {h.score}</span>
-                </div>
-                <div style={{ fontSize: 12, color: "#999", marginTop: 2 }}>
-                  {fmt(h.start)} – {fmt(h.end)} · {h.chat_count} msgs · {h.keyword_hits} kw hits
-                </div>
-                {h.reasons.length > 0 && (
-                  <div style={{ fontSize: 11, color: "#4ade80", marginTop: 2 }}>
-                    {h.reasons.slice(0, 2).join(" · ")}
-                  </div>
-                )}
-                {h.matched_keywords.length > 0 && (
-                  <div style={{ fontSize: 10, color: "#888", marginTop: 1 }}>
-                    keywords: {h.matched_keywords.slice(0, 5).join(", ")}
-                  </div>
-                )}
-                <div style={{ marginTop: 4, display: "flex", gap: 4 }}>
-                  <button onClick={(e) => { e.stopPropagation(); setSelectedHighlight(h); setEditStart(String(h.clip_start)); setEditEnd(String(h.clip_start + h.clip_duration)); }}
-                    style={{ padding: "2px 8px", background: "#2a2a3e", border: "1px solid #555", borderRadius: 4, color: "#aaa", cursor: "pointer", fontSize: 11 }}>
-                    Select
-                  </button>
-                  <button onClick={(e) => { e.stopPropagation(); handleGenerateClip(); }}
-                    disabled={clipping}
-                    style={{ padding: "2px 8px", background: "#7c3aed", border: "none", borderRadius: 4, color: "#fff", cursor: clipping ? "not-allowed" : "pointer", fontSize: 11 }}>
-                    Generate
-                  </button>
-                  {h.output_file && (
-                    <span style={{ fontSize: 10, color: "#4ade80", alignSelf: "center" }}>✓</span>
-                  )}
-                </div>
-              </div>
-            ))}
-            {!result && (
-              <div style={{ height: 120, display: "flex", alignItems: "center", justifyContent: "center", color: "#555", fontSize: 13 }}>
-                Results appear here
+      {/* Error */}
+      {error && (
+        <div className="error-bar">
+          <span>⚠ {error}</span>
+          <button onClick={() => setError(null)}>✕</button>
+        </div>
+      )}
+
+      {/* Main content */}
+      <div className="main-layout">
+        {/* Left column: video + editor */}
+        <div className="main-left">
+          <VideoPreview
+            videoPath={videoPath}
+            currentTime={currentTime}
+            editedStart={editedStart}
+            editedEnd={editedEnd}
+            isPreviewing={isPreviewing}
+            onTimeUpdate={handleTimeUpdate}
+            onSeek={handleSeek}
+            onPreviewPlay={handlePreviewPlay}
+            onSetStartToCurrent={handleSetStartToCurrent}
+            onSetEndToCurrent={handleSetEndToCurrent}
+            onTogglePlay={handleTogglePlay}
+          />
+          <HighlightEditor
+            highlight={selectedHighlight}
+            editedStart={editedStart}
+            editedEnd={editedEnd}
+            isGenerating={isGenerating}
+            encoder={encoder}
+            clipMode={clipMode}
+            onStartChange={setEditedStart}
+            onEndChange={setEditedEnd}
+            onEncoderChange={setEncoder}
+            onClipModeChange={setClipMode}
+            onSetStartToCurrent={handleSetStartToCurrent}
+            onSetEndToCurrent={handleSetEndToCurrent}
+            onPreviewPlay={handlePreviewPlay}
+            onExport={() => handleExportClip()}
+            onTranscribe={handleTranscribe}
+            isTranscribing={isTranscribing}
+            transcriptText={transcriptText}
+          />
+        </div>
+
+        {/* Right column: ranking */}
+        <div className="main-right">
+          <HighlightRanking
+            highlights={result?.highlights ?? []}
+            selectedRank={selectedRank}
+            generatedFiles={generatedFiles}
+            onSelect={handleSelectHighlight}
+            onExport={handleExportClip}
+            onCreateShort={handleCreateShort}
+          />
+        </div>
+      </div>
+
+      {/* Chart */}
+      <div className="chart-area">
+        <HighlightChart
+          timeline={result?.timeline ?? []}
+          highlights={result?.highlights ?? []}
+          selectedRank={selectedRank}
+          currentTime={currentTime}
+          onChartClick={handleChartClick as any}
+        />
+      </div>
+
+      {/* Footer: Log + Export + Output files */}
+      <div className="footer-area">
+        <div className="footer-left">
+          <LogPanel logs={logs} />
+        </div>
+        <div className="footer-right">
+          <div className="export-actions">
+            <button className="btn btn-xs btn-ghost" onClick={handleSaveJson} disabled={!result}>
+              💾 JSON
+            </button>
+            <button className="btn btn-xs btn-ghost" onClick={handleSaveCsv} disabled={!result}>
+              📊 CSV
+            </button>
+            <button className="btn btn-xs btn-ghost" onClick={handleOpenOutputFolder}>
+              📁 Output
+            </button>
+            {generatedFiles.length > 0 && (
+              <div className="generated-badge">
+                🎬 {generatedFiles.length} files
               </div>
             )}
           </div>
-
-          {/* Generated files */}
-          {generatedFiles.length > 0 && (
-            <div style={{ background: "#1c1c1f", borderRadius: 8, padding: "6px 12px", border: "1px solid #333", maxHeight: 80, overflow: "auto" }}>
-              <div style={{ fontSize: 11, color: "#4ade80", marginBottom: 2 }}>Generated files</div>
-              {generatedFiles.map((f, i) => (
-                <div key={i} style={{ fontSize: 11, color: "#aaa", fontFamily: "monospace" }}>{f}</div>
+          {outputFiles.length > 0 && (
+            <div className="output-files-bar">
+              {outputFiles.slice(-5).map((f) => (
+                <span key={f.name} className="output-file-chip">{f.name}</span>
               ))}
             </div>
           )}
@@ -409,5 +475,3 @@ function App() {
     </div>
   );
 }
-
-export default App;
