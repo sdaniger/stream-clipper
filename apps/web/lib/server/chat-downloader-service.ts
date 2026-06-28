@@ -268,12 +268,15 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
     seen_lock = Lock()
     print_lock = Lock()
     total_lock = Lock()
+    gql_lock = Lock()   # serialize GQL calls — urllib CookieJar is not thread-safe
     seen_ids = set()
     total = [0]   # mutable container so threads can increment it
     deadline = _time.time() + timeout_seconds
 
     # Per-segment worker: fetches comments from one time offset.
     # Returns a list of (json_line, timestamp, comment_id) tuples.
+    # GQL calls are serialized via gql_lock because the shared
+    # urllib CookieJar is not safe for concurrent access.
     def fetch_segment(seg_index, seg_offset, seg_limit, deadline):
         results = []
         seen = set()
@@ -286,7 +289,8 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
                 break
 
             try:
-                resp_data = gql_comments(vod_id, page_offset)
+                with gql_lock:
+                    resp_data = gql_comments(vod_id, page_offset)
             except Exception as e:
                 if total[0] > 0:
                     break
@@ -356,10 +360,11 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
 
         return results, False
 
-    # Launch parallel segment fetches (8 threads — safe for network I/O)
+    # Launch parallel segment fetches (4 threads — balances parallelism
+    # with Twitch rate limiting and the serialized GQL lock).
     futures = {}
     fatal_error = False
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         for seg in range(segment_count):
             seg_offset = int(seg * duration / segment_count)
             futures[executor.submit(
@@ -374,6 +379,8 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
                 results, err = future.result()
                 if err and total[0] == 0:
                     fatal_error = True
+                    with print_lock:
+                        print(f"Segment {seg} failed with fatal GQL error", file=sys.stderr)
                 for (json_line, ts, cid) in results:
                     if total[0] >= max_messages:
                         break
@@ -386,15 +393,16 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
                         total[0] += 1
                     with print_lock:
                         print(json_line)
-            except Exception:
-                pass
+            except Exception as e:
+                with print_lock:
+                    print(f"Segment {seg} crashed: {str(e).strip().replace(chr(10), ' ')}", file=sys.stderr)
 
     total_count = total[0]
     if total_count == 0:
         print("No comments collected", file=sys.stderr)
         sys.exit(1)
 
-    print(f"collected {total} comments", file=sys.stderr)
+    print(f"collected {total_count} comments", file=sys.stderr)
 
 fetch_chat(extract_vod_id(${safeUrl}), ${maxMessages})`
   );
