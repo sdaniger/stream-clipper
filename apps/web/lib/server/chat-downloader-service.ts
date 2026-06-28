@@ -199,7 +199,7 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
         req.add_header("Content-Type", "application/json")
         req.add_header("Origin", "https://www.twitch.tv")
         req.add_header("Referer", "https://www.twitch.tv/")
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             result = json.loads(resp.read())
         token = result.get("token")
         if not token:
@@ -215,7 +215,7 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
     def gql_comments(video_id, offset):
         query = [{
             "operationName": "VideoCommentsByOffsetOrCursor",
-            "variables": {"videoID": video_id, "contentOffsetSeconds": offset},
+            "variables": {"videoID": video_id, "contentOffsetSeconds": offset, "first": 100},
             "extensions": {"persistedQuery": {"version": 1, "sha256Hash": HASH_COMMENTS}}
         }]
         data = json.dumps(query).encode()
@@ -225,7 +225,7 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
         req.add_header("Client-Integrity", integrity_token)
         req.add_header("Origin", "https://www.twitch.tv")
         req.add_header("Referer", "https://www.twitch.tv/")
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read())
 
     duration = DURATION
@@ -239,7 +239,7 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
             req.add_header("Client-Integrity", integrity_token)
             req.add_header("Origin", "https://www.twitch.tv")
             req.add_header("Referer", "https://www.twitch.tv/")
-            meta = json.loads(urllib.request.urlopen(req, timeout=15).read())
+            meta = json.loads(urllib.request.urlopen(req, timeout=10).read())
             duration = int(meta.get("data", {}).get("video", {}).get("lengthSeconds", 3600))
         except Exception:
             duration = 3600
@@ -247,7 +247,7 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
     if duration <= 0:
         duration = 3600
 
-    segment_count = max(1, min(max_messages // 100, 200))
+    segment_count = max(1, min(max_messages // 200, 100))
     comments_per_segment = max(1, max_messages // segment_count)
 
     # Per-segment worker: fetches comments from one time offset using
