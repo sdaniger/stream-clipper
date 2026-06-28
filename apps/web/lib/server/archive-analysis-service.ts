@@ -12,6 +12,7 @@ import { generateClip, generateExportPackage, parseTimecode, writeCommentAssets 
 import { proxyJsonRequest } from "@/lib/server/api-proxy";
 import { fetchChatWithChatDownloader, defaultChatLimitForDuration, type FetchChatDownloaderResult } from "@/lib/server/chat-downloader-service";
 import { createLimiter } from "@/lib/concurrency";
+import { cpus } from "node:os";
 import { downloadVideoWithYtDlp, extractYtDlpMetadata, type YtDlpDownloadedVideo, type YtDlpMetadata } from "@/lib/server/yt-dlp-service";
 
 export type ArchiveProgressStage = "metadata" | "download" | "chat" | "analysis" | "clip" | "transcription" | "comments" | "package";
@@ -227,17 +228,24 @@ export async function runArchiveAutoAnalysis(
 
   // Phase 2 parallelization: process all candidates concurrently.
   //
-  // Each candidate's pipeline is clip -> transcribe -> comments -> package, but
-  // across candidates the work is independent. We process them concurrently:
-  //   1. Clip generation in parallel (CPU + ffmpeg I/O, no concurrency limit needed;
-  //      the OS scheduler handles CPU contention on multi-core hosts).
-  //   2. Transcription is concurrency-limited to 2 to protect FastAPI memory
-  //      (faster-whisper uses ~1GB per concurrent request).
-  //   3. Comments + package generation per candidate (CPU + file I/O) — fast
-  //      enough that limiting is unnecessary.
-  //
-  // The result array preserves source order so UI indices stay stable.
+  // Per-candidate stages:
+  //   1. Clip generation — concurrency-limited to CPU cores / 2 to
+  //      prevent ffmpeg thrashing (each ffmpeg instance tries to use
+  //      all cores in reencode mode).
+  //   2. Transcription + comments — these are INDEPENDENT (transcription
+  //      needs the clip file, comments need the chat messages). They
+  //      run in parallel inside each candidate, cutting wall-clock
+  //      time by ~30% per candidate.
+  //      Transcription is limited to 2 concurrent (faster-whisper uses
+  //      ~1GB RAM per request).
+  //      Comments are CPU + small file I/O — fast enough to be unlimited.
+  //   3. Export package — runs after both transcription and comments
+  //      complete (needs transcription outputs + comment bundle).
   const candidateCount = sourceCandidates.length;
+  const cpuCount = cpus().length;
+  // Re-encode: concurrency = cores / 2. Copy mode can use more, but
+  // we keep a conservative cap to avoid I/O thrash on HDDs.
+  const clipLimit = createLimiter(Math.max(1, Math.floor(cpuCount / 2)));
   const transcribeLimit = createLimiter(2);
 
   const processed = await Promise.all(
@@ -251,13 +259,13 @@ export async function runArchiveAutoAnalysis(
         return candidate;
       }
 
-      // Stage 1: clip generation
+      // Stage 1: clip generation (concurrency-limited)
       const clipStartTime = Date.now();
       emitProgress({ stage: "clip", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Generating clip for candidate ${indexLabel}...` });
       let generatedClip: GeneratedClipReference | undefined;
       let generatedCandidate = candidate;
       try {
-        generatedClip = await generateClip({
+        generatedClip = await clipLimit(() => generateClip({
           inputPath: downloadedVideo.inputPath,
           candidateId: candidate.id,
           variantId: selectedVariant.id,
@@ -271,7 +279,7 @@ export async function runArchiveAutoAnalysis(
             const pct = Math.round(ffmpegProgress.percent);
             emitProgress({ stage: "clip", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Clip ${indexLabel} - ${pct}% done, ETA ${eta}s (elapsed ${elapsed}s)` });
           }
-        });
+        }));
         generatedCandidate = { ...generatedCandidate, generatedClip };
         const totalElapsed = Math.round((Date.now() - clipStartTime) / 1000);
         emitProgress({ stage: "clip", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Clip generated in ${totalElapsed}s` });
@@ -280,85 +288,101 @@ export async function runArchiveAutoAnalysis(
         emitProgress({ stage: "clip", status: "error", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: errorMessage(error, "Clip generation failed") });
       }
 
-      // Stage 2: transcription (concurrency-limited to protect FastAPI)
+      // Stages 2+3 run IN PARALLEL: transcription and comments are
+      // independent — transcription hits the FastAPI backend, comments
+      // are local CPU + file I/O from already-downloaded chat data.
       let transcription: ClipTranscription | undefined;
-      if (generatedClip && shouldTranscribe) {
-        emitProgress({ stage: "transcription", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Transcribing clip ${indexLabel}...` });
-        try {
-          transcription = await transcribeLimit(() => transcribeClip(generatedClip!.outputPath, input));
-          generatedCandidate = applyTranscription(generatedCandidate, transcription);
-          emitProgress({ stage: "transcription", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Transcribed ${transcription.segments.length} segments` });
-        } catch (error) {
-          const detail = errorMessage(error, "Could not transcribe generated clip.");
-          const hint = detail.includes("fetch failed") || detail.includes("ECONNREFUSED")
-            ? " (Start the Python FastAPI backend on http://127.0.0.1:8000, or uncheck 'transcribe' in the archive panel.)"
-            : "";
-          warnings.push({ stage: "transcription", candidateId: candidate.id, message: detail + hint });
-          emitProgress({ stage: "transcription", status: "error", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: errorMessage(error, "Transcription failed") });
+
+      // Build the precomputed clip window values (shared by both branches)
+      const clipStartSeconds = parseTimecode(selectedVariant.start, "clip start");
+      const clipDurationSeconds = parseTimecode(selectedVariant.duration, "clip duration");
+
+      // Pre-build the comment bundle so it's available for both comment
+      // assets and later for the export package (avoids double computing)
+      let commentBundle: ReturnType<typeof buildCommentBundle> | undefined;
+
+      if (generatedClip) {
+        const tasks: Promise<unknown>[] = [];
+
+        // Task A: transcription (if enabled, concurrency-limited)
+        if (shouldTranscribe) {
+          emitProgress({ stage: "transcription", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Transcribing clip ${indexLabel}...` });
+          tasks.push(
+            transcribeLimit(() => transcribeClip(generatedClip!.outputPath, input))
+              .then((tx) => {
+                transcription = tx;
+                generatedCandidate = applyTranscription(generatedCandidate, tx);
+                emitProgress({ stage: "transcription", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Transcribed ${tx.segments.length} segments` });
+              })
+              .catch((error) => {
+                const detail = errorMessage(error, "Could not transcribe generated clip.");
+                const hint = detail.includes("fetch failed") || detail.includes("ECONNREFUSED")
+                  ? " (Start the Python FastAPI backend on http://127.0.0.1:8000, or uncheck 'transcribe' in the archive panel.)"
+                  : "";
+                warnings.push({ stage: "transcription", candidateId: candidate.id, message: detail + hint });
+                emitProgress({ stage: "transcription", status: "error", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: errorMessage(error, "Transcription failed") });
+              })
+          );
+        } else {
+          emitProgress({
+            stage: "transcription", status: "done", candidateId: candidate.id,
+            candidateIndex: candidateIndex + 1, candidateTotal: candidateCount,
+            message: "Transcription skipped (disabled in panel)"
+          });
         }
-      } else if (generatedClip && !shouldTranscribe) {
-        // The user explicitly disabled transcription in the archive panel.
-        emitProgress({
-          stage: "transcription",
-          status: "done",
-          candidateId: candidate.id,
-          candidateIndex: candidateIndex + 1,
-          candidateTotal: candidateCount,
-          message: "Transcription skipped (disabled in panel)"
-        });
-      }
 
-      // Stage 3: comment assets (CPU + small file I/O).
-      // Comments are sourced from the REAL chat messages that fall in the
-      // clip's time window, not synthetic placeholders. This matches the
-      // narinico tool's behavior where every Twitch chat message at its
-      // real timestamp becomes a scrolling NicoNico comment in the output.
-      emitProgress({ stage: "comments", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Generating comment JSON/ASS assets for ${indexLabel}...` });
-      try {
-        const clipStartSeconds = parseTimecode(selectedVariant.start, "clip start");
-        const clipDurationSeconds = parseTimecode(selectedVariant.duration, "clip duration");
-        const commentAssets = await generateCandidateCommentAssets(
-          generatedCandidate,
-          selectedVariant.duration,
-          fetchedChat.normalizedMessages,
-          clipStartSeconds,
-          clipStartSeconds + clipDurationSeconds
+        // Task B: comment assets + bundle (always runs, parallel with transcription)
+        emitProgress({ stage: "comments", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Generating comment JSON/ASS assets for ${indexLabel}...` });
+        tasks.push(
+          (async () => {
+            try {
+              const commentAssets = await generateCandidateCommentAssets(
+                generatedCandidate,
+                selectedVariant.duration,
+                fetchedChat.normalizedMessages,
+                clipStartSeconds,
+                clipStartSeconds + clipDurationSeconds
+              );
+
+              commentBundle = buildCommentBundle(
+                generatedCandidate,
+                selectedVariant.duration,
+                fetchedChat.normalizedMessages,
+                clipStartSeconds,
+                clipStartSeconds + clipDurationSeconds
+              );
+
+              generatedCandidate = {
+                ...generatedCandidate,
+                commentAssets,
+                commentOverlayItems: commentBundle.comments as ClipCandidate["commentOverlayItems"]
+              };
+              emitProgress({ stage: "comments", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Comment assets generated` });
+            } catch (error) {
+              warnings.push({ stage: "comments", candidateId: candidate.id, message: errorMessage(error, "Could not generate comment assets.") });
+              emitProgress({ stage: "comments", status: "error", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: errorMessage(error, "Comment asset generation failed") });
+            }
+          })()
         );
 
-        // Also build the comment bundle for the overlay data so the
-        // frontend preview can render real chat-driven danmaku.
-        const commentBundle = buildCommentBundle(
-          generatedCandidate,
-          selectedVariant.duration,
-          fetchedChat.normalizedMessages,
-          clipStartSeconds,
-          clipStartSeconds + clipDurationSeconds
-        );
-
-        generatedCandidate = {
-          ...generatedCandidate,
-          commentAssets,
-          commentOverlayItems: commentBundle.comments as ClipCandidate["commentOverlayItems"]
-        };
-        emitProgress({ stage: "comments", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Comment assets generated` });
-      } catch (error) {
-        warnings.push({ stage: "comments", candidateId: candidate.id, message: errorMessage(error, "Could not generate comment assets.") });
-        emitProgress({ stage: "comments", status: "error", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: errorMessage(error, "Comment asset generation failed") });
+        // Wait for both parallel tasks to complete
+        await Promise.all(tasks);
       }
 
-      // Stage 4: export package (file copies)
-      if (shouldGeneratePackages) {
-        emitProgress({ stage: "package", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Generating editor package for ${indexLabel}...` });
-        try {
-          const clipStartSeconds = parseTimecode(selectedVariant.start, "clip start");
-          const clipDurationSeconds = parseTimecode(selectedVariant.duration, "clip duration");
-          const commentBundle = buildCommentBundle(
+      // Stage 4: export package (file copies — needs both transcription + commentBundle)
+      if (shouldGeneratePackages && generatedClip) {
+        // Rebuild commentBundle if not already built (e.g. comment stage failed)
+        if (!commentBundle) {
+          commentBundle = buildCommentBundle(
             generatedCandidate,
             selectedVariant.duration,
             fetchedChat.normalizedMessages,
             clipStartSeconds,
             clipStartSeconds + clipDurationSeconds
           );
+        }
+        emitProgress({ stage: "package", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Generating editor package for ${indexLabel}...` });
+        try {
           const exportPackage = await generateExportPackage({
             candidate: generatedCandidate,
             selectedVariant,

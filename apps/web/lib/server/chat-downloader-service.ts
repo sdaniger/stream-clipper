@@ -172,6 +172,8 @@ function buildTwitchScript(url: string, maxMessages: number, durationSeconds?: n
   return (
 `import json, re, sys, time as _time, os, urllib.request, urllib.error
 from http.cookiejar import CookieJar
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 GQL_URL = "https://gql.twitch.tv/gql"
 CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
@@ -262,43 +264,44 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
     segment_count = max(1, min(max_messages // 100, 200))
     comments_per_segment = max(1, max_messages // segment_count)
 
+    # Shared state guarded by locks for thread-safe access
+    seen_lock = Lock()
+    print_lock = Lock()
+    total_lock = Lock()
     seen_ids = set()
-    total = 0
+    total = [0]   # mutable container so threads can increment it
     deadline = _time.time() + timeout_seconds
 
-    for seg in range(segment_count):
-        if _time.time() >= deadline:
-            break
-        if total >= max_messages:
-            break
-
-        seg_offset = int(seg * duration / segment_count)
-        remaining = max_messages - total
-        seg_limit = min(comments_per_segment, remaining)
-
+    # Per-segment worker: fetches comments from one time offset.
+    # Returns a list of (json_line, timestamp, comment_id) tuples.
+    def fetch_segment(seg_index, seg_offset, seg_limit, deadline):
+        results = []
+        seen = set()
         page_offset = seg_offset
-        seg_fetched = 0
+        fetched = 0
         stale = 0
 
-        while seg_fetched < seg_limit and total < max_messages:
+        while fetched < seg_limit and total[0] < max_messages:
             if _time.time() >= deadline:
                 break
 
             try:
                 resp_data = gql_comments(vod_id, page_offset)
             except Exception as e:
-                if total > 0:
+                if total[0] > 0:
                     break
-                print(f"GQL failed: {str(e).strip().replace(chr(10), ' ')}", file=sys.stderr)
-                sys.exit(1)
+                with print_lock:
+                    print(f"GQL failed: {str(e).strip().replace(chr(10), ' ')}", file=sys.stderr)
+                return results, True  # signal fatal error
 
             if isinstance(resp_data, list):
                 resp_data = resp_data[0]
             if "errors" in resp_data:
-                if total == 0:
+                if total[0] == 0:
                     err_msgs = [e.get("message", str(e)) for e in resp_data["errors"]]
-                    print(f"GQL errors: {'; '.join(err_msgs)}", file=sys.stderr)
-                    sys.exit(1)
+                    with print_lock:
+                        print(f"GQL errors: {'; '.join(err_msgs)}", file=sys.stderr)
+                    return results, True
                 break
 
             edges = (resp_data.get("data", {}).get("video", {}).get("comments", {}).get("edges") or [])
@@ -316,10 +319,10 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
                 if not node:
                     continue
                 cid = node.get("id")
-                if cid and cid in seen_ids:
+                if cid and cid in seen:
                     continue
                 if cid:
-                    seen_ids.add(cid)
+                    seen.add(cid)
 
                 ts = node.get("contentOffsetSeconds")
                 if ts is None:
@@ -341,18 +344,53 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
                     "author": {"display_name": user, "id": str(commenter.get("id", ""))},
                     "message_type": "data"
                 }
-                print(json.dumps(out, default=str))
-                total += 1
-                seg_fetched += 1
+                results.append((json.dumps(out, default=str), ts, cid))
+                fetched += 1
                 if ts > max_os:
                     max_os = ts
-                if total >= max_messages:
+                if fetched >= seg_limit:
                     break
 
-            if seg_fetched < seg_limit:
+            if fetched < seg_limit:
                 page_offset = int(max_os) + 3
 
-    if total == 0:
+        return results, False
+
+    # Launch parallel segment fetches (8 threads — safe for network I/O)
+    futures = {}
+    fatal_error = False
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        for seg in range(segment_count):
+            seg_offset = int(seg * duration / segment_count)
+            futures[executor.submit(
+                fetch_segment, seg, seg_offset, comments_per_segment, deadline
+            )] = seg
+
+        # Collect and merge results, deduplicating across threads
+        for future in as_completed(futures):
+            if _time.time() >= deadline or total[0] >= max_messages or fatal_error:
+                continue
+            try:
+                results, err = future.result()
+                if err and total[0] == 0:
+                    fatal_error = True
+                for (json_line, ts, cid) in results:
+                    if total[0] >= max_messages:
+                        break
+                    with seen_lock:
+                        if cid and cid in seen_ids:
+                            continue
+                        if cid:
+                            seen_ids.add(cid)
+                    with total_lock:
+                        total[0] += 1
+                    with print_lock:
+                        print(json_line)
+            except Exception:
+                pass
+
+    total_count = total[0]
+    if total_count == 0:
         print("No comments collected", file=sys.stderr)
         sys.exit(1)
 
