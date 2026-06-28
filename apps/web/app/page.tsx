@@ -683,13 +683,11 @@ function SimpleCandidateCard({
               </div>
             )}
 
-            {/* LLM evaluation */}
-            {hasTranscription && (
-              <LlmEvaluationBox
-                candidate={candidate}
-                onEvaluated={(evaluation) => onUpdate({ ...candidate, llmEvaluation: evaluation })}
-              />
-            )}
+            {/* LLM evaluation — always visible when expanded */}
+            <LlmEvaluationBox
+              candidate={candidate}
+              onEvaluated={(evaluation) => onUpdate({ ...candidate, llmEvaluation: evaluation })}
+            />
 
             {/* warnings */}
             {candidate.warnings.length > 0 && (
@@ -942,6 +940,15 @@ function LlmEvaluationBox({
     return (
       <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3 text-xs text-slate-500">
         確認中...
+      </div>
+    );
+  }
+
+  // Transcription required but not yet available
+  if (!candidate.transcription) {
+    return (
+      <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3 text-xs text-slate-500">
+        AI 評価には文字起こしが必要です。「詳細設定」で文字起こしを ON にしてパイプラインを再実行してください。
       </div>
     );
   }
