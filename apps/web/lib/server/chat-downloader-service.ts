@@ -171,7 +171,8 @@ function buildTwitchScript(url: string, maxMessages: number, durationSeconds?: n
   const duration = Math.max(1, Math.round(durationSeconds ?? 0));
   return (
 `import json, re, sys, time as _time, os, urllib.request, urllib.error
-from http.cookiejar import CookieJar
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 GQL_URL = "https://gql.twitch.tv/gql"
 CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
@@ -190,19 +191,6 @@ def extract_vod_id(url):
     sys.exit(1)
 
 def fetch_chat(vod_id, max_messages, timeout_seconds=600):
-    cj = CookieJar()
-    opener = urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(cj)
-    )
-    opener.addheaders = [("User-Agent", UA)]
-
-    try:
-        opener.open(urllib.request.Request(
-            "https://www.twitch.tv/videos/" + vod_id,
-            headers={"User-Agent": UA}
-        ), timeout=20)
-    except Exception as e:
-        print(f"Twitch visit: {str(e).strip().replace(chr(10), ' ')}", file=sys.stderr)
 
     def get_integrity():
         data = json.dumps({}).encode()
@@ -211,7 +199,7 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
         req.add_header("Content-Type", "application/json")
         req.add_header("Origin", "https://www.twitch.tv")
         req.add_header("Referer", "https://www.twitch.tv/")
-        with opener.open(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             result = json.loads(resp.read())
         token = result.get("token")
         if not token:
@@ -237,7 +225,7 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
         req.add_header("Client-Integrity", integrity_token)
         req.add_header("Origin", "https://www.twitch.tv")
         req.add_header("Referer", "https://www.twitch.tv/")
-        with opener.open(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:
             return json.loads(resp.read())
 
     duration = DURATION
@@ -251,7 +239,7 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
             req.add_header("Client-Integrity", integrity_token)
             req.add_header("Origin", "https://www.twitch.tv")
             req.add_header("Referer", "https://www.twitch.tv/")
-            meta = json.loads(opener.open(req, timeout=15).read())
+            meta = json.loads(urllib.request.urlopen(req, timeout=15).read())
             duration = int(meta.get("data", {}).get("video", {}).get("lengthSeconds", 3600))
         except Exception:
             duration = 3600
@@ -262,101 +250,106 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
     segment_count = max(1, min(max_messages // 100, 200))
     comments_per_segment = max(1, max_messages // segment_count)
 
-    seen_ids = set()
-    total = 0
-    deadline = _time.time() + timeout_seconds
-
-    for seg in range(segment_count):
-        if _time.time() >= deadline:
-            break
-        if total >= max_messages:
-            break
-
-        seg_offset = int(seg * duration / segment_count)
-        remaining = max_messages - total
-        seg_limit = min(comments_per_segment, remaining)
-
+    # Per-segment worker: fetches comments from one time offset using
+    # urllib.request.urlopen (fully thread-safe, no shared state).
+    # Returns list of (json_line, timestamp, comment_id, error_flag).
+    def fetch_segment(seg_offset, seg_limit, deadline):
+        results = []
+        seen = set()
         page_offset = seg_offset
-        seg_fetched = 0
+        fetched = 0
         stale = 0
-
-        while seg_fetched < seg_limit and total < max_messages:
-            if _time.time() >= deadline:
-                break
-
+        while fetched < seg_limit:
+            if _time.time() >= deadline: break
             try:
                 resp_data = gql_comments(vod_id, page_offset)
-            except Exception as e:
-                if total > 0:
-                    break
-                print(f"GQL failed: {str(e).strip().replace(chr(10), ' ')}", file=sys.stderr)
-                sys.exit(1)
-
-            if isinstance(resp_data, list):
-                resp_data = resp_data[0]
+            except Exception:
+                stale += 1
+                if stale >= 3: break
+                page_offset += 30
+                continue
+            if isinstance(resp_data, list): resp_data = resp_data[0]
             if "errors" in resp_data:
-                if total == 0:
-                    err_msgs = [e.get("message", str(e)) for e in resp_data["errors"]]
-                    print(f"GQL errors: {'; '.join(err_msgs)}", file=sys.stderr)
-                    sys.exit(1)
-                break
-
+                return results, True  # fatal
             edges = (resp_data.get("data", {}).get("video", {}).get("comments", {}).get("edges") or [])
             if not edges:
                 stale += 1
-                if stale >= 3:
-                    break
+                if stale >= 3: break
                 page_offset += 30
                 continue
-
             stale = 0
             max_os = page_offset
             for edge in edges:
                 node = edge.get("node")
-                if not node:
-                    continue
+                if not node: continue
                 cid = node.get("id")
-                if cid and cid in seen_ids:
-                    continue
-                if cid:
-                    seen_ids.add(cid)
-
+                if cid and cid in seen: continue
+                if cid: seen.add(cid)
                 ts = node.get("contentOffsetSeconds")
-                if ts is None:
-                    continue
-                try:
-                    ts = round(float(ts), 3)
-                except (TypeError, ValueError):
-                    continue
-
+                if ts is None: continue
+                try: ts = round(float(ts), 3)
+                except: continue
                 commenter = node.get("commenter") or {}
                 user = str(commenter.get("displayName") or commenter.get("login") or "unknown")
                 fragments = node.get("message", {}).get("fragments") or []
-                if not fragments:
-                    continue
-
+                if not fragments: continue
                 out = {
-                    "message": fragments,
-                    "time_in_seconds": ts,
+                    "message": fragments, "time_in_seconds": ts,
                     "author": {"display_name": user, "id": str(commenter.get("id", ""))},
                     "message_type": "data"
                 }
-                print(json.dumps(out, default=str))
-                total += 1
-                seg_fetched += 1
-                if ts > max_os:
-                    max_os = ts
-                if total >= max_messages:
-                    break
-
-            if seg_fetched < seg_limit:
+                results.append((json.dumps(out, default=str), ts, cid))
+                fetched += 1
+                if ts > max_os: max_os = ts
+                if fetched >= seg_limit: break
+            if fetched < seg_limit:
                 page_offset = int(max_os) + 3
+        return results, False
 
-    if total == 0:
+    # Shared state for cross-thread deduplication and ordering
+    seen_lock = Lock()
+    print_lock = Lock()
+    total_lock = Lock()
+    seen_ids = set()
+    total = [0]
+    deadline = _time.time() + timeout_seconds
+
+    futures = {}
+    fatal_error = False
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        for seg in range(segment_count):
+            seg_offset = int(seg * duration / segment_count)
+            futures[executor.submit(
+                fetch_segment, seg_offset, comments_per_segment, deadline
+            )] = seg
+
+        for future in as_completed(futures):
+            if _time.time() >= deadline or total[0] >= max_messages or fatal_error:
+                continue
+            seg = futures[future]
+            try:
+                results, err = future.result()
+                if err and total[0] == 0:
+                    fatal_error = True
+                    with print_lock:
+                        print(f"Segment {seg} GQL fatal error", file=sys.stderr)
+                for (json_line, ts, cid) in results:
+                    if total[0] >= max_messages: break
+                    with seen_lock:
+                        if cid and cid in seen_ids: continue
+                        if cid: seen_ids.add(cid)
+                    with total_lock: total[0] += 1
+                    with print_lock: print(json_line)
+            except Exception as e:
+                with print_lock:
+                    print(f"Segment {seg} crashed: {str(e).strip().replace(chr(10), ' ')}", file=sys.stderr)
+
+    total_count = total[0]
+    if total_count == 0:
         print("No comments collected", file=sys.stderr)
         sys.exit(1)
 
-    print(f"collected {total} comments", file=sys.stderr)
+    print(f"collected {total_count} comments", file=sys.stderr)
 
 fetch_chat(extract_vod_id(${safeUrl}), ${maxMessages})`
   );
