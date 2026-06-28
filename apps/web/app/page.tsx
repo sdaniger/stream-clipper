@@ -474,6 +474,10 @@ export default function Home() {
                       prev.map((c) => (c.id === updated.id ? updated : c))
                     );
                   }}
+                  onDelete={() => {
+                    setCandidates((prev) => prev.filter((c) => c.id !== candidate.id));
+                    if (expandedId === candidate.id) setExpandedId(null);
+                  }}
                 />
               ))}
             </div>
@@ -513,12 +517,14 @@ function SimpleCandidateCard({
   candidate,
   isExpanded,
   onToggle,
-  onUpdate
+  onUpdate,
+  onDelete
 }: {
   candidate: ClipCandidate;
   isExpanded: boolean;
   onToggle: () => void;
   onUpdate: (c: ClipCandidate) => void;
+  onDelete: () => void;
 }) {
   const hasClip = Boolean(candidate.generatedClip);
   const hasTranscription = Boolean(candidate.transcription);
@@ -552,6 +558,19 @@ function SimpleCandidateCard({
             </div>
           </div>
         )}
+
+        {/* delete button — top left corner */}
+        <div className="absolute top-2 left-2">
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); onDelete(); }}
+            className="flex h-7 w-7 items-center justify-center rounded-lg bg-black/50 text-white/50 text-xs backdrop-blur transition hover:bg-red-900/70 hover:text-rose-200"
+            aria-label="削除"
+            title="候補を削除"
+          >
+            ✕
+          </button>
+        </div>
 
         {/* toggle button — top right corner */}
         <div className="absolute top-2 right-2">
