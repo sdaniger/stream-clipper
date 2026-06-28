@@ -22,6 +22,8 @@ export type YtDlpMetadataInput = {
 export type YtDlpDownloadInput = {
   url: string;
   format?: string;
+  /** Metadata already fetched by the caller (skips a second yt-dlp call). */
+  prefetchedMetadata?: YtDlpMetadata;
   onProgress?: (progress: YtDlpProgressEvent) => void;
   signal?: AbortSignal;
 };
@@ -91,7 +93,7 @@ export async function extractYtDlpMetadata(input: YtDlpMetadataInput): Promise<Y
 
 export async function downloadVideoWithYtDlp(input: YtDlpDownloadInput): Promise<YtDlpDownloadedVideo> {
   const url = validateUrl(input.url);
-  const format = input.format?.trim() || "bv*+ba/best";
+  const format = input.format?.trim() || "bv*[height<=1080]+ba/best";
   const paths = getMediaPaths();
 
   await mkdir(paths.inputDownloadsDir, { recursive: true });
@@ -100,6 +102,8 @@ export async function downloadVideoWithYtDlp(input: YtDlpDownloadInput): Promise
   const args = [
     "--no-playlist",
     "--restrict-filenames",
+    "--no-mtime",
+    "-N", "4",
     "--merge-output-format",
     "mp4",
     "-f",
@@ -122,8 +126,15 @@ export async function downloadVideoWithYtDlp(input: YtDlpDownloadInput): Promise
   }
 
   const relativeInputPath = toMediaRelativePath(absoluteDownloadedPath, paths.mediaRoot);
-  const metadata = await extractYtDlpMetadata({ url });
-  const probe = await probeVideo(relativeInputPath);
+
+  // Reuse metadata from the caller if prefetched (avoids a second yt-dlp
+  // network call). Otherwise extract it now.
+  const [metadata, probe] = await Promise.all([
+    input.prefetchedMetadata
+      ? Promise.resolve(input.prefetchedMetadata)
+      : extractYtDlpMetadata({ url }),
+    probeVideo(relativeInputPath)
+  ]);
   const metadataFileName = `${path.basename(absoluteDownloadedPath, path.extname(absoluteDownloadedPath))}.yt-dlp.json`;
   const metadataAbsolutePath = path.join(paths.inputDownloadsDir, metadataFileName);
   const metadataPath = toMediaRelativePath(metadataAbsolutePath, paths.mediaRoot);

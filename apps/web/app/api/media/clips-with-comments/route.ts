@@ -3,7 +3,7 @@ import { burnCommentsIntoClip, type BurnCommentsIntoClipInput } from "@/lib/serv
 
 export const runtime = "nodejs";
 
-const ALLOWED_ENCODERS: ReadonlyArray<NonNullable<BurnCommentsIntoClipInput["encoder"]>> = ["libx264", "h264_nvenc", "libx265"];
+const ALLOWED_ENCODERS: ReadonlyArray<NonNullable<BurnCommentsIntoClipInput["encoder"]>> = ["libx264", "h264_nvenc", "hevc_nvenc", "libx265"];
 
 export async function POST(request: Request) {
   try {
@@ -43,10 +43,6 @@ export async function POST(request: Request) {
 
     if (body.preset !== undefined && typeof body.preset !== "string") {
       return NextResponse.json({ error: "preset must be a string when provided." }, { status: 400 });
-    }
-
-    if (body.audioBitrate !== undefined && typeof body.audioBitrate !== "string") {
-      return NextResponse.json({ error: "audioBitrate must be a string when provided." }, { status: 400 });
     }
 
     if (body.normalizeAudio !== undefined && typeof body.normalizeAudio !== "boolean") {

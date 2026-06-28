@@ -78,13 +78,20 @@ const SPEED_MAX = 1.00;
 const BASE_DWELL_SEC = 5.0;
 const SAFE_GAP_PX = 24;
 
+const durationCache = new Map<number, number>();
+
 function computeScrollDuration(commentWidth: number): number {
+  const cached = durationCache.get(commentWidth);
+  if (cached !== undefined) return cached;
   const outW = REF_SCREEN_WIDTH;
   const rawBase = (outW + commentWidth + SAFE_GAP_PX) / BASE_DWELL_SEC;
   const scaleRaw = Math.pow(commentWidth / Math.max(1, REF_WIDTH_PX), SPEED_GAMMA);
   const boost = Math.min(SPEED_MAX, Math.max(SPEED_MIN, scaleRaw));
   const v = rawBase * boost;
-  return (outW + commentWidth + SAFE_GAP_PX) / Math.max(0.01, v);
+  const result = (outW + commentWidth + SAFE_GAP_PX) / Math.max(0.01, v);
+  if (durationCache.size > 2000) durationCache.clear();
+  durationCache.set(commentWidth, result);
+  return result;
 }
 
 export function categorizeComment(text: string): CommentOverlayCategory {
@@ -505,19 +512,20 @@ function escapeAssText(text: string) {
     .replace(/\n/g, "\\N");
 }
 
+const textWidthCache = new Map<string, number>();
+
 function estimateAssTextWidth(text: string, fontSize: number) {
+  const key = `${fontSize}:${text}`;
+  const cached = textWidthCache.get(key);
+  if (cached !== undefined) return cached;
   let width = 0;
   for (const char of text) {
-    const code = char.charCodeAt(0);
-    // Full-width CJK, emoji, and kana get full fontSize; everything else
-    // gets ~60% (half-width Latin).
-    if (code > 255) {
-      width += fontSize;
-    } else {
-      width += fontSize * 0.6;
-    }
+    width += char.charCodeAt(0) > 255 ? fontSize : fontSize * 0.6;
   }
-  return Math.max(1, Math.round(width));
+  const result = Math.max(1, Math.round(width));
+  if (textWidthCache.size > 5000) textWidthCache.clear();
+  textWidthCache.set(key, result);
+  return result;
 }
 
 function roundTime(value: number) {

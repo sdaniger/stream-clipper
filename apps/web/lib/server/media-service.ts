@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { access, copyFile, mkdir, rename, stat, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { ClipCandidate, ClipCandidateVariant, ClipTranscription, CommentAssetReference, CommentBurnedClipReference, GeneratedClipReference, ThumbnailCandidateReference } from "@/lib/mock-candidates";
@@ -96,10 +96,9 @@ export type BurnCommentsIntoClipInput = {
    * libx264 veryfast crf=20, AAC 160k, +faststart. Set encoder to
    * "h264_nvenc" on hosts with NVIDIA GPUs to use the hardware path.
    */
-  encoder?: "libx264" | "h264_nvenc" | "libx265";
+  encoder?: "libx264" | "h264_nvenc" | "hevc_nvenc" | "libx265";
   crf?: number;
   preset?: string;
-  audioBitrate?: string;
   /**
    * Apply EBU R128 loudness normalization to the audio before muxing.
    * Useful for VTubers who stream at low volume (matches the narinico
@@ -107,13 +106,6 @@ export type BurnCommentsIntoClipInput = {
    * already-loud sources.
    */
   normalizeAudio?: boolean;
-  /**
-   * Post-process the output for fast seeking (CFR, short 2s GOP,
-   * sc_threshold=0). This matches narinico's `seek_optimize` pass
-   * which makes the video responsive in players. Defaults to true
-   * because it's cheap and the UX improvement is huge.
-   */
-  seekOptimize?: boolean;
 };
 
 export type CommentBurnedClip = {
@@ -428,31 +420,6 @@ function resolveFfmpegPath() {
   return process.env.FFMPEG_PATH || "ffmpeg";
 }
 
-/**
- * Narinico-style seek optimization (CFR, short GOP, sc_threshold=0, faststart).
- * Re-encodes the given MP4 in-place so video players can seek instantly.
- * Uses GPU encoder (h264_nvenc) when available, falling back to libx264.
- * Non-critical — failures are swallowed with a console.warn.
- */
-async function optimizeForSeeking(outputPath: string, encoder?: string) {
-  const tmp = outputPath.replace(/\.mp4$/i, ".seekopt.tmp.mp4");
-  const fps = 60;
-  const gop = fps * 2; // 2-second GOP
-  const isNvenc = encoder === "h264_nvenc" || encoder === "hevc_nvenc";
-  const args = [
-    "-hide_banner", "-y", "-i", outputPath,
-    ...(isNvenc
-      ? ["-c:v", encoder, "-preset", "p4", "-cq", "20", "-b:v", "0", "-pix_fmt", "yuv420p"]
-      : ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]),
-    "-r", String(fps), "-g", String(gop), "-sc_threshold", "0",
-    "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
-    "-movflags", "+faststart",
-    tmp
-  ];
-  await execFileAsync("ffmpeg", args, { timeout: 10 * 60_000, maxBuffer: 32 * 1024 * 1024 });
-  await rename(tmp, outputPath);
-}
-
 export async function burnCommentsIntoClip(input: BurnCommentsIntoClipInput): Promise<CommentBurnedClip> {
   const absoluteClipPath = resolveMediaPath(input.clipPath);
   await assertFileExists(absoluteClipPath, "Clip file");
@@ -470,14 +437,11 @@ export async function burnCommentsIntoClip(input: BurnCommentsIntoClipInput): Pr
   const outputRelativePath = path.join("output", "clips_with_comments", outputFileName).replaceAll(path.sep, "/");
   const filterRelativePath = toPosixPath(assRelativePath);
 
-  // Narinico-style defaults: libx264 veryfast crf=20, AAC 160k, +faststart.
-  // Override via input.encoder/preset/crf/audioBitrate if the user wants
-  // GPU encoding or a different quality knob.
   const encoder = input.encoder ?? "libx264";
   const preset = input.preset ?? "veryfast";
   const crf = input.crf ?? 20;
-  const audioBitrate = input.audioBitrate ?? "160k";
   const normalizeAudio = input.normalizeAudio === true;
+  const isNvenc = encoder === "h264_nvenc" || encoder === "hevc_nvenc";
 
   const audioFilter = normalizeAudio ? "loudnorm=I=-16:TP=-1.5:LRA=11" : null;
 
@@ -491,14 +455,16 @@ export async function burnCommentsIntoClip(input: BurnCommentsIntoClipInput): Pr
     ...(audioFilter ? ["-af", audioFilter] : []),
     "-c:v",
     encoder,
-    "-preset",
-    preset,
-    "-crf",
-    String(crf),
+    ...(isNvenc
+      ? ["-preset", "p4", "-cq", String(crf), "-b:v", "0", "-pix_fmt", "yuv420p"]
+      : ["-preset", preset, "-crf", String(crf)]),
+    "-r", "60",           // CFR for smooth playback
+    "-g", "120",           // 2-second GOP for fast seeking
+    "-sc_threshold", "0",  // disable scene detection for seek-optimized GOP
     "-c:a",
     "aac",
     "-b:a",
-    audioBitrate,
+    "128k",
     "-movflags",
     "+faststart",
     outputPath
@@ -508,17 +474,6 @@ export async function burnCommentsIntoClip(input: BurnCommentsIntoClipInput): Pr
     await execFileAsync("ffmpeg", args, { cwd: getMediaRoot(), timeout: 20 * 60_000, maxBuffer: 32 * 1024 * 1024 });
   } catch (error) {
     throw new Error(`FFmpeg comment burn-in failed: ${formatExecError(error)}`);
-  }
-
-  // Narinico-style seek optimization: CFR + short 2s GOP for responsive
-  // seeking in video players. Disable with seekOptimize: false.
-  if (input.seekOptimize !== false) {
-    try {
-      await optimizeForSeeking(outputPath, encoder);
-    } catch (error) {
-      // Seek optimization is non-critical; warn and continue.
-      console.warn("Seek optimization failed (non-critical):", formatExecError(error));
-    }
   }
 
   return {
@@ -814,7 +769,7 @@ function buildFfmpegArgs(inputPath: string, outputPath: string, startSeconds: nu
   const baseArgs = ["-hide_banner", "-y", "-ss", startSeconds.toString(), "-i", inputPath, "-t", durationSeconds.toString(), "-avoid_negative_ts", "make_zero"];
 
   if (mode === "copy") {
-    return [...baseArgs, "-c", "copy", outputPath];
+    return [...baseArgs, "-c", "copy", "-movflags", "+faststart", outputPath];
   }
 
   if (encoder === "h264_nvenc" || encoder === "hevc_nvenc") {
@@ -823,11 +778,11 @@ function buildFfmpegArgs(inputPath: string, outputPath: string, startSeconds: nu
     return [...baseArgs,
       "-c:v", encoder, "-preset", "p4", "-cq", String(quality), "-b:v", "0",
       "-pix_fmt", "yuv420p",
-      "-c:a", "aac", "-b:a", "160k", outputPath];
+      "-c:a", "aac", "-b:a", "128k", outputPath];
   }
 
   // Default: CPU libx264
-  return [...baseArgs, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "160k", outputPath];
+  return [...baseArgs, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "128k", outputPath];
 }
 
 function resolveMediaPath(relativePath: string) {
@@ -891,16 +846,22 @@ async function prepareAssFile(input: BurnCommentsIntoClipInput) {
   return { absoluteAssPath, assRelativePath };
 }
 
+let dirsEnsured = false;
+
 async function ensureMediaDirs() {
+  if (dirsEnsured) return;
   const { inputDir, inputDownloadsDir, outputClipsDir, outputCommentAssDir, outputClipsWithCommentsDir, outputChatLogsDir, outputPackagesDir, outputThumbnailsDir } = getMediaPaths();
-  await mkdir(inputDir, { recursive: true });
-  await mkdir(inputDownloadsDir, { recursive: true });
-  await mkdir(outputClipsDir, { recursive: true });
-  await mkdir(outputCommentAssDir, { recursive: true });
-  await mkdir(outputClipsWithCommentsDir, { recursive: true });
-  await mkdir(outputChatLogsDir, { recursive: true });
-  await mkdir(outputPackagesDir, { recursive: true });
-  await mkdir(outputThumbnailsDir, { recursive: true });
+  await Promise.all([
+    mkdir(inputDir, { recursive: true }),
+    mkdir(inputDownloadsDir, { recursive: true }),
+    mkdir(outputClipsDir, { recursive: true }),
+    mkdir(outputCommentAssDir, { recursive: true }),
+    mkdir(outputClipsWithCommentsDir, { recursive: true }),
+    mkdir(outputChatLogsDir, { recursive: true }),
+    mkdir(outputPackagesDir, { recursive: true }),
+    mkdir(outputThumbnailsDir, { recursive: true })
+  ]);
+  dirsEnsured = true;
 }
 
 async function assertFileExists(absolutePath: string, label = "Video file") {

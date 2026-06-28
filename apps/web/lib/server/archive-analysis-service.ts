@@ -160,6 +160,7 @@ export async function runArchiveAutoAnalysis(
     downloadedVideo = await downloadVideoWithYtDlp({
       url,
       format: input.ytDlpFormat,
+      prefetchedMetadata: metadata,
       signal: input.signal,
       onProgress: (p) => {
         emitProgress({ stage: "download", status: "running", message: `Downloading... ${p.percent.toFixed(1)}% at ${p.speed}, ETA ${p.eta}` });
@@ -300,9 +301,18 @@ export async function runArchiveAutoAnalysis(
       const clipStartSeconds = parseTimecode(selectedVariant.start, "clip start");
       const clipDurationSeconds = parseTimecode(selectedVariant.duration, "clip duration");
 
-      // Pre-build the comment bundle so it's available for both comment
-      // assets and later for the export package (avoids double computing)
-      let commentBundle: ReturnType<typeof buildCommentBundle> | undefined;
+      // Pre-build the comment bundle ONCE — it's shared by comment assets
+      // and the export package. This avoids computing the same window filter,
+      // overlay generation, and export bundle 2-3x per candidate.
+      const commentBundle = buildCommentBundle(
+        generatedCandidate,
+        selectedVariant.duration,
+        fetchedChat.normalizedMessages,
+        clipStartSeconds,
+        clipStartSeconds + clipDurationSeconds
+      );
+      const commentsJsonStr = generateCommentsJson(commentBundle);
+      const commentsAssStr = generateScrollingCommentsAss(commentBundle);
 
       if (generatedClip) {
         const tasks: Promise<unknown>[] = [];
@@ -327,39 +337,16 @@ export async function runArchiveAutoAnalysis(
               })
           );
         } else {
-          emitProgress({
-            stage: "transcription", status: "done", candidateId: candidate.id,
-            candidateIndex: candidateIndex + 1, candidateTotal: candidateCount,
-            message: "Transcription skipped (disabled in panel)"
-          });
+          emitProgress({ stage: "transcription", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: "Transcription skipped (disabled in panel)" });
         }
 
-        // Task B: comment assets + bundle (always runs, parallel with transcription)
-        emitProgress({ stage: "comments", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Generating comment JSON/ASS assets for ${indexLabel}...` });
+        // Task B: comment assets (writes pre-computed bundle to disk, parallel with transcription)
+        emitProgress({ stage: "comments", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Writing comment assets for ${indexLabel}...` });
         tasks.push(
           (async () => {
             try {
-              const commentAssets = await generateCandidateCommentAssets(
-                generatedCandidate,
-                selectedVariant.duration,
-                fetchedChat.normalizedMessages,
-                clipStartSeconds,
-                clipStartSeconds + clipDurationSeconds
-              );
-
-              commentBundle = buildCommentBundle(
-                generatedCandidate,
-                selectedVariant.duration,
-                fetchedChat.normalizedMessages,
-                clipStartSeconds,
-                clipStartSeconds + clipDurationSeconds
-              );
-
-              generatedCandidate = {
-                ...generatedCandidate,
-                commentAssets,
-                commentOverlayItems: commentBundle.comments as ClipCandidate["commentOverlayItems"]
-              };
+              const commentAssets = await generateCandidateCommentAssets(generatedCandidate, commentBundle);
+              generatedCandidate = { ...generatedCandidate, commentAssets, commentOverlayItems: commentBundle.comments as ClipCandidate["commentOverlayItems"] };
               emitProgress({ stage: "comments", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Comment assets generated` });
             } catch (error) {
               warnings.push({ stage: "comments", candidateId: candidate.id, message: errorMessage(error, "Could not generate comment assets.") });
@@ -368,22 +355,11 @@ export async function runArchiveAutoAnalysis(
           })()
         );
 
-        // Wait for both parallel tasks to complete
         await Promise.all(tasks);
       }
 
-      // Stage 4: export package (file copies — needs both transcription + commentBundle)
+      // Stage 4: export package (reuses pre-computed JSON/ASS strings)
       if (shouldGeneratePackages && generatedClip) {
-        // Rebuild commentBundle if not already built (e.g. comment stage failed)
-        if (!commentBundle) {
-          commentBundle = buildCommentBundle(
-            generatedCandidate,
-            selectedVariant.duration,
-            fetchedChat.normalizedMessages,
-            clipStartSeconds,
-            clipStartSeconds + clipDurationSeconds
-          );
-        }
         emitProgress({ stage: "package", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Generating editor package for ${indexLabel}...` });
         try {
           const exportPackage = await generateExportPackage({
@@ -391,8 +367,8 @@ export async function runArchiveAutoAnalysis(
             selectedVariant,
             generatedClip,
             transcription,
-            commentsJson: generateCommentsJson(commentBundle),
-            commentsAss: generateScrollingCommentsAss(commentBundle),
+            commentsJson: commentsJsonStr,
+            commentsAss: commentsAssStr,
             commentJsonFileName: commentBundle.files.jsonFileName,
             commentAssFileName: commentBundle.files.assFileName
           });
@@ -411,16 +387,11 @@ export async function runArchiveAutoAnalysis(
   emitProgress({ stage: "comments", status: "done", message: "Pipeline complete" });
 
   // Delete the downloaded VOD now that clips are generated. The full
-  // archive is typically 10-15 GB per VOD and the generated clips are
-  // only ~100 MB each, so keeping the original download wastes disk.
-  try {
-    const { unlink } = await import("node:fs/promises");
-    await unlink(downloadedVideo.absolutePath).catch(() => undefined);
-    emitProgress({ stage: "download", status: "done", message: "Cleaned up download" });
-  } catch {
-    // Non-critical — the download will accumulate and can be cleared
-    // later via the 'すべてクリア' button or manual rm.
-  }
+  // archive is typically 10-15 GB per VOD. Use fire-and-forget so the
+  // HTTP response isn't blocked waiting for the filesystem.
+  import("node:fs/promises").then(({ unlink }) =>
+    unlink(downloadedVideo.absolutePath).catch(() => undefined)
+  );
 
   return {
     sourceUrl: url,
@@ -464,12 +435,8 @@ function enrichArchiveCandidates(candidates: ClipCandidate[], metadata: YtDlpMet
 
 async function generateCandidateCommentAssets(
   candidate: ClipCandidate,
-  duration: string,
-  chatEntries: ChatLogEntry[],
-  clipStartSeconds: number,
-  clipEndSeconds: number
+  bundle: ReturnType<typeof createCommentExportBundle>
 ) {
-  const bundle = buildCommentBundle(candidate, duration, chatEntries, clipStartSeconds, clipEndSeconds);
   return writeCommentAssets({
     candidateId: candidate.id,
     jsonContent: generateCommentsJson(bundle),
