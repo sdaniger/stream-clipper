@@ -69,3 +69,12 @@ build/
 # Env
 .env
 .env.local
+# Large files — not version controlled
+media/
+apps/web/.next/
+apps/web/test-results/
+apps/web/playwright-report/
+.playwright-libs/
+*.mp4
+*.png
+!apps/web/tests/*.png

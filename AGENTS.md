@@ -76,3 +76,25 @@ packages/
 infra/
 scripts/
 docs/
+## Development server
+
+- Do not start `npm run dev` if http://localhost:3000 is already responding.
+- Before starting the dev server, check `curl http://localhost:3000`.
+- Do not use fixed `sleep 20`.
+- Use a polling loop and continue as soon as HTTP 200 is returned.
+- Prefer editing files directly and running targeted checks.
+## Running the app
+
+The Next.js dev server is long-running.
+
+Rules:
+- Do not run `npm run dev` in the foreground.
+- First check whether the app is already running:
+  `curl -s -o /dev/null -w "%{http_code}" http://localhost:3000`
+- If it is already responding, reuse it.
+- If it must be started, use:
+  `nohup npm run dev > /tmp/next-dev.log 2>&1 &`
+- Never wait for `npm run dev` to exit.
+- Never use a fixed `sleep 20`.
+- Poll `http://localhost:3000` and continue as soon as it responds.
+- If the app does not respond, inspect `/tmp/next-dev.log`.
