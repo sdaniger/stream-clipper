@@ -70,6 +70,7 @@ type TranscriptionResponseSegment = {
   start_time: string;
   end_time: string;
   text: string;
+  no_speech_prob?: number | null;
 };
 
 type TranscriptionResponse = {
@@ -249,7 +250,7 @@ export async function runArchiveAutoAnalysis(
   // Re-encode: concurrency = cores / 2. Copy mode can use more, but
   // we keep a conservative cap to avoid I/O thrash on HDDs.
   const clipLimit = createLimiter(Math.max(1, Math.floor(cpuCount / 2)));
-  const transcribeLimit = createLimiter(2);
+  const transcribeLimit = createLimiter(4);
 
   const processed = await Promise.all(
     sourceCandidates.map(async (candidate, candidateIndex): Promise<ClipCandidate> => {
@@ -288,7 +289,8 @@ export async function runArchiveAutoAnalysis(
         const totalElapsed = Math.round((Date.now() - clipStartTime) / 1000);
         emitProgress({ stage: "clip", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Clip generated in ${totalElapsed}s` });
       } catch (error) {
-        warnings.push({ stage: "clip", candidateId: candidate.id, message: errorMessage(error, "Could not generate FFmpeg clip.") });
+        const clipError = errorMessage(error, "Could not generate FFmpeg clip.") + " (Transcription and comments will be skipped for this candidate)";
+        warnings.push({ stage: "clip", candidateId: candidate.id, message: clipError });
         emitProgress({ stage: "clip", status: "error", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: errorMessage(error, "Clip generation failed") });
       }
 
@@ -514,7 +516,7 @@ function mapTranscriptionResponse(response: TranscriptionResponse): ClipTranscri
     end: segment.end_time,
     speaker: "Transcript",
     text: segment.text,
-    highlight: segment.text.trim().length > 0
+    highlight: segment.text.trim().length > 10 && (segment.no_speech_prob == null || segment.no_speech_prob < 0.5)
   }));
 
   return {

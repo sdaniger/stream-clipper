@@ -37,6 +37,7 @@ export type GeneratedClipReference = {
   duration: string;
   mode: "copy" | "reencode";
   commandPreview: string;
+  sizeBytes: number;
 };
 
 export type CommentBurnedClipReference = {
@@ -132,6 +133,8 @@ export type ClipCandidateNotes = {
   uploadText: string;
 };
 
+export type EditorStatus = "keep" | "discard";
+
 export type ClipCandidate = {
   id: string;
   title: string;
@@ -141,6 +144,7 @@ export type ClipCandidate = {
   duration: string;
   confidence: number;
   status: CandidateStatus;
+  editorStatus?: EditorStatus;
   summary: string;
   whyDetected: string[];
   tags: string[];

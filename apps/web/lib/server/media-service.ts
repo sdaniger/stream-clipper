@@ -81,6 +81,7 @@ export type GeneratedClip = {
   start: string;
   duration: string;
   mode: "copy" | "reencode";
+  sizeBytes: number;
   commandPreview: string;
 };
 
@@ -115,6 +116,7 @@ export type CommentBurnedClip = {
   assPath: string;
   outputPath: string;
   absoluteOutputPath: string;
+  sizeBytes: number;
   commandPreview: string;
   createdAt: string;
 };
@@ -313,6 +315,8 @@ export async function generateClip(input: GenerateClipInput): Promise<GeneratedC
 
   await assertClipValid(outputPath);
 
+  const clipStat = await stat(outputPath).catch(() => null);
+
   return {
     inputPath: normalizeRelativePath(input.inputPath),
     outputPath: outputRelativePath.replaceAll(path.sep, "/"),
@@ -320,6 +324,7 @@ export async function generateClip(input: GenerateClipInput): Promise<GeneratedC
     start: formatSeconds(startSeconds),
     duration: formatSeconds(durationSeconds),
     mode,
+    sizeBytes: clipStat?.size ?? 0,
     commandPreview: `ffmpeg ${args.map(shellQuote).join(" ")}`
   };
 }
@@ -460,7 +465,6 @@ export async function burnCommentsIntoClip(input: BurnCommentsIntoClipInput): Pr
     ...(isNvenc
       ? ["-preset", "p4", "-cq", String(crf), "-b:v", "0", "-pix_fmt", "yuv420p"]
       : ["-preset", preset, "-crf", String(crf)]),
-    "-r", "60",           // CFR for smooth playback
     "-g", "120",           // 2-second GOP for fast seeking
     "-sc_threshold", "0",  // disable scene detection for seek-optimized GOP
     "-c:a",
@@ -478,6 +482,8 @@ export async function burnCommentsIntoClip(input: BurnCommentsIntoClipInput): Pr
     throw new Error(`FFmpeg comment burn-in failed: ${formatExecError(error)}`);
   }
 
+  const burnedStat = await stat(outputPath).catch(() => null);
+
   return {
     candidateId: input.candidateId,
     variantId: input.variantId,
@@ -485,6 +491,7 @@ export async function burnCommentsIntoClip(input: BurnCommentsIntoClipInput): Pr
     assPath: assRelativePath,
     outputPath: outputRelativePath,
     absoluteOutputPath: outputPath,
+    sizeBytes: burnedStat?.size ?? 0,
     commandPreview: `ffmpeg ${args.map(shellQuote).join(" ")}`,
     createdAt: new Date().toISOString()
   };
@@ -903,19 +910,27 @@ async function assertFileExists(absolutePath: string, label = "Video file") {
   }
 }
 
+const toolCache = new Map<string, ToolStatus>();
+
 async function checkTool(command: string): Promise<ToolStatus> {
+  const cached = toolCache.get(command);
+  if (cached) return cached;
+
   try {
     await access(getMediaRoot()).catch(() => undefined);
     const { stdout } = await execFileAsync(command, ["-version"], { timeout: 10_000, maxBuffer: 1024 * 1024 });
     const version = stdout.split("\n")[0]?.trim() || `${command} is available`;
-
-    return { available: true, command, version };
+    const result: ToolStatus = { available: true, command, version };
+    toolCache.set(command, result);
+    return result;
   } catch (error) {
-    return {
+    const result: ToolStatus = {
       available: false,
       command,
       error: error instanceof Error ? error.message : `${command} is not available`
     };
+    toolCache.set(command, result);
+    return result;
   }
 }
 

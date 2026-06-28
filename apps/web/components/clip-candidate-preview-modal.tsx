@@ -433,7 +433,7 @@ export function ClipCandidatePreviewModal({
           </div>
         </header>
 
-        <div className="grid min-h-0 flex-1 gap-4 overflow-y-auto p-4 xl:grid-cols-[21rem_minmax(0,1fr)_24rem]">
+        <div className="grid min-h-0 flex-1 gap-4 overflow-y-auto p-4 lg:grid-cols-[1fr_24rem] xl:grid-cols-[21rem_minmax(0,1fr)_24rem]">
           <aside className="space-y-4 xl:overflow-y-auto xl:pr-1">
             <Panel title={t("preview.transcriptDetail")}>
               {candidate.transcription && (
@@ -530,7 +530,7 @@ export function ClipCandidatePreviewModal({
                     }}
                     onError={() => {
                       setVideoError(
-                        t("preview.currentMockTime", { time: currentMockTime })
+                        t("preview.videoLoadError")
                       );
                     }}
                   />

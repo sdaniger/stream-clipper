@@ -19,7 +19,7 @@ MODEL_CACHE: dict[tuple[str, str, str], Any] = {}
 
 
 def default_model() -> str:
-    return os.getenv("FASTER_WHISPER_MODEL", "small")
+    return os.getenv("FASTER_WHISPER_MODEL", "turbo")
 
 
 def default_device() -> str:
@@ -71,9 +71,10 @@ def transcribe_clip(request: TranscribeRequest) -> TranscribeResponse:
     device = request.device or default_device()
     compute_type = request.compute_type or default_compute_type()
     model = get_model(model_name, device, compute_type)
+    language = request.language or "ja"
     segment_iter, info = model.transcribe(
         str(clip_path),
-        language=request.language,
+        language=language,
         beam_size=request.beam_size,
         vad_filter=True,
     )
@@ -86,7 +87,7 @@ def transcribe_clip(request: TranscribeRequest) -> TranscribeResponse:
         model_name=model_name,
         device=device,
         compute_type=compute_type,
-        language=getattr(info, "language", request.language),
+        language=getattr(info, "language", language),
         duration_seconds=getattr(info, "duration", None),
         text=text,
         segments=segments,
@@ -98,7 +99,7 @@ def transcribe_clip(request: TranscribeRequest) -> TranscribeResponse:
         model=model_name,
         device=device,
         compute_type=compute_type,
-        language=getattr(info, "language", request.language),
+        language=getattr(info, "language", language),
         duration_seconds=getattr(info, "duration", None),
         clip_path=relative_to_media_root(clip_path),
         text=text,

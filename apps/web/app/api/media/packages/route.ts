@@ -21,6 +21,10 @@ export async function POST(request: Request) {
 
     return NextResponse.json(await generateExportPackage(body as GenerateExportPackageInput));
   } catch (error) {
-    return NextResponse.json({ error: error instanceof Error ? error.message : "Unknown export package error" }, { status: 400 });
+    const msg = error instanceof Error ? error.message : "Unknown export package error";
+    const status = msg.includes("not found") || msg.includes("was not found") ? 404
+      : msg.includes("not available") ? 503
+      : 500;
+    return NextResponse.json({ error: msg }, { status });
   }
 }

@@ -1,5 +1,7 @@
-import { stat, open, readFile } from "node:fs/promises";
+import { stat, open } from "node:fs/promises";
+import { createReadStream } from "node:fs";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { NextResponse } from "next/server";
 import { getMediaRoot } from "@/lib/server/media-service";
 
@@ -19,22 +21,23 @@ export async function GET(request: Request) {
     const contentType = contentTypeForPath(relativePath);
     const isVideo = contentType.startsWith("video/");
 
-    // Video files need Range request support so the <video> element can seek
-    // and the browser can stream the file in chunks. Without this, browsers
-    // must download the entire file before playing.
     if (isVideo) {
       return await serveWithRange(request, absolutePath, relativePath, contentType);
     }
 
-    const file = await readFile(absolutePath);
-    return new NextResponse(file, {
+    // Stream non-video files instead of buffering entire file
+    const fileStat = await stat(absolutePath);
+    const stream = Readable.toWeb(createReadStream(absolutePath)) as ReadableStream;
+    return new NextResponse(stream, {
       headers: {
         "Content-Type": contentType,
+        "Content-Length": fileStat.size.toString(),
         "Cache-Control": "no-store"
       }
     });
   } catch (error) {
-    return NextResponse.json({ error: error instanceof Error ? error.message : "Unknown media file error" }, { status: 400 });
+    const status = error instanceof Error && error.message.includes("was not found") ? 404 : 400;
+    return NextResponse.json({ error: error instanceof Error ? error.message : "Unknown media file error" }, { status });
   }
 }
 
@@ -74,23 +77,18 @@ async function serveWithRange(request: Request, absolutePath: string, relativePa
     }
   }
 
-  // No range: send the whole file but advertise Range support so the browser
-  // upgrades to range requests on its own (e.g. for seeking).
-  const handle = await open(absolutePath, "r");
-  try {
-    const buffer = Buffer.alloc(total);
-    await handle.read(buffer, 0, total, 0);
-    return new NextResponse(buffer, {
-      headers: {
-        "Content-Type": contentType,
-        "Content-Length": total.toString(),
-        "Accept-Ranges": "bytes",
-        "Cache-Control": "no-store"
-      }
-    });
-  } finally {
-    await handle.close();
-  }
+  // No range header — stream the entire file via chunked response.
+  // The browser will upgrade to range requests when seeking.
+  const nodeStream = createReadStream(absolutePath);
+  const webStream = Readable.toWeb(nodeStream) as ReadableStream;
+  return new NextResponse(webStream, {
+    headers: {
+      "Content-Type": contentType,
+      "Content-Length": total.toString(),
+      "Accept-Ranges": "bytes",
+      "Cache-Control": "no-store"
+    }
+  });
 }
 
 function normalizeRelativePath(relativePath: string) {
@@ -137,7 +135,23 @@ function contentTypeForPath(relativePath: string) {
     return "video/x-matroska";
   }
 
-  if (extension === ".json" || extension === ".ass" || extension === ".srt" || extension === ".vtt" || extension === ".txt") {
+  if (extension === ".json") {
+    return "application/json;charset=utf-8";
+  }
+
+  if (extension === ".ass") {
+    return "text/x-ssa;charset=utf-8";
+  }
+
+  if (extension === ".srt") {
+    return "application/x-subrip;charset=utf-8";
+  }
+
+  if (extension === ".vtt") {
+    return "text/vtt;charset=utf-8";
+  }
+
+  if (extension === ".txt" || extension === ".ref" || extension === ".md") {
     return "text/plain;charset=utf-8";
   }
 

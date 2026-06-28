@@ -325,7 +325,7 @@ export function LocalVideoPanel({ candidates, onClipGenerated, onTranscriptionCo
         throw new Error(readApiError(data, "Could not generate clip."));
       }
 
-      const clip = data as GeneratedClip;
+      const clip = data as GeneratedClipReference;
       setGeneratedClip(clip);
       setGeneratedClipCandidateId(selectedCandidate.id);
       setLastTranscript(null);

@@ -104,6 +104,7 @@ export async function downloadVideoWithYtDlp(input: YtDlpDownloadInput): Promise
     "--restrict-filenames",
     "--no-mtime",
     "-N", "4",
+    "--buffer-size", "32K",
     "--merge-output-format",
     "mp4",
     "-f",
@@ -125,7 +126,17 @@ export async function downloadVideoWithYtDlp(input: YtDlpDownloadInput): Promise
     throw new Error("yt-dlp output path exists but is not a file.");
   }
 
+  // Validate the downloaded file is a valid video (moov atom check).
+  // A corrupt file (e.g. killed mid-merge) will have no moov atom.
   const relativeInputPath = toMediaRelativePath(absoluteDownloadedPath, paths.mediaRoot);
+  try {
+    await probeVideo(relativeInputPath);
+  } catch {
+    // Delete the corrupt file so it doesn't block future retries.
+    const { unlink } = await import("node:fs/promises");
+    await unlink(absoluteDownloadedPath).catch(() => {});
+    throw new Error(`Downloaded file is corrupt (no moov atom). The download may have been interrupted. File deleted: ${path.basename(absoluteDownloadedPath)}`);
+  }
 
   // Reuse metadata from the caller if prefetched (avoids a second yt-dlp
   // network call). Otherwise extract it now.
@@ -157,7 +168,7 @@ export async function downloadVideoWithYtDlp(input: YtDlpDownloadInput): Promise
 
 async function execYtDlp(args: string[], signal?: AbortSignal): Promise<string> {
   try {
-    const result = await execFileAsync("yt-dlp", args, { timeout: 60 * 60_000, maxBuffer: 64 * 1024 * 1024, signal });
+    const result = await execFileAsync("yt-dlp", args, { timeout: 180 * 60_000, maxBuffer: 64 * 1024 * 1024, signal });
     return result.stdout;
   } catch (error) {
     throw new Error(`yt-dlp download failed: ${formatExecError(error)}. Install it with \`pip install yt-dlp\` and confirm \`yt-dlp\` is on PATH.`);
@@ -167,7 +178,7 @@ async function execYtDlp(args: string[], signal?: AbortSignal): Promise<string> 
 async function spawnYtDlpWithProgress(args: string[], onProgress: (p: YtDlpProgressEvent) => void, signal?: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn("yt-dlp", args, {
-      timeout: 60 * 60_000,
+      timeout: 180 * 60_000,
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, TERM: "dumb", PYTHONUNBUFFERED: "1" }
     });
@@ -181,8 +192,8 @@ async function spawnYtDlpWithProgress(args: string[], onProgress: (p: YtDlpProgr
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGTERM");
-      reject(new Error("yt-dlp timed out after 60 minutes."));
-    }, 60 * 60_000);
+      reject(new Error("yt-dlp timed out after 180 minutes."));
+    }, 180 * 60_000);
 
     const onAbort = () => {
       if (aborted) return;

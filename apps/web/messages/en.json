@@ -340,6 +340,15 @@
     "autoEditLoading": "Processing...",
     "packageExport": "Export package",
     "packageExporting": "Exporting...",
-    "normalizeAudio": "Normalize audio (EBU R128)"
+    "normalizeAudio": "Normalize audio (EBU R128)",
+    "videoLoadError": "Failed to load video",
+    "skipToContent": "Skip to main content",
+    "settingsExport": "Export",
+    "settingsImport": "Import",
+    "packageDL": "Package DL",
+    "gpuAccelerated": "GPU",
+    "cpuOnly": "CPU",
+    "clearAllWarning": "All candidates will be deleted. Local clip files will be preserved.",
+    "vodDeleteNotice": "※ VOD deletion is not handled by this tool. Please delete from the original streaming platform manually."
   }
 }

@@ -19,28 +19,38 @@ export function CommentCanvasOverlay({ comments, currentTime, duration, settings
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const latestStateRef = useRef({ comments, currentTime, duration, settings, playing });
   const animationRef = useRef<number | null>(null);
-  const lastFrameRef = useRef<number | null>(null);
-  const internalTimeRef = useRef(currentTime);
+  const renderTimeRef = useRef(currentTime);
 
   useEffect(() => {
     latestStateRef.current = { comments, currentTime, duration, settings, playing };
-    internalTimeRef.current = currentTime;
+    // Sync from external currentTime whenever it changes (seek, pause, etc.)
+    renderTimeRef.current = currentTime;
     drawFrame();
   }, [comments, currentTime, duration, settings, playing]);
 
   useEffect(() => {
+    let lastFrameTime: number | null = null;
+
     const tick = (timestamp: number) => {
       const state = latestStateRef.current;
-      const lastFrame = lastFrameRef.current ?? timestamp;
-      const deltaSeconds = (timestamp - lastFrame) / 1000;
-      lastFrameRef.current = timestamp;
 
       if (state.playing) {
-        internalTimeRef.current = (internalTimeRef.current + deltaSeconds) % Math.max(state.duration, 1);
+        // During playback, advance render time from delta but also
+        // periodically re-sync to the parent's currentTime (passed via
+        // useEffect above) to prevent long-term drift.
+        if (lastFrameTime !== null) {
+          const deltaSeconds = (timestamp - lastFrameTime) / 1000;
+          renderTimeRef.current += deltaSeconds;
+          // Wrap around at duration boundary
+          if (renderTimeRef.current >= state.duration) {
+            renderTimeRef.current = renderTimeRef.current % Math.max(state.duration, 1);
+          }
+        }
       } else {
-        internalTimeRef.current = state.currentTime;
+        renderTimeRef.current = state.currentTime;
       }
 
+      lastFrameTime = timestamp;
       drawFrame();
       animationRef.current = requestAnimationFrame(tick);
     };
@@ -52,7 +62,7 @@ export function CommentCanvasOverlay({ comments, currentTime, duration, settings
         cancelAnimationFrame(animationRef.current);
       }
       animationRef.current = null;
-      lastFrameRef.current = null;
+      lastFrameTime = null;
     };
   }, []);
 
@@ -88,10 +98,8 @@ export function CommentCanvasOverlay({ comments, currentTime, duration, settings
       return;
     }
 
-    // Comments are pre-filtered (pipeline applies density/URL/long/repeated filters).
-    // Use them directly — no need to run prepareOverlayComments per frame.
     const renderComments = state.comments;
-    const renderTime = state.playing ? internalTimeRef.current : state.currentTime;
+    const renderTime = state.playing ? renderTimeRef.current : state.currentTime;
 
     for (const comment of renderComments) {
       const fontSize = comment.size;
@@ -106,9 +114,6 @@ export function CommentCanvasOverlay({ comments, currentTime, duration, settings
 
       const y = getCommentY(comment.lane ?? 0, height, state.settings);
 
-      // Gaussian-blurred outline (narinico's OUTLINE_BLUR=3.0, OUTLINE_ALPHA=250).
-      // Renders a thick black blurred outline, then sharp white text on top —
-      // producing the characteristic NicoNico glow effect.
       context.save();
       if (typeof context.filter !== "undefined") {
         context.filter = "blur(3px)";
@@ -119,7 +124,6 @@ export function CommentCanvasOverlay({ comments, currentTime, duration, settings
       context.strokeText(text, x, y);
       context.restore();
 
-      // Sharp white fill on top
       context.lineJoin = "round";
       context.shadowColor = "rgba(0, 0, 0, 0.55)";
       context.shadowBlur = 2;

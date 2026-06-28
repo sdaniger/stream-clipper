@@ -51,6 +51,10 @@ export async function POST(request: Request) {
 
     return NextResponse.json(await burnCommentsIntoClip(body as BurnCommentsIntoClipInput));
   } catch (error) {
-    return NextResponse.json({ error: error instanceof Error ? error.message : "Unknown comment burn-in error" }, { status: 400 });
+    const msg = error instanceof Error ? error.message : "Unknown comment burn-in error";
+    const status = msg.includes("not found") || msg.includes("was not found") ? 404
+      : msg.includes("not available") ? 503
+      : 500;
+    return NextResponse.json({ error: msg }, { status });
   }
 }

@@ -340,6 +340,15 @@
     "autoEditLoading": "処理中...",
     "packageExport": "パッケージ出力",
     "packageExporting": "出力中...",
-    "normalizeAudio": "音声正規化 (EBU R128)"
+    "normalizeAudio": "音声正規化 (EBU R128)",
+    "videoLoadError": "動画を読み込めませんでした",
+    "skipToContent": "メインコンテンツへスキップ",
+    "settingsExport": "エクスポート",
+    "settingsImport": "インポート",
+    "packageDL": "パッケージDL",
+    "gpuAccelerated": "GPU",
+    "cpuOnly": "CPU",
+    "clearAllWarning": "すべての候補が削除されます。ローカルのクリップファイルは保持されます。",
+    "vodDeleteNotice": "※ VODの削除はこのツールでは行いません。元の配信プラットフォームで手動に削除してください。"
   }
 }
