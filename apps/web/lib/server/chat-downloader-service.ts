@@ -48,10 +48,10 @@ export type FetchChatDownloaderInput = {
 
 /** 0 means "as much as Twitch will return within the timeout". This is the
  *  hard upper bound on a single fetch to keep the pipeline from running
- *  forever on runaway pagination. 100K messages is more than enough for
- *  highlight detection on any VOD (a 4-hour stream at 7 msg/sec ≈ 100K). */
-const PRACTICAL_MESSAGE_CAP = 100_000;
-const PYTHON_TIMEOUT = 10 * 60_000;
+ *  forever on runaway pagination. 300K messages covers an 8-hour stream
+ *  at ~10 msg/sec with headroom for pop-off moments. */
+const PRACTICAL_MESSAGE_CAP = 300_000;
+const PYTHON_TIMEOUT = 20 * 60_000;
 
 /**
  * Returns a sensible default chat limit for the given VOD duration (seconds).

@@ -24,6 +24,10 @@ export type YtDlpDownloadInput = {
   format?: string;
   /** Metadata already fetched by the caller (skips a second yt-dlp call). */
   prefetchedMetadata?: YtDlpMetadata;
+  /** Start time in seconds for partial download. */
+  timeStartSeconds?: number;
+  /** End time in seconds for partial download. */
+  timeEndSeconds?: number;
   onProgress?: (progress: YtDlpProgressEvent) => void;
   signal?: AbortSignal;
 };
@@ -113,8 +117,23 @@ export async function downloadVideoWithYtDlp(input: YtDlpDownloadInput): Promise
     outputTemplate,
     "--print",
     "after_move:filepath",
-    url
   ];
+
+  // Partial download: use --download-sections when time range is specified.
+  // This avoids downloading the entire VOD when only a portion is needed.
+  const hasTimeRange = input.timeStartSeconds != null || input.timeEndSeconds != null;
+  if (hasTimeRange) {
+    const startStr = secondsToHHMMSS(input.timeStartSeconds ?? 0);
+    const endStr = secondsToHHMMSS(input.timeEndSeconds ?? 999999);
+    args.push("--download-sections", `*${startStr}-${endStr}`);
+    // Force remux to ensure the output is a playable mp4 when section is
+    // downloaded. --download-sections with --merge-output-format mp4 is
+    // already handled by yt-dlp, but we also add --force-keyframes-at-cuts
+    // to make the cut points accurate.
+    args.push("--force-keyframes-at-cuts");
+  }
+
+  args.push(url);
 
   const stdout = input.onProgress
     ? await spawnYtDlpWithProgress(args, input.onProgress, input.signal)
@@ -377,10 +396,62 @@ function formatExecError(error: unknown) {
   return "Unknown yt-dlp error";
 }
 
+function secondsToHHMMSS(totalSeconds: number) {
+  const safe = Math.max(0, Math.round(totalSeconds));
+  const hours = Math.floor(safe / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  const seconds = safe % 60;
+  return `${hours.toString().padStart(2, "0")}:${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
+}
+
 function shellQuote(value: string) {
   if (/^[a-zA-Z0-9_./:=+-]+$/.test(value)) {
     return value;
   }
 
   return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+export type YtDlpSectionInput = {
+  url: string;
+  startSeconds: number;
+  endSeconds: number;
+  candidateId: string;
+  signal?: AbortSignal;
+};
+
+export type YtDlpSectionResult = {
+  inputPath: string;
+  candidateId: string;
+};
+
+export async function downloadSectionWithYtDlp(input: YtDlpSectionInput): Promise<YtDlpSectionResult> {
+  const url = validateUrl(input.url);
+  const paths = getMediaPaths();
+  await mkdir(paths.inputDownloadsDir, { recursive: true });
+
+  const outputTemplate = path.join(paths.inputDownloadsDir, `section_${input.candidateId}_%(id)s.%(ext)s`);
+  const startStr = secondsToHHMMSS(input.startSeconds);
+  const endStr = secondsToHHMMSS(input.endSeconds);
+
+  const args = [
+    "--no-playlist",
+    "--restrict-filenames",
+    "--no-mtime",
+    "-N", "4",
+    "--buffer-size", "32K",
+    "--merge-output-format", "mp4",
+    "-f", "bv*[height<=1080]+ba/best",
+    "-o", outputTemplate,
+    "--print", "after_move:filepath",
+    "--download-sections", `*${startStr}-${endStr}`,
+    "--force-keyframes-at-cuts",
+    url,
+  ];
+
+  const stdout = await execYtDlp(args, input.signal);
+  const absolutePath = resolveDownloadedFilePath(stdout, paths.inputDownloadsDir);
+  const relativePath = toMediaRelativePath(absolutePath, paths.mediaRoot);
+
+  return { inputPath: relativePath, candidateId: input.candidateId };
 }

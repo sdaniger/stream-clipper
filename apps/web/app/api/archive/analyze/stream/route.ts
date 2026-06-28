@@ -37,6 +37,32 @@ export async function POST(request: Request) {
     });
   }
 
+  // Validate time range params if present.
+  if (body.timeStartSeconds != null && (typeof body.timeStartSeconds !== "number" || body.timeStartSeconds < 0)) {
+    return new Response(encodeSSE("error", { error: "timeStartSeconds must be a non-negative number." }), {
+      status: 400,
+      headers: { "Content-Type": "text/event-stream" }
+    });
+  }
+  if (body.timeEndSeconds != null && (typeof body.timeEndSeconds !== "number" || body.timeEndSeconds < 0)) {
+    return new Response(encodeSSE("error", { error: "timeEndSeconds must be a non-negative number." }), {
+      status: 400,
+      headers: { "Content-Type": "text/event-stream" }
+    });
+  }
+  if (body.windowSeconds != null && (typeof body.windowSeconds !== "number" || body.windowSeconds < 10 || body.windowSeconds > 300)) {
+    return new Response(encodeSSE("error", { error: "windowSeconds must be between 10 and 300." }), {
+      status: 400,
+      headers: { "Content-Type": "text/event-stream" }
+    });
+  }
+  if (body.clipLength != null && !["short", "standard", "long"].includes(body.clipLength)) {
+    return new Response(encodeSSE("error", { error: 'clipLength must be "short", "standard", or "long".' }), {
+      status: 400,
+      headers: { "Content-Type": "text/event-stream" }
+    });
+  }
+
   const abortController = new AbortController();
   const signal = abortController.signal;
 

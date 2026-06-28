@@ -65,6 +65,10 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
   const [generatePackages, setGeneratePackages] = useState(true);
   const [autoOpenModal, setAutoOpenModal] = useState(true);
   const [isRunning, setIsRunning] = useState(false);
+  const [useTimeRange, setUseTimeRange] = useState(false);
+  const [timeRangeStart, setTimeRangeStart] = useState("");
+  const [timeRangeEnd, setTimeRangeEnd] = useState("");
+  const [clipLength, setClipLength] = useState<"short" | "standard" | "long">("standard");
   const [stages, setStages] = useState<PipelineStage[]>(initialStages);
   const [result, setResult] = useState<ArchiveAutoResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -189,7 +193,10 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
           maxMessages,
           clipMode,
           transcribe,
-          generatePackages
+          generatePackages,
+          timeStartSeconds: useTimeRange ? parseTimeToSeconds(timeRangeStart) : undefined,
+          timeEndSeconds: useTimeRange ? parseTimeToSeconds(timeRangeEnd) : undefined,
+          clipLength,
         }),
         signal: controller.signal
       });
@@ -375,6 +382,60 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
                     <option value="reencode">{t("archive.reencodeMode")}</option>
                   </select>
                 </label>
+
+                <label className="block">
+                  <span className="mb-2 block text-xs font-semibold uppercase tracking-[0.2em] text-violet-100/75">{t("archive.clipLength")}</span>
+                  <select
+                    value={clipLength}
+                    onChange={(event) => setClipLength(event.target.value as "short" | "standard" | "long")}
+                    className="h-11 w-full rounded-2xl border border-white/10 bg-slate-950/60 px-4 text-sm text-slate-100 outline-none focus:border-violet-200/60"
+                  >
+                    <option value="short">{t("archive.clipLengthShort")}</option>
+                    <option value="standard">{t("archive.clipLengthStandard")}</option>
+                    <option value="long">{t("archive.clipLengthLong")}</option>
+                  </select>
+                </label>
+              </div>
+
+              <div className="mt-3 rounded-2xl border border-white/10 bg-white/[0.04] p-3">
+                <label className="flex items-start gap-3">
+                  <input
+                    type="checkbox"
+                    checked={useTimeRange}
+                    onChange={(event) => setUseTimeRange(event.target.checked)}
+                    className="mt-1 h-4 w-4 accent-violet-300"
+                  />
+                  <div className="min-w-0 flex-1">
+                    <span className="text-sm font-semibold text-slate-100">
+                      {t("archive.timeRange")}
+                    </span>
+                    <p className="mt-0.5 text-[0.7rem] leading-4 text-slate-400">
+                      {t("archive.timeRangeHint")}
+                    </p>
+                  </div>
+                </label>
+                {useTimeRange && (
+                  <div className="mt-3 grid grid-cols-2 gap-3">
+                    <label className="block">
+                      <span className="mb-1 block text-xs text-slate-400">{t("archive.timeStart")}</span>
+                      <input
+                        value={timeRangeStart}
+                        onChange={(e) => setTimeRangeStart(e.target.value)}
+                        placeholder="00:00:00"
+                        className="h-10 w-full rounded-xl border border-white/10 bg-slate-950/60 px-3 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-violet-200/60 font-mono"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="mb-1 block text-xs text-slate-400">{t("archive.timeEnd")}</span>
+                      <input
+                        value={timeRangeEnd}
+                        onChange={(e) => setTimeRangeEnd(e.target.value)}
+                        placeholder="02:00:00"
+                        className="h-10 w-full rounded-xl border border-white/10 bg-slate-950/60 px-3 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-violet-200/60 font-mono"
+                      />
+                    </label>
+                  </div>
+                )}
               </div>
 
               <div className="mt-3 grid gap-3 lg:grid-cols-2">
@@ -612,6 +673,17 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
       )}
     </section>
   );
+}
+
+function parseTimeToSeconds(input: string): number | undefined {
+  const trimmed = input.trim();
+  if (!trimmed) return undefined;
+  const parts = trimmed.split(":").map(Number);
+  if (parts.some((p) => !Number.isFinite(p) || p < 0)) return undefined;
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 1) return parts[0];
+  return undefined;
 }
 
 function MiniStat({ label, value }: { label: string; value: string }) {

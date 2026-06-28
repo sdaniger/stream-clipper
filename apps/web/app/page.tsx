@@ -2,6 +2,7 @@
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CommentCanvasOverlay } from "@/components/comment-canvas-overlay";
+import { VideoRangeSelector } from "@/components/video-range-selector";
 import { LanguageSwitcher } from "@/components/language-switcher";
 import { useI18n } from "@/lib/i18n";
 import {
@@ -48,7 +49,7 @@ type SSEProgressEvent = {
 
 // ── constants ──
 
-const STAGE_ORDER = ["metadata", "download", "chat", "analysis", "clip", "transcription", "comments", "package"];
+const STAGE_ORDER = ["metadata", "download", "chat", "analysis", "clip", "transcription", "comments", "package", "links"];
 const STAGE_KEYS: Record<string, string> = {
   metadata: "archive.stageMetadata",
   download: "archive.stageDownload",
@@ -57,7 +58,8 @@ const STAGE_KEYS: Record<string, string> = {
   clip: "archive.stageClip",
   transcription: "archive.stageTranscription",
   comments: "archive.stageComments",
-  package: "archive.stagePackage"
+  package: "archive.stagePackage",
+  links: "archive.stageLinks"
 };
 
 const MAX_CANDIDATES_PRESETS = [1, 2, 3, 6, 12, 24];
@@ -101,6 +103,8 @@ export default function Home() {
   const [transcribe, setTranscribe] = usePersistedState("transcribe", true);
   const [withComments, setWithComments] = usePersistedState("withComments", true);
   const [encoder, setEncoder] = usePersistedState<"libx264" | "h264_nvenc" | "hevc_nvenc">("encoder", "h264_nvenc");
+  const [pipelineMode, setPipelineMode] = usePersistedState<"full" | "links" | "clips" | "sections">("pipelineMode", "full");
+  const [oauthToken, setOauthToken] = usePersistedState("oauthToken", "");
   const [keepFilter, setKeepFilter] = useState<"all" | "keep" | "discard" | "unreviewed">("all");
   const [minConfidence, setMinConfidence] = usePersistedState("minConfidence", 50);
   const [batchBurning, setBatchBurning] = useState(false);
@@ -109,6 +113,8 @@ export default function Home() {
   const [sortBy, setSortBy] = usePersistedState<SortMode>("sortBy", "confidence");
   const [searchQuery, setSearchQuery] = useState("");
   const [commentSettings, setCommentSettings] = useState<CommentOverlaySettings>(defaultCommentOverlaySettings);
+  const [llmProvider, setLlmProvider] = usePersistedState<"gemini" | "groq" | "openai">("llmProvider", "gemini");
+  const [autoEvaluate, setAutoEvaluate] = usePersistedState("autoEvaluate", true);
 
   // pipeline
   const [isRunning, setIsRunning] = useState(false);
@@ -121,6 +127,16 @@ export default function Home() {
   const [result, setResult] = useState<PipelineResult | null>(null);
   const [downloadPoints, setDownloadPoints] = useState<Array<{ percent: number; speed: string; ts: number; elapsed: number }>>([]);
   const downloadStartRef = useRef<number>(0);
+
+  // manual clip
+  const [clipUrl, setClipUrl] = usePersistedState("clipUrl", "");
+  const [clipWithComments, setClipWithComments] = usePersistedState("clipWithComments", true);
+  const [vodPreviewPath, setVodPreviewPath] = useState<string | null>(null);
+  const [vodPreviewDuration, setVodPreviewDuration] = useState(0);
+  const [vodLoading, setVodLoading] = useState(false);
+  const [clipRange, setClipRange] = useState<{ start: number; end: number }>({ start: 0, end: 0 });
+  const [manualClipLoading, setManualClipLoading] = useState(false);
+  const [manualClipResult, setManualClipResult] = useState<{ outputPath: string; sizeBytes: number; chatMessageCount: number; overlayItemCount?: number; warning?: string } | null>(null);
 
   // candidates
   const [candidates, setCandidates] = useState<ClipCandidate[]>(() => loadCandidates() ?? []);
@@ -271,6 +287,27 @@ export default function Home() {
 
   // ── run pipeline with proper SSE parsing ──
 
+  const autoEvaluateCandidates = useCallback(async (candidates: ClipCandidate[]) => {
+    if (!autoEvaluate) return;
+    const needsEval = candidates.filter((c) => c.transcription && !c.llmEvaluation);
+    if (needsEval.length === 0) return;
+    for (const candidate of needsEval) {
+      try {
+        const response = await fetch("/api/transcription/summarize", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ segments: candidate.transcription!.segments, provider: llmProvider })
+        });
+        if (response.ok) {
+          const evaluation = await response.json();
+          if (evaluation && typeof evaluation.interestingness === "number") {
+            setCandidates((prev) => prev.map((c) => c.id === candidate.id ? { ...c, llmEvaluation: evaluation } : c));
+          }
+        }
+      } catch { /* ignore individual evaluation failures */ }
+    }
+  }, [autoEvaluate, llmProvider]);
+
   const handleRun = useCallback(async () => {
     const trimmed = url.trim();
     if (!trimmed) { setError("URLを入力してください"); return; }
@@ -305,7 +342,10 @@ export default function Home() {
           transcribe,
           generatePackages: withComments,
           encoder,
-          clipMode: encoder !== "libx264" ? "reencode" : "copy"
+          clipMode: encoder !== "libx264" ? "reencode" : "copy",
+          llmProvider,
+          pipelineMode,
+          oauthToken: oauthToken || undefined,
         }),
         signal: abort.signal
       });
@@ -379,6 +419,7 @@ export default function Home() {
                 if (typeof Notification !== "undefined" && Notification.permission === "granted") {
                   new Notification("Stream Clipper", { body: `${res.candidates.length} candidates found` });
                 }
+                autoEvaluateCandidates(res.candidates);
               } else if (currentEvent === "error") {
                 setError(data?.error ?? t("archive.unknownError"));
               } else if (currentEvent === "cancelled") {
@@ -420,11 +461,70 @@ export default function Home() {
       setIsRunning(false);
       abortRef.current = null;
     }
-  }, [url, effectiveMax, transcribe, withComments, t]);
+  }, [url, effectiveMax, transcribe, withComments, encoder, llmProvider, autoEvaluateCandidates, pipelineMode, oauthToken, t]);
 
   const handleCancel = useCallback(() => {
     abortRef.current?.abort();
   }, []);
+
+  // Manual clip: load VOD for preview
+  const handleLoadVod = useCallback(async () => {
+    const trimmedUrl = clipUrl.trim();
+    if (!trimmedUrl) { setError("URLを入力してください"); return; }
+
+    setError(null);
+    setVodLoading(true);
+    setVodPreviewPath(null);
+    setManualClipResult(null);
+
+    try {
+      const res = await fetch("/api/media/clip-with-comments/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: trimmedUrl }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "Failed to load VOD");
+      setVodPreviewPath(data.inputPath);
+      setVodPreviewDuration(data.durationSeconds ?? 0);
+      setClipRange({ start: 0, end: data.durationSeconds ?? 0 });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "VOD load failed");
+    } finally {
+      setVodLoading(false);
+    }
+  }, [clipUrl]);
+
+  // Manual clip: generate clip from selected range
+  const handleManualClip = useCallback(async () => {
+    const trimmedUrl = clipUrl.trim();
+    if (!trimmedUrl || !clipRange.end) { setError("範囲を選択してください"); return; }
+
+    setError(null);
+    setManualClipLoading(true);
+    setManualClipResult(null);
+
+    try {
+      const res = await fetch("/api/media/clip-with-comments", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          url: trimmedUrl,
+          startSeconds: clipRange.start,
+          durationSeconds: clipRange.end - clipRange.start,
+          commentSettings: clipWithComments ? commentSettings : undefined,
+          encoder,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "Failed to generate clip");
+      setManualClipResult(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Manual clip failed");
+    } finally {
+      setManualClipLoading(false);
+    }
+  }, [clipUrl, clipRange, clipWithComments, commentSettings, encoder]);
 
   // Batch download — parallel with concurrency limiter
   const handleBatchDownload = useCallback(async () => {
@@ -609,6 +709,41 @@ export default function Home() {
                     encoder !== "libx264" ? "border-emerald-300/40 bg-emerald-400/10 text-emerald-100" : "border-white/10 text-slate-400")}>
                     <input type="checkbox" checked={encoder !== "libx264"} onChange={(e) => setEncoder(e.target.checked ? "h264_nvenc" : "libx264")} className="h-3.5 w-3.5 accent-emerald-300" />
                     {t("main.highSpeed")}
+                  </label>
+                </div>
+                <div className="flex items-end gap-3">
+                  <div>
+                    <span className="mb-1 block text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">{t("main.pipelineMode")}</span>
+                    <select value={pipelineMode} onChange={(e) => setPipelineMode(e.target.value as typeof pipelineMode)}
+                      className="rounded-xl border border-white/10 bg-white/[0.06] px-3 py-1.5 text-sm text-slate-200 outline-none focus:border-cyan-200/60">
+                      <option value="full">{t("main.pipelineModeFull")}</option>
+                      <option value="links">{t("main.pipelineModeLinks")}</option>
+                      <option value="clips">{t("main.pipelineModeClips")}</option>
+                      <option value="sections">{t("main.pipelineModeSections")}</option>
+                    </select>
+                  </div>
+                  {pipelineMode === "clips" && (
+                    <div className="flex-1">
+                      <span className="mb-1 block text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">{t("main.oauthToken")}</span>
+                      <input value={oauthToken} onChange={(e) => setOauthToken(e.target.value)} type="password" placeholder={t("main.oauthTokenHint")}
+                        className="w-full rounded-xl border border-white/10 bg-white/[0.06] px-3 py-1.5 text-sm text-slate-200 outline-none focus:border-cyan-200/60 placeholder:text-slate-500" />
+                    </div>
+                  )}
+                </div>
+                <div className="flex items-end gap-3">
+                  <div>
+                    <span className="mb-1 block text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">{t("main.aiProvider")}</span>
+                    <select value={llmProvider} onChange={(e) => setLlmProvider(e.target.value as typeof llmProvider)}
+                      className="rounded-xl border border-white/10 bg-white/[0.06] px-3 py-1.5 text-sm text-slate-200 outline-none focus:border-cyan-200/60">
+                      <option value="gemini">{t("main.aiProviderGemini")}</option>
+                      <option value="groq">{t("main.aiProviderGroq")}</option>
+                      <option value="openai">{t("main.aiProviderOpenAI")}</option>
+                    </select>
+                  </div>
+                  <label className={cn("flex cursor-pointer items-center gap-2 rounded-xl border px-3 py-1.5 text-sm transition",
+                    autoEvaluate ? "border-amber-300/40 bg-amber-400/10 text-amber-100" : "border-white/10 text-slate-400")} title={t("main.aiAutoEvaluateHint")}>
+                    <input type="checkbox" checked={autoEvaluate} onChange={(e) => setAutoEvaluate(e.target.checked)} className="h-3.5 w-3.5 accent-amber-300" />
+                    {t("main.aiAutoEvaluate")}
                   </label>
                 </div>
                 <div className="flex items-end gap-2">
@@ -808,9 +943,76 @@ export default function Home() {
                   onUpdate={(updated) => setCandidates(prev => prev.map(c => c.id === updated.id ? updated : c))}
                   onDelete={() => deleteCandidate(candidate.id)}
                   commentSettings={commentSettings}
+                  llmProvider={llmProvider}
                 />
               ))}
             </div>
+          </section>
+        )}
+
+        {/* Manual clip section */}
+        {!isRunning && (
+          <section className="glass-panel rounded-3xl p-5 sm:p-6">
+            <h2 className="mb-3 text-sm font-semibold text-white">{t("main.manualClip")}</h2>
+
+            {/* URL input + Load button */}
+            <div className="flex gap-3">
+              <input value={clipUrl} onChange={(e) => setClipUrl(e.target.value)}
+                placeholder={t("main.urlPlaceholder")}
+                disabled={vodLoading}
+                className="flex-1 rounded-xl border border-white/10 bg-white/[0.06] px-3 py-2 text-sm text-white placeholder:text-slate-500 focus:border-cyan-200/60 outline-none disabled:opacity-50" />
+              <button type="button" onClick={handleLoadVod} disabled={vodLoading || !clipUrl.trim()}
+                className="shrink-0 rounded-xl border border-cyan-200/45 bg-cyan-300/15 px-4 py-2 text-sm font-semibold text-cyan-50 transition hover:bg-cyan-300/25 disabled:opacity-40 disabled:cursor-not-allowed">
+                {vodLoading ? t("main.manualClipProgress") : t("main.manualClipLoad")}
+              </button>
+            </div>
+
+            {/* Video player + range selector */}
+            {vodPreviewPath && vodPreviewDuration > 0 && (
+              <div className="mt-4">
+                <VideoRangeSelector
+                  videoSrc={`/api/media/files?path=${encodeURIComponent(vodPreviewPath)}`}
+                  duration={vodPreviewDuration}
+                  onChange={(start, end) => setClipRange({ start, end })}
+                />
+
+                {/* Generate button */}
+                <div className="mt-3 flex items-center gap-3">
+                  <label className="flex cursor-pointer items-center gap-2 rounded-xl border border-white/10 px-3 py-2 text-sm text-slate-400 transition">
+                    <input type="checkbox" checked={clipWithComments} onChange={(e) => setClipWithComments(e.target.checked)} className="h-3.5 w-3.5 accent-cyan-300" />
+                    {t("main.withComments")}
+                  </label>
+                  <button type="button" onClick={handleManualClip} disabled={manualClipLoading}
+                    className="rounded-xl border border-violet-300/40 bg-violet-400/15 px-5 py-2 text-sm font-semibold text-violet-100 transition hover:bg-violet-400/25 disabled:opacity-40 disabled:cursor-not-allowed">
+                    {manualClipLoading ? t("main.manualClipProgress") : t("main.manualClipGenerate")}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Result */}
+            {manualClipResult && (
+              <div className="mt-3 rounded-xl border border-emerald-300/20 bg-emerald-400/10 p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-emerald-100">{t("main.manualClipDone")}</p>
+                    <p className="mt-0.5 text-xs text-emerald-100/70">
+                      {manualClipResult.chatMessageCount} {t("main.messages")}
+                      {manualClipResult.overlayItemCount ? ` · ${manualClipResult.overlayItemCount} comments` : ""}
+                      {manualClipResult.sizeBytes ? ` · ${formatBytes(manualClipResult.sizeBytes)}` : ""}
+                    </p>
+                    {manualClipResult.warning && (
+                      <p className="mt-1 text-xs text-amber-100/80">{manualClipResult.warning}</p>
+                    )}
+                  </div>
+                  <a href={`/api/media/files?path=${encodeURIComponent(manualClipResult.outputPath)}`} download
+                    className="shrink-0 rounded-xl border border-emerald-200/40 bg-emerald-300/15 px-4 py-2 text-xs font-semibold text-emerald-50 transition hover:bg-emerald-300/25">
+                    {t("main.manualClipDownload")}
+                  </a>
+                </div>
+                <p className="mt-1.5 truncate font-mono text-[0.6rem] text-emerald-100/50">{manualClipResult.outputPath}</p>
+              </div>
+            )}
           </section>
         )}
 
@@ -979,10 +1181,10 @@ function ToggleSetting({ label, checked, onChange }: { label: string; checked: b
 
 // ── simplified candidate card ──
 
-const SimpleCandidateCard = memo(function SimpleCandidateCard({ candidate, isExpanded, onToggle, onUpdate, onDelete, commentSettings }: {
+const SimpleCandidateCard = memo(function SimpleCandidateCard({ candidate, isExpanded, onToggle, onUpdate, onDelete, commentSettings, llmProvider }: {
   candidate: ClipCandidate; isExpanded: boolean; onToggle: () => void;
   onUpdate: (c: ClipCandidate) => void; onDelete: () => void;
-  commentSettings: CommentOverlaySettings;
+  commentSettings: CommentOverlaySettings; llmProvider: string;
 }) {
   const { t } = useI18n();
   const hasClip = Boolean(candidate.generatedClip);
@@ -1107,7 +1309,7 @@ const SimpleCandidateCard = memo(function SimpleCandidateCard({ candidate, isExp
               </div>
             )}
 
-            <LlmEvaluationBox candidate={candidate} onEvaluated={(evaluation) => onUpdate({ ...candidate, llmEvaluation: evaluation })} />
+            <LlmEvaluationBox candidate={candidate} llmProvider={llmProvider} onEvaluated={(evaluation) => onUpdate({ ...candidate, llmEvaluation: evaluation })} />
 
             {candidate.warnings.length > 0 && (
               <div>
@@ -1208,6 +1410,12 @@ function TrimmingSection({ candidate, onUpdate }: { candidate: ClipCandidate; on
     }
   };
 
+  const applyPreset = (factor: number) => {
+    const current = Number(durationSec) || 30;
+    const newDur = Math.max(10, Math.round(current * factor));
+    setDurationSec(String(newDur));
+  };
+
   return (
     <div>
       <p className="mb-1.5 text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">{t("main.trimming")}</p>
@@ -1224,6 +1432,25 @@ function TrimmingSection({ candidate, onUpdate }: { candidate: ClipCandidate; on
           className="rounded-lg border border-cyan-200/40 bg-cyan-300/15 px-3 py-1.5 text-xs font-semibold text-cyan-50 transition hover:bg-cyan-300/25 disabled:opacity-40">
           {isRegenerating ? t("main.trimRegenerating") : t("main.trimRegenerate")}
         </button>
+      </div>
+      <div className="mt-2 flex gap-1.5">
+        <button type="button" onClick={() => applyPreset(0.5)}
+          className="rounded-lg border border-white/10 bg-white/[0.04] px-2 py-1 text-[0.65rem] text-slate-400 transition hover:text-slate-200">
+          0.5x
+        </button>
+        <button type="button" onClick={() => applyPreset(1)}
+          className="rounded-lg border border-white/10 bg-white/[0.04] px-2 py-1 text-[0.65rem] text-slate-400 transition hover:text-slate-200">
+          1x
+        </button>
+        <button type="button" onClick={() => applyPreset(1.5)}
+          className="rounded-lg border border-white/10 bg-white/[0.04] px-2 py-1 text-[0.65rem] text-slate-400 transition hover:text-slate-200">
+          1.5x
+        </button>
+        <button type="button" onClick={() => applyPreset(2)}
+          className="rounded-lg border border-white/10 bg-white/[0.04] px-2 py-1 text-[0.65rem] text-slate-400 transition hover:text-slate-200">
+          2x
+        </button>
+        <span className="text-[0.6rem] text-slate-500 self-center ml-auto">{t("main.trimPresetHint")}</span>
       </div>
       {error && <p className="mt-1 text-[0.6rem] text-rose-300">{error}</p>}
     </div>
@@ -1393,7 +1620,7 @@ function BurnButton({ candidate, onDone, commentSettings }: {
 
 // ── LLM evaluation box ──
 
-function LlmEvaluationBox({ candidate, onEvaluated }: { candidate: ClipCandidate; onEvaluated: (evaluation: NonNullable<ClipCandidate["llmEvaluation"]>) => void }) {
+function LlmEvaluationBox({ candidate, llmProvider, onEvaluated }: { candidate: ClipCandidate; llmProvider: string; onEvaluated: (evaluation: NonNullable<ClipCandidate["llmEvaluation"]>) => void }) {
   const { t } = useI18n();
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);

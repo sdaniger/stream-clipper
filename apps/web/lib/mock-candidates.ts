@@ -135,6 +135,16 @@ export type ClipCandidateNotes = {
 
 export type EditorStatus = "keep" | "discard";
 
+export type TwitchClipReference = {
+  id: string;
+  editUrl: string;
+  previewUrl: string;
+  embedUrl: string;
+  duration: number;
+  createdAt: string;
+  broadcasterId: string;
+};
+
 export type ClipCandidate = {
   id: string;
   title: string;
@@ -189,6 +199,10 @@ export type ClipCandidate = {
     interestingness: number;
     reason: string;
   };
+  /** VOD timestamp link for Twitch VOD (e.g. https://twitch.tv/videos/123?t=1h23m45s) */
+  vodTimestampUrl?: string;
+  /** Twitch clip created via Helix API */
+  twitchClip?: TwitchClipReference;
   representativeComments: RepresentativeComment[];
   detectionReasons: DetectionReason[];
   warnings: CandidateWarning[];

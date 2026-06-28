@@ -1,16 +1,19 @@
 /**
- * OpenAI-compatible LLM client for clip evaluation.
+ * Multi-provider LLM client for clip evaluation.
  *
- * Configure via environment variables — no API key = disabled gracefully.
+ * Providers:
+ *   - "groq"   – Groq OpenAI-compatible API (llama-3.3-70b-versatile)
+ *   - "gemini" – Google Gemini API (gemini-2.0-flash)
+ *   - "openai" – OpenAI-compatible API (any model)
  *
- *   LLM_API_URL   – e.g. https://api.openai.com/v1/chat/completions
- *   LLM_API_KEY   – Bearer token
- *   LLM_MODEL     – e.g. gpt-4o-mini, gpt-4o, claude-3-haiku (default: gpt-4o-mini)
- *
- * The prompt is specialized for Japanese VTuber/twitch clip evaluation:
- * given a transcript of a 1-3 minute clip, the LLM returns a structured
- * JSON object with summary, highlights, interestingness score and reasoning.
+ * Configure via environment variables:
+ *   LLM_PROVIDER  – "groq" | "gemini" | "openai" (default: "gemini")
+ *   LLM_API_KEY   – API key
+ *   LLM_MODEL     – model name (optional, has provider-specific defaults)
+ *   LLM_API_URL   – custom endpoint (optional, has provider-specific defaults)
  */
+
+export type LlmProvider = "groq" | "gemini" | "openai";
 
 export type LlmEvaluation = {
   summary: string;
@@ -21,36 +24,61 @@ export type LlmEvaluation = {
 
 export type LlmStatus = {
   available: boolean;
+  provider: LlmProvider;
   model: string;
   endpoint: string;
   reason?: string;
 };
 
-export function getLlmConfig() {
-  const endpoint = (process.env.LLM_API_URL ?? "https://api.openai.com/v1/chat/completions").trim();
-  const apiKey = process.env.LLM_API_KEY?.trim() ?? "";
-  const model = (process.env.LLM_MODEL ?? "gpt-4o-mini").trim();
+const PROVIDER_DEFAULTS: Record<LlmProvider, { endpoint: string; model: string }> = {
+  groq: {
+    endpoint: "https://api.groq.com/openai/v1/chat/completions",
+    model: "llama-3.3-70b-versatile",
+  },
+  gemini: {
+    endpoint: "https://generativelanguage.googleapis.com/v1beta",
+    model: "gemini-2.0-flash",
+  },
+  openai: {
+    endpoint: "https://api.openai.com/v1/chat/completions",
+    model: "gpt-4o-mini",
+  },
+};
+
+export function getLlmConfig(overrideProvider?: LlmProvider) {
+  const provider = overrideProvider ?? (process.env.LLM_PROVIDER ?? "gemini").trim() as LlmProvider;
+  const defaults = PROVIDER_DEFAULTS[provider] ?? PROVIDER_DEFAULTS.gemini;
+  const endpoint = (process.env.LLM_API_URL ?? defaults.endpoint).trim();
+  const model = (process.env.LLM_MODEL ?? defaults.model).trim();
+
+  const apiKey =
+    process.env.LLM_API_KEY?.trim() ||
+    process.env.GROQ_API_KEY?.trim() ||
+    process.env.GEMINI_API_KEY?.trim() ||
+    "";
 
   if (!apiKey) {
     return {
       available: false as const,
+      provider,
       model,
       endpoint,
       apiKey: "",
-      reason: "LLM_API_KEY is not set. Add it to your .env file."
+      reason: "No API key found. Set LLM_API_KEY, GROQ_API_KEY, or GEMINI_API_KEY in .env.",
     };
   }
 
-  return { available: true as const, model, endpoint, apiKey };
+  return { available: true as const, provider, model, endpoint, apiKey };
 }
 
 export function getLlmStatus(): LlmStatus {
   const config = getLlmConfig();
   return {
     available: config.available,
+    provider: config.provider,
     model: config.model,
     endpoint: config.endpoint,
-    reason: "reason" in config ? config.reason : undefined
+    reason: "reason" in config ? config.reason : undefined,
   };
 }
 
@@ -63,34 +91,85 @@ const SYSTEM_PROMPT =
   "返すのは必ず以下の JSON だけにしてください:\n" +
   '{"summary":"...","highlights":["...","..."],"interestingness":85,"reason":"..."}';
 
-export async function evaluateClip(transcript: string): Promise<LlmEvaluation> {
-  const config = getLlmConfig();
+export async function evaluateClip(transcript: string, provider?: LlmProvider): Promise<LlmEvaluation> {
+  const config = getLlmConfig(provider);
   if (!config.available) {
     throw new Error(config.reason ?? "LLM is not configured.");
   }
 
   const userPrompt = `以下は配信クリップの文字起こしです。評価してください。\n\n文字起こし:\n${transcript}`;
 
+  if (config.provider === "gemini") {
+    return callGemini(config, userPrompt);
+  }
+  return callOpenAiCompatible(config, userPrompt);
+}
+
+async function callGemini(
+  config: { endpoint: string; model: string; apiKey: string },
+  userPrompt: string
+): Promise<LlmEvaluation> {
+  const url = `${config.endpoint}/models/${config.model}:generateContent?key=${config.apiKey}`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      contents: [{ parts: [{ text: userPrompt }] }],
+      generationConfig: {
+        temperature: 0.5,
+        maxOutputTokens: 600,
+        responseMimeType: "application/json",
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`Gemini API returned ${response.status}: ${body.slice(0, 200)}`);
+  }
+
+  const data = (await response.json()) as Record<string, unknown>;
+
+  const errorObj = data.error as { message: string } | undefined;
+  if (errorObj) {
+    throw new Error(`Gemini API error: ${errorObj.message}`);
+  }
+
+  const candidates = data.candidates as Array<{ content?: { parts?: Array<{ text?: string }> } }> | undefined;
+  const content = candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!content) {
+    throw new Error("Gemini returned empty content.");
+  }
+
+  return parseLlmResponse(content);
+}
+
+async function callOpenAiCompatible(
+  config: { endpoint: string; model: string; apiKey: string; provider: LlmProvider },
+  userPrompt: string
+): Promise<LlmEvaluation> {
   const response = await fetch(config.endpoint, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${config.apiKey}`
+      Authorization: `Bearer ${config.apiKey}`,
     },
     body: JSON.stringify({
       model: config.model,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userPrompt }
+        { role: "user", content: userPrompt },
       ],
       temperature: 0.5,
-      max_tokens: 600
-    })
+      max_tokens: 600,
+    }),
   });
 
   if (!response.ok) {
     const body = await response.text().catch(() => "");
-    throw new Error(`LLM API returned ${response.status}: ${body.slice(0, 200)}`);
+    throw new Error(`${config.provider} API returned ${response.status}: ${body.slice(0, 200)}`);
   }
 
   const data = (await response.json()) as {
@@ -99,7 +178,7 @@ export async function evaluateClip(transcript: string): Promise<LlmEvaluation> {
   };
 
   if (data.error) {
-    throw new Error(`LLM API error: ${data.error.message}`);
+    throw new Error(`${config.provider} API error: ${data.error.message}`);
   }
 
   const content = data.choices?.[0]?.message?.content;

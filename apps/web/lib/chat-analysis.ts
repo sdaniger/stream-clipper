@@ -24,6 +24,8 @@ export type ChatAnalysisSummary = {
   peakPerMinute: number;
 };
 
+export type ClipLengthPreset = "short" | "standard" | "long";
+
 export type ChatAnalysisResult = {
   candidates: ClipCandidate[];
   summary: ChatAnalysisSummary;
@@ -53,10 +55,27 @@ type CandidateWindow = {
   dominantReaction: ReactionKind;
 };
 
-const WINDOW_SECONDS = 30;
-const CONTEXT_BEFORE_SECONDS = 25;
-const CONTEXT_AFTER_SECONDS = 45;
+const DEFAULT_WINDOW_SECONDS = 30;
 const MAX_CANDIDATES = 24;
+
+export function computeAdaptiveWindowSeconds(
+  durationSeconds?: number | null,
+  preferred?: number
+): number {
+  if (preferred && preferred >= 10 && preferred <= 300) return preferred;
+  if (!durationSeconds || durationSeconds <= 0) return DEFAULT_WINDOW_SECONDS;
+  if (durationSeconds < 7200) return 30;
+  if (durationSeconds < 21600) return 45;
+  return 60;
+}
+
+function contextBeforeSeconds(windowSeconds: number) {
+  return Math.max(10, Math.round(windowSeconds * 5 / 6));
+}
+
+function contextAfterSeconds(windowSeconds: number) {
+  return Math.max(15, Math.round(windowSeconds * 3 / 2));
+}
 
 const reactionRules: Record<Exclude<ReactionKind, "general">, RegExp[]> = {
   laughter: [/草+/, /w{2,}/i, /ｗ{2,}/, /笑+/, /爆笑/, /lol/i, /lmao/i, /haha/i, /ハハ/],
@@ -115,15 +134,18 @@ export function analyzeChatJson(input: string, idPrefix = `chat-${Date.now()}`):
   return analyzeChatEntries(entries, idPrefix);
 }
 
-export function analyzeChatEntries(entries: ChatLogEntry[], idPrefix = `chat-${Date.now()}`): ChatAnalysisResult {
+export function analyzeChatEntries(
+  entries: ChatLogEntry[],
+  idPrefix = `chat-${Date.now()}`,
+  options?: { windowSeconds?: number; clipLength?: ClipLengthPreset }
+): ChatAnalysisResult {
+  const windowSec = options?.windowSeconds ?? DEFAULT_WINDOW_SECONDS;
+
   const normalizedEntries = entries
     .filter((entry) => entry.message.trim().length > 0)
     .sort((a, b) => a.timestamp_seconds - b.timestamp_seconds);
 
   if (normalizedEntries.length === 0) {
-    // Empty input is a valid outcome (no chat or no non-empty messages).
-    // Return a zero-candidate summary so callers can degrade gracefully
-    // instead of crashing the pipeline.
     return {
       candidates: [],
       summary: {
@@ -136,20 +158,11 @@ export function analyzeChatEntries(entries: ChatLogEntry[], idPrefix = `chat-${D
     };
   }
 
-  const buckets = buildBuckets(normalizedEntries);
+  const buckets = buildBuckets(normalizedEntries, windowSec);
   const counts = buckets.map((bucket) => bucket.entries.length);
-  const baselinePerMinute = Math.round(median(counts) * (60 / WINDOW_SECONDS));
-  const peakPerMinute = Math.round(Math.max(...counts) * (60 / WINDOW_SECONDS));
+  const baselinePerMinute = Math.round(median(counts) * (60 / windowSec));
+  const peakPerMinute = Math.round(Math.max(...counts) * (60 / windowSec));
 
-  // Percentile-based threshold: highlights the top ~15% of activity windows
-  // (85th percentile) relative to the whole stream. This auto-adapts to any
-  // chat density — high-activity streams (e.g. 28K messages) no longer
-  // require impossible 250+ msg/30s spikes to be detected, while quiet
-  // streams still catch any reasonable burst of activity. 85th percentile
-  // (vs 90th) was chosen to be more inclusive since downstream clustering
-  // (`mergeHighlightedBuckets`) already de-duplicates adjacent highlights
-  // into single candidate windows, so 15% of buckets quickly collapses into
-  // 3-6 candidate windows.
   const sortedCounts = [...counts].sort((a, b) => a - b);
   const p85Index = Math.floor(sortedCounts.length * 0.85);
   const volumeThreshold = Math.max(4, sortedCounts[p85Index] ?? 0);
@@ -165,15 +178,12 @@ export function analyzeChatEntries(entries: ChatLogEntry[], idPrefix = `chat-${D
     return hasVolumeSpike || hasReactionSpike;
   });
 
-  // DEBUG (temporary): log threshold so we can verify the new logic in
-  // production without redeploying. Remove after the 0-candidate regression
-  // is fully diagnosed.
   if (process.env.NODE_ENV !== "test" && typeof console !== "undefined") {
     console.log(
       `[chat-analysis] buckets=${buckets.length} messages=${normalizedEntries.length} ` +
         `p85=${sortedCounts[p85Index]} volumeThreshold=${volumeThreshold} ` +
         `p85Signal=${sortedSignals[p85SignalIndex]} reactionThreshold=${reactionThreshold} ` +
-        `highlighted=${highlightedBuckets.length}`
+        `highlighted=${highlightedBuckets.length} windowSec=${windowSec}`
     );
   }
 
@@ -190,11 +200,14 @@ export function analyzeChatEntries(entries: ChatLogEntry[], idPrefix = `chat-${D
     };
   }
 
-  const windows = mergeHighlightedBuckets(highlightedBuckets, normalizedEntries);
+  const ctxBefore = contextBeforeSeconds(windowSec);
+  const ctxAfter = contextAfterSeconds(windowSec);
+  const windows = mergeHighlightedBuckets(highlightedBuckets, normalizedEntries, ctxBefore, ctxAfter);
+  const clipLength = options?.clipLength ?? "standard";
   const candidates = windows
     .sort((a, b) => b.score - a.score)
     .slice(0, MAX_CANDIDATES)
-    .map((window, index) => buildCandidateFromWindow(window, index, idPrefix, baselinePerMinute, peakPerMinute));
+    .map((window, index) => buildCandidateFromWindow(window, index, idPrefix, baselinePerMinute, peakPerMinute, windowSec, clipLength));
 
   return {
     candidates,
@@ -237,11 +250,11 @@ function validateChatEntry(item: unknown, index: number): ChatLogEntry {
   };
 }
 
-function buildBuckets(entries: ChatLogEntry[]): Bucket[] {
+function buildBuckets(entries: ChatLogEntry[], windowSec: number): Bucket[] {
   const bucketMap = new Map<number, ChatLogEntry[]>();
 
   for (const entry of entries) {
-    const index = Math.floor(entry.timestamp_seconds / WINDOW_SECONDS);
+    const index = Math.floor(entry.timestamp_seconds / windowSec);
     bucketMap.set(index, [...(bucketMap.get(index) ?? []), entry]);
   }
 
@@ -257,8 +270,8 @@ function buildBuckets(entries: ChatLogEntry[]): Bucket[] {
 
     buckets.push({
       index,
-      start: index * WINDOW_SECONDS,
-      end: (index + 1) * WINDOW_SECONDS,
+      start: index * windowSec,
+      end: (index + 1) * windowSec,
       entries: bucketEntries,
       uniqueAuthors,
       reactionCounts,
@@ -269,7 +282,7 @@ function buildBuckets(entries: ChatLogEntry[]): Bucket[] {
   return buckets;
 }
 
-function mergeHighlightedBuckets(highlightedBuckets: Bucket[], entries: ChatLogEntry[]): CandidateWindow[] {
+function mergeHighlightedBuckets(highlightedBuckets: Bucket[], entries: ChatLogEntry[], ctxBefore: number, ctxAfter: number): CandidateWindow[] {
   const sorted = [...highlightedBuckets].sort((a, b) => a.index - b.index);
   const clusters: Bucket[][] = [];
 
@@ -287,8 +300,8 @@ function mergeHighlightedBuckets(highlightedBuckets: Bucket[], entries: ChatLogE
   return clusters.map((cluster) => {
     const start = cluster[0].start;
     const end = cluster[cluster.length - 1].end;
-    const clipStart = Math.max(0, start - CONTEXT_BEFORE_SECONDS);
-    const clipEnd = end + CONTEXT_AFTER_SECONDS;
+    const clipStart = Math.max(0, start - ctxBefore);
+    const clipEnd = end + ctxAfter;
     const windowEntries = entries.filter((entry) => entry.timestamp_seconds >= clipStart && entry.timestamp_seconds <= clipEnd);
     const peakBucket = cluster.reduce((best, bucket) => (bucket.signalScore > best.signalScore ? bucket : best), cluster[0]);
     const reactionCounts = countReactions(windowEntries);
@@ -304,11 +317,13 @@ function buildCandidateFromWindow(
   index: number,
   idPrefix: string,
   baselinePerMinute: number,
-  globalPeakPerMinute: number
+  globalPeakPerMinute: number,
+  windowSec: number,
+  clipLength: ClipLengthPreset = "standard"
 ): ClipCandidate {
   const id = `${idPrefix}-${index + 1}`;
   const durationSeconds = Math.max(30, window.clipEnd - window.clipStart);
-  const peakPerMinute = Math.round(window.peakBucket.entries.length * (60 / WINDOW_SECONDS));
+  const peakPerMinute = Math.round(window.peakBucket.entries.length * (60 / windowSec));
   const uniqueAuthors = new Set(window.entries.map((entry) => entry.author_name)).size;
   const repeatedPhrases = topPhrases(window.entries).slice(0, 3);
   const representativeComments = buildRepresentativeComments(window);
@@ -318,7 +333,7 @@ function buildCandidateFromWindow(
     96
   );
   const sparkline = buildSparkline(window.entries, window.clipStart, window.clipEnd);
-  const peakOffsetSeconds = Math.max(0, Math.round(window.peakBucket.start + WINDOW_SECONDS / 2 - window.clipStart));
+  const peakOffsetSeconds = Math.max(0, Math.round(window.peakBucket.start + windowSec / 2 - window.clipStart));
   const reactionLabel = reactionLabels[window.dominantReaction];
 
   const topPhrase = repeatedPhrases[0] ?? "";
@@ -361,8 +376,8 @@ function buildCandidateFromWindow(
     ],
     transcriptSegments: buildTranscriptPlaceholders(window, peakOffsetSeconds),
     representativeComments,
-    detectionReasons: buildDetectionReasons(window, baselinePerMinute, globalPeakPerMinute, uniqueAuthors),
-    warnings: buildWarnings(window, baselinePerMinute),
+    detectionReasons: buildDetectionReasons(window, baselinePerMinute, globalPeakPerMinute, uniqueAuthors, windowSec),
+    warnings: buildWarnings(window, baselinePerMinute, windowSec),
     notes: {
       editPlan: `${secondsToClock(window.clipStart)}-${secondsToClock(window.clipEnd)} を確認。チャットスパイク前の文脈から始めて、${reactionLabel} に視覚的・音声的な見どころがあるかチェックする。`,
       titleIdea: `${secondsToClock(window.peakBucket.start)} 頃に${reactionLabel}`,
@@ -370,7 +385,7 @@ function buildCandidateFromWindow(
       uploadText: "インポートしたチャット JSON から生成。公開前にソース動画の内容を必ず確認してください。"
     },
     markers: buildMarkers(id, peakOffsetSeconds, durationSeconds, window.dominantReaction),
-    variants: buildVariants(id, window.clipStart, window.clipEnd, window.peakBucket.start, window.peakBucket.end),
+    variants: buildVariants(id, window.clipStart, window.clipEnd, window.peakBucket.start, window.peakBucket.end, clipLength),
     selectedVariantId: `${id}-standard`,
     visualTone: visualTones[window.dominantReaction]
   };
@@ -443,8 +458,8 @@ function buildRepresentativeComments(window: CandidateWindow): RepresentativeCom
   }));
 }
 
-function buildDetectionReasons(window: CandidateWindow, baselinePerMinute: number, globalPeakPerMinute: number, uniqueAuthors: number): DetectionReason[] {
-  const peakPerMinute = Math.round(window.peakBucket.entries.length * (60 / WINDOW_SECONDS));
+function buildDetectionReasons(window: CandidateWindow, baselinePerMinute: number, globalPeakPerMinute: number, uniqueAuthors: number, windowSec: number): DetectionReason[] {
+  const peakPerMinute = Math.round(window.peakBucket.entries.length * (60 / windowSec));
   const reactionCounts = countReactions(window.entries);
   const dominant = dominantReactionKind(reactionCounts);
 
@@ -467,7 +482,7 @@ function buildDetectionReasons(window: CandidateWindow, baselinePerMinute: numbe
   ];
 }
 
-function buildWarnings(window: CandidateWindow, baselinePerMinute: number): CandidateWarning[] {
+function buildWarnings(window: CandidateWindow, baselinePerMinute: number, windowSec: number): CandidateWarning[] {
   const warnings: CandidateWarning[] = [
     {
       label: "チャットのみ",
@@ -475,7 +490,7 @@ function buildWarnings(window: CandidateWindow, baselinePerMinute: number): Cand
       severity: "medium"
     }
   ];
-  const peakPerMinute = Math.round(window.peakBucket.entries.length * (60 / WINDOW_SECONDS));
+  const peakPerMinute = Math.round(window.peakBucket.entries.length * (60 / windowSec));
 
   if (window.entries.length < 12) {
     warnings.push({
@@ -532,18 +547,29 @@ function buildMarkers(id: string, peakOffsetSeconds: number, durationSeconds: nu
   ];
 }
 
-function buildVariants(id: string, clipStart: number, clipEnd: number, peakStart: number, peakEnd: number): ClipCandidateVariant[] {
-  const shortStart = Math.max(0, peakStart - 15);
-  const shortEnd = peakEnd + 25;
+function buildVariants(id: string, clipStart: number, clipEnd: number, peakStart: number, peakEnd: number, clipLength: ClipLengthPreset = "standard"): ClipCandidateVariant[] {
+  // Scale factor based on clip length preset:
+  // short   = 0.6x  → tight around the peak
+  // standard = 1.0x → current default
+  // long    = 1.5x  → extra context before/after
+  const scale = clipLength === "short" ? 0.6 : clipLength === "long" ? 1.5 : 1.0;
+  const SHORT_LEAD = Math.round(15 * scale);
+  const SHORT_TRAIL = Math.round(25 * scale);
+  const CONTEXT_BEFORE = Math.round(20 * scale);
+  const CONTEXT_AFTER = Math.round(20 * scale);
+  const LONG_EXTRA = Math.round(40 * scale);
+
+  const shortStart = Math.max(0, peakStart - SHORT_LEAD);
+  const shortEnd = peakEnd + SHORT_TRAIL;
   const standardStart = clipStart;
   const standardEnd = clipEnd;
-  const contextStart = Math.max(0, clipStart - 20);
-  const contextEnd = clipEnd + 20;
+  const contextStart = Math.max(0, clipStart - CONTEXT_BEFORE);
+  const contextEnd = clipEnd + CONTEXT_AFTER;
 
-  return [
+  const variants: ClipCandidateVariant[] = [
     {
       id: `${id}-short`,
-      label: "スパイクのみ",
+      label: clipLength === "short" ? "最小限" : "スパイクのみ",
       start: secondsToClock(shortStart),
       end: secondsToClock(shortEnd),
       duration: secondsToClock(shortEnd - shortStart),
@@ -552,17 +578,17 @@ function buildVariants(id: string, clipStart: number, clipEnd: number, peakStart
     },
     {
       id: `${id}-standard`,
-      label: "標準レビュー",
+      label: clipLength === "long" ? "標準" : "標準レビュー",
       start: secondsToClock(standardStart),
       end: secondsToClock(standardEnd),
       duration: secondsToClock(standardEnd - standardStart),
       description: "リードイン、チャットスパイク、その後の余韻までを含む。",
       tradeoff: "人間のレビューには最適なデフォルト。",
-      recommended: true
+      recommended: clipLength !== "long"
     },
     {
       id: `${id}-context`,
-      label: "文脈多め",
+      label: clipLength === "long" ? "文脈広め" : "文脈多め",
       start: secondsToClock(contextStart),
       end: secondsToClock(contextEnd),
       duration: secondsToClock(contextEnd - contextStart),
@@ -570,6 +596,25 @@ function buildVariants(id: string, clipStart: number, clipEnd: number, peakStart
       tradeoff: "文脈が安全だが、レビューに時間がかかる。"
     }
   ];
+
+  // Long preset gets a 4th "extra long" variant for game streams where more
+  // context around a highlight is valuable (e.g. build-up + reaction + aftermath).
+  if (clipLength === "long") {
+    const extraLongStart = Math.max(0, clipStart - LONG_EXTRA);
+    const extraLongEnd = clipEnd + LONG_EXTRA;
+    variants.push({
+      id: `${id}-extralong`,
+      label: "超長め（ゲーム向け）",
+      start: secondsToClock(extraLongStart),
+      end: secondsToClock(extraLongEnd),
+      duration: secondsToClock(extraLongEnd - extraLongStart),
+      description: "前後に大幅なバッファを追加。ゲームの展開・反応・余韻まで包括。",
+      tradeoff: "尺が長いが、見どころを逃さない。長時間配信の切り抜きに最適。",
+      recommended: true
+    });
+  }
+
+  return variants;
 }
 
 function buildSparkline(entries: ChatLogEntry[], start: number, end: number) {
@@ -663,7 +708,7 @@ function average(values: number[]) {
   return values.reduce((total, value) => total + value, 0) / values.length;
 }
 
-function secondsToClock(totalSeconds: number) {
+export function secondsToClock(totalSeconds: number) {
   const safeSeconds = Math.max(0, Math.round(totalSeconds));
   const hours = Math.floor(safeSeconds / 3600);
   const minutes = Math.floor((safeSeconds % 3600) / 60);

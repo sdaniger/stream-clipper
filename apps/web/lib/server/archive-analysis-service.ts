@@ -1,4 +1,4 @@
-import { analyzeChatEntries, type ChatAnalysisSummary, type ChatLogEntry } from "@/lib/chat-analysis";
+import { analyzeChatEntries, computeAdaptiveWindowSeconds, secondsToClock, type ChatAnalysisSummary, type ChatLogEntry, type ClipLengthPreset } from "@/lib/chat-analysis";
 import {
   createCommentExportBundle,
   defaultCommentOverlaySettings,
@@ -14,8 +14,9 @@ import { fetchChatWithChatDownloader, defaultChatLimitForDuration, type FetchCha
 import { createLimiter } from "@/lib/concurrency";
 import { cpus } from "node:os";
 import { downloadVideoWithYtDlp, extractYtDlpMetadata, type YtDlpDownloadedVideo, type YtDlpMetadata } from "@/lib/server/yt-dlp-service";
+import { generateVodTimestampUrls, createTwitchClips, type PipelineModeContext } from "@/lib/server/pipeline-modes";
 
-export type ArchiveProgressStage = "metadata" | "download" | "chat" | "analysis" | "clip" | "transcription" | "comments" | "package";
+export type ArchiveProgressStage = "metadata" | "download" | "chat" | "analysis" | "clip" | "transcription" | "comments" | "package" | "links";
 
 export type ArchiveProgressEvent = {
   stage: ArchiveProgressStage;
@@ -38,6 +39,18 @@ export type ArchiveAutoAnalyzeInput = {
   transcriptionModel?: string;
   transcriptionLanguage?: string;
   generatePackages?: boolean;
+  /** Start time in seconds for partial VOD analysis. Defaults to 0 (beginning). */
+  timeStartSeconds?: number;
+  /** End time in seconds for partial VOD analysis. Defaults to end of video. */
+  timeEndSeconds?: number;
+  /** Bucket window size in seconds. Defaults to adaptive (30/45/60 based on duration). */
+  windowSeconds?: number;
+  /** Clip length preset — controls variant durations. Defaults to "standard". */
+  clipLength?: ClipLengthPreset;
+  /** Pipeline mode: full VOD, VOD timestamp links, Twitch clips, or section downloads. */
+  pipelineMode?: "full" | "links" | "clips" | "sections";
+  /** Twitch OAuth token for creating clips via Helix API (required for "clips" mode). */
+  oauthToken?: string;
   signal?: AbortSignal;
 };
 
@@ -101,6 +114,7 @@ export async function runArchiveAutoAnalysis(
   const clipMode = input.clipMode ?? "copy";
   const shouldTranscribe = input.transcribe !== false;
   const shouldGeneratePackages = input.generatePackages !== false;
+  const pipelineMode = input.pipelineMode ?? "full";
   const warnings: ArchiveAutoAnalyzeWarning[] = [];
   const emitProgress = (event: ArchiveProgressEvent) => { try { onProgress?.(event); } catch { /* client disconnected */ } };
 
@@ -108,11 +122,21 @@ export async function runArchiveAutoAnalysis(
   const metadata = await extractYtDlpMetadata({ url });
   emitProgress({ stage: "metadata", status: "done", message: `${metadata.title ?? metadata.url}` });
 
+  // Compute time range and adaptive window size from metadata.
+  const timeStart = Math.max(0, input.timeStartSeconds ?? 0);
+  const timeEnd = input.timeEndSeconds ?? metadata.durationSeconds ?? 0;
+  const hasTimeRange = timeStart > 0 || (timeEnd > 0 && timeEnd < (metadata.durationSeconds ?? Infinity));
+  const windowSec = computeAdaptiveWindowSeconds(
+    hasTimeRange ? (timeEnd - timeStart) : metadata.durationSeconds,
+    input.windowSeconds
+  );
+
   // 0 = user explicitly asked for "as much as possible". Otherwise, derive a
   // sensible default from the VOD duration when the caller didn't pick a number.
   const explicitLimit = input.maxMessages ?? 0;
+  const limitDuration = hasTimeRange ? (timeEnd - timeStart) : metadata.durationSeconds;
   const requestedChatLimit =
-    explicitLimit > 0 ? explicitLimit : defaultChatLimitForDuration(metadata.durationSeconds);
+    explicitLimit > 0 ? explicitLimit : defaultChatLimitForDuration(limitDuration);
   const isUnlimited = explicitLimit === 0;
   const maxChatMsgsLabel = isUnlimited
     ? `∞ (cap ${requestedChatLimit.toLocaleString()})`
@@ -130,11 +154,12 @@ export async function runArchiveAutoAnalysis(
   // max(download, chat) instead of download + chat. The chat fetch
   // gracefully tolerates the video not being downloaded yet because it only
   // needs the VOD duration (already returned by metadata).
-  emitProgress({ stage: "download", status: "running", message: `Downloading video...` });
+  const needsFullDownload = pipelineMode === "full" || pipelineMode === "sections";
+  emitProgress({ stage: "download", status: needsFullDownload ? "running" : "skipped", message: needsFullDownload ? `Downloading video...` : `Download skipped (${pipelineMode} mode)` });
   emitProgress({ stage: "chat", status: "running", message: "Fetching chat..." });
 
-  let downloadedVideo: Awaited<ReturnType<typeof downloadVideoWithYtDlp>>;
-  let fetchedChat: FetchChatDownloaderResult;
+  let downloadedVideo: Awaited<ReturnType<typeof downloadVideoWithYtDlp>> | null = null;
+  let fetchedChat!: FetchChatDownloaderResult;
   const chatPromise = (async () => {
     try {
       const result = await fetchChatWithChatDownloaderWithRetry({
@@ -149,7 +174,6 @@ export async function runArchiveAutoAnalysis(
       emitProgress({ stage: "chat", status: "done", message: `Fetched ${result.normalizedMessages.length.toLocaleString()} messages` });
       return { ok: true as const, result };
     } catch (error) {
-      // AbortErrors bubble up so the outer route can emit "cancelled".
       if (error instanceof DOMException && error.name === "AbortError") {
         throw error;
       }
@@ -157,22 +181,26 @@ export async function runArchiveAutoAnalysis(
     }
   })();
 
-  try {
-    downloadedVideo = await downloadVideoWithYtDlp({
-      url,
-      format: input.ytDlpFormat,
-      prefetchedMetadata: metadata,
-      signal: input.signal,
-      onProgress: (p) => {
-        emitProgress({ stage: "download", status: "running", message: `Downloading... ${p.percent.toFixed(1)}% at ${p.speed}, ETA ${p.eta}` });
-      }
-    });
-    emitProgress({ stage: "download", status: "done", message: `Downloaded ${downloadedVideo.filename}` });
-  } catch (error) {
-    // If the video download fails, the chat promise is still running in the
-    // background. Wait for it (it might still succeed) before throwing.
-    await chatPromise.catch(() => undefined);
-    throw error;
+  if (needsFullDownload) {
+    try {
+      downloadedVideo = await downloadVideoWithYtDlp({
+        url,
+        format: input.ytDlpFormat,
+        prefetchedMetadata: metadata,
+        timeStartSeconds: hasTimeRange ? timeStart : undefined,
+        timeEndSeconds: hasTimeRange ? timeEnd : undefined,
+        signal: input.signal,
+        onProgress: (p) => {
+          emitProgress({ stage: "download", status: "running", message: `Downloading... ${p.percent.toFixed(1)}% at ${p.speed}, ETA ${p.eta}` });
+        }
+      });
+      emitProgress({ stage: "download", status: "done", message: `Downloaded ${downloadedVideo.filename}` });
+    } catch (error) {
+      await chatPromise.catch(() => undefined);
+      throw error;
+    }
+  } else {
+    emitProgress({ stage: "download", status: "skipped", message: `Download skipped (${pipelineMode} mode)` });
   }
 
   const chatResult = await chatPromise;
@@ -193,11 +221,18 @@ export async function runArchiveAutoAnalysis(
     };
   }
 
+  // Filter chat messages to the selected time range (if specified).
+  const filteredChat = hasTimeRange
+    ? fetchedChat.normalizedMessages.filter(
+        (msg) => msg.timestamp_seconds >= timeStart && msg.timestamp_seconds <= timeEnd
+      )
+    : fetchedChat.normalizedMessages;
+
   // Build a zero-candidate summary when chat data is missing so the pipeline
   // can finish gracefully instead of throwing inside analyzeChatEntries.
   const analysis =
-    fetchedChat.normalizedMessages.length > 0
-      ? analyzeChatEntries(fetchedChat.normalizedMessages, buildCandidatePrefix(metadata))
+    filteredChat.length > 0
+      ? analyzeChatEntries(filteredChat, buildCandidatePrefix(metadata), { windowSeconds: windowSec, clipLength: input.clipLength })
       : {
           candidates: [],
           summary: {
@@ -209,10 +244,10 @@ export async function runArchiveAutoAnalysis(
           }
         };
 
-  if (fetchedChat.normalizedMessages.length === 0) {
+  if (filteredChat.length === 0) {
     warnings.push({
       stage: "chat",
-      message: "No chat messages were collected. Candidates cannot be generated from chat activity."
+      message: "No chat messages were collected in the selected time range. Candidates cannot be generated from chat activity."
     });
   }
 
@@ -220,13 +255,85 @@ export async function runArchiveAutoAnalysis(
     stage: "analysis",
     status: "running",
     message:
-      fetchedChat.normalizedMessages.length > 0
-        ? "Running rule-based chat analysis..."
+      filteredChat.length > 0
+        ? `Running rule-based chat analysis (${hasTimeRange ? `time range ${secondsToClock(timeStart)}-${secondsToClock(timeEnd)}, ` : ""}window ${windowSec}s)...`
         : "Skipping analysis (no chat data — no candidates can be generated)."
   });
 
   const sourceCandidates = enrichArchiveCandidates(analysis.candidates, metadata).slice(0, maxCandidates);
   emitProgress({ stage: "analysis", status: "done", message: `Found ${sourceCandidates.length} candidates` });
+
+  // Pipeline mode branching: apply mode-specific processing after analysis.
+  const modeContext: PipelineModeContext = {
+    url,
+    metadata,
+    candidates: sourceCandidates,
+    emitProgress,
+    signal: input.signal,
+  };
+
+  if (pipelineMode === "links") {
+    // Links mode: add VOD timestamp URLs to candidates, skip clip generation.
+    emitProgress({ stage: "links", status: "running", message: "Generating VOD timestamp links..." });
+    const linkedCandidates = generateVodTimestampUrls(modeContext);
+    emitProgress({ stage: "links", status: "done", message: `Generated ${linkedCandidates.length} VOD timestamp links` });
+
+    // Build lightweight candidates without clip generation.
+    const candidates: ClipCandidate[] = [];
+    for (const c of linkedCandidates) {
+      candidates.push(c);
+    }
+
+    return {
+      sourceUrl: url,
+      metadata,
+      downloadedVideo: downloadedVideo as YtDlpDownloadedVideo,
+      chat: { source: fetchedChat.source, url: fetchedChat.url, normalizedPath: fetchedChat.normalizedPath, rawPath: fetchedChat.rawPath, messageCount: fetchedChat.normalizedMessages.length, commandPreview: fetchedChat.commandPreview, fetchedAt: fetchedChat.fetchedAt },
+      summary: { ...analysis.summary, candidateCount: candidates.length },
+      candidates,
+      generatedClipCount: 0,
+      transcribedCount: 0,
+      commentAssetCount: 0,
+      packageCount: 0,
+      pipelineWarnings: warnings,
+    };
+  }
+
+  if (pipelineMode === "clips") {
+    // Clips mode: create Twitch clips via Helix API, skip local clip generation.
+    if (!input.oauthToken) {
+      warnings.push({ stage: "clip", message: "OAuth token is required for Twitch Clips mode. Add TWITCH_OAUTH_TOKEN to .env or paste in the pipeline form." });
+      emitProgress({ stage: "clip", status: "error", message: "Missing OAuth token for Twitch Clips mode" });
+    } else {
+      emitProgress({ stage: "clip", status: "running", message: "Creating Twitch clips via Helix API..." });
+      try {
+        const clipCandidates = await createTwitchClips(modeContext, input.oauthToken);
+        emitProgress({ stage: "clip", status: "done", message: `Created ${clipCandidates.filter(c => c.twitchClip).length} Twitch clips` });
+
+        const candidates: ClipCandidate[] = [];
+        for (const c of clipCandidates) {
+          candidates.push(c);
+        }
+
+        return {
+          sourceUrl: url,
+          metadata,
+          downloadedVideo: downloadedVideo as YtDlpDownloadedVideo,
+          chat: { source: fetchedChat.source, url: fetchedChat.url, normalizedPath: fetchedChat.normalizedPath, rawPath: fetchedChat.rawPath, messageCount: fetchedChat.normalizedMessages.length, commandPreview: fetchedChat.commandPreview, fetchedAt: fetchedChat.fetchedAt },
+          summary: { ...analysis.summary, candidateCount: candidates.length },
+          candidates,
+          generatedClipCount: 0,
+          transcribedCount: 0,
+          commentAssetCount: 0,
+          packageCount: 0,
+          pipelineWarnings: warnings,
+        };
+      } catch (error) {
+        warnings.push({ stage: "clip", message: `Twitch clip creation failed: ${errorMessage(error, "Unknown error")}` });
+        emitProgress({ stage: "clip", status: "error", message: errorMessage(error, "Twitch clip creation failed") });
+      }
+    }
+  }
 
   const candidates: ClipCandidate[] = [];
 
@@ -269,8 +376,27 @@ export async function runArchiveAutoAnalysis(
       let generatedClip: GeneratedClipReference | undefined;
       let generatedCandidate = candidate;
       try {
+        let clipInputPath = downloadedVideo!.inputPath;
+
+        // In sections mode, download just this section instead of using the full VOD.
+        if (pipelineMode === "sections") {
+          const { parseTimecodeToSeconds } = await import("@/lib/server/pipeline-modes");
+          const startSeconds = parseTimecodeToSeconds(selectedVariant.start);
+          const endSeconds = startSeconds + parseTimecodeToSeconds(selectedVariant.duration);
+          const { downloadSectionWithYtDlp } = await import("@/lib/server/yt-dlp-service");
+          emitProgress({ stage: "clip", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Downloading section for ${indexLabel}...` });
+          const section = await downloadSectionWithYtDlp({
+            url,
+            startSeconds,
+            endSeconds,
+            candidateId: candidate.id,
+            signal: input.signal,
+          });
+          clipInputPath = section.inputPath;
+        }
+
         generatedClip = await clipLimit(() => generateClip({
-          inputPath: downloadedVideo.inputPath,
+          inputPath: clipInputPath,
           candidateId: candidate.id,
           variantId: selectedVariant.id,
           start: selectedVariant.start,
@@ -391,14 +517,16 @@ export async function runArchiveAutoAnalysis(
   // Delete the downloaded VOD now that clips are generated. The full
   // archive is typically 10-15 GB per VOD. Use fire-and-forget so the
   // HTTP response isn't blocked waiting for the filesystem.
-  import("node:fs/promises").then(({ unlink }) =>
-    unlink(downloadedVideo.absolutePath).catch(() => undefined)
-  );
+  if (downloadedVideo) {
+    import("node:fs/promises").then(({ unlink }) =>
+      unlink(downloadedVideo!.absolutePath).catch(() => undefined)
+    );
+  }
 
   return {
     sourceUrl: url,
     metadata,
-    downloadedVideo,
+    downloadedVideo: downloadedVideo as YtDlpDownloadedVideo,
     chat: {
       source: fetchedChat.source,
       url: fetchedChat.url,
@@ -483,7 +611,9 @@ async function transcribeClip(clipPath: string, input: ArchiveAutoAnalyzeInput):
       clip_path: clipPath,
       model: input.transcriptionModel?.trim() || undefined,
       language: input.transcriptionLanguage?.trim() || undefined
-    })
+    }),
+    timeoutMs: 5 * 60 * 1000,
+    signal: input.signal
   });
 
   if (!response.ok) {
