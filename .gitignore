@@ -80,3 +80,5 @@ apps/web/playwright-report/
 !apps/web/tests/*.png
 !apps/web/app/api/media/
 !apps/web/app/api/media/**
+# Python build artifacts
+*.egg-info/

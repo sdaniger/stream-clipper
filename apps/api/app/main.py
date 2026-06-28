@@ -1,20 +1,28 @@
 import os
+import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# Add the CLI package to sys.path for reuse in highlight service
+_cli_path = Path(__file__).resolve().parents[3] / "packages" / "cli"
+if str(_cli_path) not in sys.path:
+    sys.path.insert(0, str(_cli_path))
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.routers.transcription import router as transcription_router
+from app.routers.highlights import router as highlights_router
 
 
 def create_app() -> FastAPI:
     app = FastAPI(title="Stream Clipper API", version="0.1.0")
     cors_origins = [
         origin.strip()
-        for origin in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+        for origin in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173").split(",")
         if origin.strip()
     ]
 
@@ -26,6 +34,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(transcription_router)
+    app.include_router(highlights_router)
     return app
 
 

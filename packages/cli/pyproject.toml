@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "stream-clipper-cli"
@@ -11,6 +11,7 @@ dependencies = []
 
 [project.scripts]
 stream-clipper-cli = "stream_clipper_cli.cli:main"
+stream-clipper = "stream_clipper_cli.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

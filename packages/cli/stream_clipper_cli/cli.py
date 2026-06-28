@@ -7,6 +7,7 @@ from typing import List, Optional
 
 from stream_clipper_cli.analyzer import analyze_highlights, load_chat
 from stream_clipper_cli.exporter import print_summary, write_csv, write_json
+from stream_clipper_cli.gui import run_gui
 from stream_clipper_cli.scorer import DEFAULT_KEYWORDS, DEFAULT_KEYWORD_WEIGHT
 from stream_clipper_cli.video import generate_clips
 
@@ -17,6 +18,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Livestream highlight detection and clipping tool",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    # --- gui subcommand ---
+    gui_parser = sub.add_parser("gui", help="Launch the desktop GUI application")
+    gui_parser.add_argument("--port", type=int, default=8000, help="Backend port (default: 8000)")
+    gui_parser.set_defaults(func=_run_gui)
 
     # --- analyze subcommand ---
     analyze = sub.add_parser("analyze", help="Analyze chat log for highlights")
@@ -34,6 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Output JSON file path for highlight candidates")
     analyze.add_argument("--output-csv", type=str, default=None,
                          help="Output CSV file path for timeline data")
+    analyze.set_defaults(func=cmd_analyze)
 
     # --- clip subcommand ---
     clip = sub.add_parser("clip", help="Analyze and generate video clips")
@@ -62,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Output CSV file path for timeline data")
     clip.add_argument("--ffmpeg-args", type=str, default=None,
                       help="Additional ffmpeg arguments (e.g. '--ffmpeg-args=-preset fast')")
+    clip.set_defaults(func=cmd_clip)
 
     return parser
 
@@ -76,12 +84,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    keywords = parse_keywords(args.keywords)
-
-    if args.command == "analyze":
-        return cmd_analyze(args, keywords)
-    elif args.command == "clip":
-        return cmd_clip(args, keywords)
+    if hasattr(args, "func"):
+        if args.command == "analyze" or args.command == "clip":
+            keywords = parse_keywords(args.keywords)
+            return args.func(args, keywords)
+        return args.func(args)
     else:
         parser.print_help()
         return 1
@@ -187,6 +194,10 @@ def cmd_clip(args: argparse.Namespace, keywords: List[str]) -> int:
         print("Skipped clip generation (--no-clip)")
 
     return 0
+
+
+def _run_gui(args: argparse.Namespace) -> int:
+    return run_gui()
 
 
 if __name__ == "__main__":

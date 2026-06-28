@@ -161,3 +161,92 @@ media/output/packages/
 ```
 
 Each package contains `metadata.json`, `notes.md`, current comment JSON/ASS files, and copies of available generated assets such as clean clips, comment-burned clips, and transcript files. Missing assets are left out so an editor can still package partial work.
+
+---
+
+## GUI Application (Highlight Analysis & Clipping)
+
+A standalone desktop-style GUI for highlight detection and clip generation is available under `packages/gui/`.
+
+### Prerequisites
+
+- Python 3.10+
+- Node.js 18+
+- ffmpeg on PATH (for clip generation)
+
+### Quick Start
+
+```bash
+# 1. Install GUI frontend dependencies
+cd packages/gui && npm install
+
+# 2. Install CLI package in the API virtual environment
+cd apps/api && .venv/bin/pip install -e ../../packages/cli
+
+# 3. Launch the GUI (starts both FastAPI backend on :8000 and Vite frontend on :5173)
+stream-clipper gui
+```
+
+Or start each component separately:
+
+```bash
+# Terminal 1: FastAPI backend
+cd apps/api && .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+# Terminal 2: GUI frontend
+cd packages/gui && npm run dev
+```
+
+Open `http://localhost:5173`.
+
+### How to Use
+
+1. **Input**: Enter paths to a video file and a chat log file (.json or .csv)
+2. **Settings**: Configure window size, top N, keyword weight, and custom keywords in Advanced settings
+3. **Analyze**: Click "Analyze" to detect highlights — results appear as a ranked list and timeline chart
+4. **Preview**: Click a highlight card to seek the video to that position
+5. **Adjust**: Fine-tune clip start/end times in the video panel
+6. **Generate**: Click "Generate" on a single highlight or "Top N Generate" for batch clip creation
+7. **Export**: Save highlights JSON and timeline CSV with the buttons above the chart
+
+### Supported Chat Log Formats
+
+- **JSON**: Array of objects with `timestamp` (or `time`/`createdAt`) and `message` fields
+- **CSV**: Columns for `timestamp` (or `time`/`start`) and `message` (or `text`/`body`)
+
+### API Endpoints (GUI Backend)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/gui/health` | Health check |
+| POST | `/api/gui/analyze` | Analyze chat log for highlights |
+| POST | `/api/gui/clips/create` | Generate a single clip |
+| POST | `/api/gui/clips/batch` | Generate multiple clips |
+| GET | `/api/gui/video?path=...` | Stream a local video file |
+
+### CLI Usage (Standalone)
+
+The Python CLI tool is also available directly (no GUI required):
+
+```bash
+# Analyze only
+stream-clipper-cli analyze chat_log.json --top 5 --output-json highlights.json --output-csv timeline.csv
+
+# Analyze + clip generation
+stream-clipper-cli clip video.mp4 chat_log.json --top 3 --output-dir clips/
+
+# Analyze only (no video needed)
+stream-clipper-cli clip video.mp4 chat_log.json --no-clip --output-json highlights.json
+```
+
+### Upcoming Features
+
+- Subtitle generation (Whisper)
+- AI-based scene search
+- Vertical short video conversion (9:16)
+- Timeline video seek via chart click
+- Drag-based clip adjustment
+
+---
+
+The existing Next.js web app (`apps/web/`) and CLI tool (`stream-clipper-cli`) continue to work as before. The GUI is an additional interface and does not replace or modify any existing functionality.
