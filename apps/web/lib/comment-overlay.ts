@@ -15,7 +15,9 @@ export const defaultCommentOverlaySettings: CommentOverlaySettings = {
   filterRepeatedComments: true,
   fontName: "Noto Sans JP",
   outlineWidth: 4,
-  maxPerSecond: 12
+  maxPerSecond: 12,
+  longCommentLimit: 40,
+  repeatedCommentWindowMs: 3000
 };
 
 export const commentCategoryColors: Record<CommentOverlayCategory, string> = {
@@ -32,8 +34,11 @@ export const commentFontSizes: Record<CommentOverlaySettings["fontSize"], number
   large: 68
 };
 
-/** NicoNico-style line height — 60px matches the narinico tool's LINE_HEIGHT. */
-const LINE_HEIGHT = 60;
+/** NicoNico-style line height — 60px at 1080p, scales with resolution. */
+const REF_LINE_HEIGHT = 60;
+function getLineHeight(canvasHeight: number) {
+  return Math.max(30, Math.round(REF_LINE_HEIGHT * canvasHeight / 1080));
+}
 
 const densityModulo: Record<CommentOverlaySettings["density"], number> = {
   low: 4,
@@ -44,11 +49,12 @@ const densityModulo: Record<CommentOverlaySettings["density"], number> = {
 
 /**
  * Cap on how many NicoNico-style comments can be on screen at the same
- * moment. The narinico tool uses density to scale this. 12 is enough to
- * fill the screen for a 1080p video with ~15-18 lanes without becoming
- * unreadable.
+ * moment. Scales with resolution.
  */
-const MAX_CONCURRENT_COMMENTS = 12;
+const REF_MAX_CONCURRENT = 12;
+function getMaxConcurrent(canvasHeight: number) {
+  return Math.max(4, Math.round(REF_MAX_CONCURRENT * canvasHeight / 1080));
+}
 
 /**
  * Narinico-style variable scroll speed. Longer comments scroll faster,
@@ -76,21 +82,24 @@ const SPEED_GAMMA = 0.5;
 const SPEED_MIN = 0.80;
 const SPEED_MAX = 1.00;
 const BASE_DWELL_SEC = 5.0;
-const SAFE_GAP_PX = 24;
+const REF_SAFE_GAP_PX = 24;
 
 const durationCache = new Map<number, number>();
 
-function computeScrollDuration(commentWidth: number): number {
-  const cached = durationCache.get(commentWidth);
+/** Compute scroll duration for a comment of the given pixel width.
+ *  canvasWidth defaults to 1920 (1080p) for backward compatibility. */
+function computeScrollDuration(commentWidth: number, canvasWidth: number = REF_SCREEN_WIDTH): number {
+  const cacheKey = commentWidth * 10000 + canvasWidth;
+  const cached = durationCache.get(cacheKey);
   if (cached !== undefined) return cached;
-  const outW = REF_SCREEN_WIDTH;
-  const rawBase = (outW + commentWidth + SAFE_GAP_PX) / BASE_DWELL_SEC;
+  const safeGap = Math.round(REF_SAFE_GAP_PX * canvasWidth / REF_SCREEN_WIDTH);
+  const rawBase = (canvasWidth + commentWidth + safeGap) / BASE_DWELL_SEC;
   const scaleRaw = Math.pow(commentWidth / Math.max(1, REF_WIDTH_PX), SPEED_GAMMA);
   const boost = Math.min(SPEED_MAX, Math.max(SPEED_MIN, scaleRaw));
   const v = rawBase * boost;
-  const result = (outW + commentWidth + SAFE_GAP_PX) / Math.max(0.01, v);
+  const result = (canvasWidth + commentWidth + safeGap) / Math.max(0.01, v);
   if (durationCache.size > 2000) durationCache.clear();
-  durationCache.set(commentWidth, result);
+  durationCache.set(cacheKey, result);
   return result;
 }
 
@@ -116,9 +125,11 @@ export function categorizeComment(text: string): CommentOverlayCategory {
   return "normal";
 }
 
-export function generateCommentOverlayItems(candidate: ClipCandidate, durationSeconds: number): CommentOverlayItem[] {
+export function generateCommentOverlayItems(candidate: ClipCandidate, durationSeconds: number, settings?: Partial<CommentOverlaySettings>): CommentOverlayItem[] {
+  const mergedSettings = { ...defaultCommentOverlaySettings, ...settings };
   const sourceComments = buildSourceComments(candidate);
   const safeDuration = Math.max(12, durationSeconds);
+  const fontSize = commentFontSizes[mergedSettings.fontSize];
   // Spread all repeated comments evenly across the full clip span so the
   // overlay doesn't cluster everything in the first 20 seconds.
   let index = 0;
@@ -132,6 +143,8 @@ export function generateCommentOverlayItems(candidate: ClipCandidate, durationSe
 
     return Array.from({ length: repeatCount }, () => {
       const time = ((index++ / totalCount) * Math.max(8, safeDuration - 2) + 1);
+      const estimatedWidth = estimateAssTextWidth(comment.text, fontSize);
+      const duration = computeScrollDuration(estimatedWidth);
 
       return {
         id: `${candidate.id}-overlay-${index}`,
@@ -139,9 +152,9 @@ export function generateCommentOverlayItems(candidate: ClipCandidate, durationSe
         text: comment.text,
         userId: comment.author,
         mode: "scroll" as const,
-        color: commentCategoryColors[category],
-        size: commentFontSizes.medium,
-        duration: roundTime(computeScrollDuration(estimateAssTextWidth(comment.text, commentFontSizes.medium))),
+        color: mergedSettings.colorMode === "reaction" ? commentCategoryColors[category] : "#ffffff",
+        size: fontSize,
+        duration: roundTime(duration),
         weight: comment.intensity === "high" ? 3 : comment.intensity === "medium" ? 2 : 1,
         category
       };
@@ -180,7 +193,7 @@ export function generateCommentOverlayItemsFromChat(
   clipEndSeconds: number,
   settings: CommentOverlaySettings
 ): CommentOverlayItem[] {
-  const windowMs = settings.filterRepeatedComments ? 3000 : 0;
+  const windowMs = settings.filterRepeatedComments ? settings.repeatedCommentWindowMs : 0;
   const recentText = new Map<string, number>();
   const out: CommentOverlayItem[] = [];
 
@@ -200,7 +213,7 @@ export function generateCommentOverlayItemsFromChat(
     if (relativeSeconds < 0) relativeSeconds = 0;
 
     if (settings.filterUrls && /(https?:\/\/|www\.)/i.test(text)) continue;
-    if (settings.filterLongComments && text.length > 40) continue;
+    if (settings.filterLongComments && text.length > settings.longCommentLimit) continue;
 
     if (settings.filterRepeatedComments) {
       const key = text.toLowerCase();
@@ -257,28 +270,36 @@ function capByPerSecond(items: CommentOverlayItem[], maxPerSecond: number): Comm
 export function prepareOverlayComments(
   comments: CommentOverlayItem[],
   settings: CommentOverlaySettings,
-  canvasHeight: number
+  canvasHeight: number,
+  canvasWidth: number = REF_SCREEN_WIDTH
 ): CommentOverlayItem[] {
   const fontSize = commentFontSizes[settings.fontSize];
+  const lh = getLineHeight(canvasHeight);
+  const safeGap = Math.round(REF_SAFE_GAP_PX * canvasWidth / REF_SCREEN_WIDTH);
   // Density is already applied in generateCommentOverlayItemsFromChat.
   // Only re-apply content filters (URL / long / repeated) as a safety net
   // for comments coming from the fallback synthetic generator.
   const filtered = applyCommentFilters(comments, settings);
-  const lanes = Math.max(1, Math.floor(getDisplayArea(canvasHeight, settings.displayArea).height / LINE_HEIGHT));
+  const lanes = Math.max(1, Math.floor(getDisplayArea(canvasHeight, settings.displayArea).height / lh));
   const laneAvailability = Array.from({ length: lanes }, () => 0);
   const laneLastSpeed = Array.from({ length: lanes }, () => Infinity);
 
   return filtered.map((comment) => {
     const estimatedWidth = estimateAssTextWidth(comment.text, fontSize);
-    const scrollDuration = computeScrollDuration(estimatedWidth);
-    const speed = (REF_SCREEN_WIDTH + estimatedWidth + SAFE_GAP_PX) / Math.max(0.01, scrollDuration);
+    let scrollDuration = computeScrollDuration(estimatedWidth, canvasWidth);
     const lane = chooseLane(laneAvailability);
+    // Speed inheritance: don't make this comment scroll faster than
+    // the previous one on the same lane (same as narinico).
+    const currentSpeed = (canvasWidth + estimatedWidth + safeGap) / Math.max(0.01, scrollDuration);
+    if (currentSpeed > laneLastSpeed[lane]) {
+      // Clamp to the slower speed — recompute duration from the max speed.
+      scrollDuration = (canvasWidth + estimatedWidth + safeGap) / Math.max(0.01, laneLastSpeed[lane]);
+    }
+    const finalSpeed = (canvasWidth + estimatedWidth + safeGap) / Math.max(0.01, scrollDuration);
+    laneLastSpeed[lane] = Math.min(finalSpeed, laneLastSpeed[lane]);
     // Full duration occupancy — narinico-style: the lane is freed when
     // the comment has fully exited the screen, including safe gap.
     laneAvailability[lane] = comment.time + scrollDuration;
-    // Speed inheritance: don't make this comment scroll faster than
-    // the previous one on the same lane (same as narinico).
-    laneLastSpeed[lane] = Math.min(speed, laneLastSpeed[lane]);
 
     return {
       ...comment,
@@ -304,7 +325,7 @@ export function applyCommentFilters(comments: CommentOverlayItem[], settings: Co
       return false;
     }
 
-    if (settings.filterLongComments && text.length > 40) {
+    if (settings.filterLongComments && text.length > settings.longCommentLimit) {
       return false;
     }
 
@@ -313,7 +334,7 @@ export function applyCommentFilters(comments: CommentOverlayItem[], settings: Co
       const lastTime = seen.get(key);
       seen.set(key, comment.time);
 
-      if (lastTime !== undefined && comment.time - lastTime < 3) {
+      if (lastTime !== undefined && comment.time - lastTime < settings.repeatedCommentWindowMs / 1000) {
         return false;
       }
     }
@@ -340,7 +361,8 @@ export function getDisplayArea(canvasHeight: number, displayArea: CommentOverlay
 
 export function getCommentY(lane: number, canvasHeight: number, settings: CommentOverlaySettings) {
   const area = getDisplayArea(canvasHeight, settings.displayArea);
-  return area.top + lane * LINE_HEIGHT + LINE_HEIGHT * 0.85;
+  const lh = getLineHeight(canvasHeight);
+  return area.top + lane * lh + lh * 0.85;
 }
 
 export function getActiveCommentPosition(
@@ -348,10 +370,11 @@ export function getActiveCommentPosition(
   currentTime: number,
   canvasWidth: number,
   textWidth: number,
-  settings: CommentOverlaySettings
+  _settings: CommentOverlaySettings
 ) {
-  const displayTime = comment.time + settings.syncOffsetSeconds;
-  const elapsed = currentTime - displayTime;
+  // syncOffset is already applied in generateCommentOverlayItemsFromChat,
+  // so we use comment.time directly to avoid double-application.
+  const elapsed = currentTime - comment.time;
 
   if (elapsed < 0 || elapsed > comment.duration) {
     return null;
@@ -376,7 +399,7 @@ export function createCommentExportPayload({
   width?: number;
   height?: number;
 }): CommentExportBundle {
-  const exportComments = prepareOverlayComments(comments, settings, height).map((comment) => ({
+  const exportComments = prepareOverlayComments(comments, settings, height, width).map((comment) => ({
     ...comment,
     time: roundTime(comment.time),
     duration: roundTime(comment.duration)
@@ -530,18 +553,6 @@ function estimateAssTextWidth(text: string, fontSize: number) {
 
 function roundTime(value: number) {
   return Math.round(value * 1000) / 1000;
-}
-
-function passesDensity(index: number, density: CommentOverlaySettings["density"]) {
-  if (density === "danmaku") {
-    return true;
-  }
-
-  if (density === "high") {
-    return index % densityModulo[density] !== 3;
-  }
-
-  return index % densityModulo[density] === 0;
 }
 
 function chooseLane(laneAvailability: number[]) {

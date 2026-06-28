@@ -107,6 +107,7 @@ export type BurnCommentsIntoClipInput = {
    * already-loud sources.
    */
   normalizeAudio?: boolean;
+  onProgress?: (progress: { percent: number; etaSeconds: number }) => void;
 };
 
 export type CommentBurnedClip = {

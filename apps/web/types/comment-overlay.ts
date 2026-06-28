@@ -30,6 +30,10 @@ export type CommentOverlaySettings = {
   fontName: string;
   outlineWidth: number;
   maxPerSecond: number;
+  /** Maximum character length before a comment is filtered. */
+  longCommentLimit: number;
+  /** Window in ms for detecting repeated comments. */
+  repeatedCommentWindowMs: number;
 };
 
 export type CommentExportBundle = {

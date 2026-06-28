@@ -103,7 +103,7 @@ export function CommentCanvasOverlay({ comments, currentTime, duration, settings
 
     for (const comment of renderComments) {
       const fontSize = comment.size;
-      context.font = `700 ${fontSize}px "Noto Sans JP", system-ui, sans-serif`;
+      context.font = `700 ${fontSize}px "${state.settings.fontName}", system-ui, sans-serif`;
       const text = state.settings.hideUserNames || !comment.userId ? comment.text : `${comment.userId}: ${comment.text}`;
       const textWidth = context.measureText(text).width;
       const x = getActiveCommentPosition(comment, renderTime, width, textWidth, state.settings);

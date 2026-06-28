@@ -8,15 +8,16 @@ import {
   generateScrollingCommentsAss
 } from "@/lib/comment-overlay";
 import type { ClipCandidate, ClipTranscription, GeneratedClipReference, TranscriptSegment } from "@/lib/mock-candidates";
-import { generateClip, generateExportPackage, parseTimecode, writeCommentAssets } from "@/lib/server/media-service";
+import { burnCommentsIntoClip, generateClip, generateExportPackage, parseTimecode, writeCommentAssets } from "@/lib/server/media-service";
 import { proxyJsonRequest } from "@/lib/server/api-proxy";
 import { fetchChatWithChatDownloader, defaultChatLimitForDuration, type FetchChatDownloaderResult } from "@/lib/server/chat-downloader-service";
 import { createLimiter } from "@/lib/concurrency";
 import { cpus } from "node:os";
 import { downloadVideoWithYtDlp, extractYtDlpMetadata, type YtDlpDownloadedVideo, type YtDlpMetadata } from "@/lib/server/yt-dlp-service";
 import { generateVodTimestampUrls, createTwitchClips, type PipelineModeContext } from "@/lib/server/pipeline-modes";
+import type { CommentOverlaySettings } from "@/types/comment-overlay";
 
-export type ArchiveProgressStage = "metadata" | "download" | "chat" | "analysis" | "clip" | "transcription" | "comments" | "package" | "links";
+export type ArchiveProgressStage = "metadata" | "download" | "chat" | "analysis" | "clip" | "transcription" | "comments" | "burn" | "package" | "links";
 
 export type ArchiveProgressEvent = {
   stage: ArchiveProgressStage;
@@ -51,11 +52,13 @@ export type ArchiveAutoAnalyzeInput = {
   pipelineMode?: "full" | "links" | "clips" | "sections";
   /** Twitch OAuth token for creating clips via Helix API (required for "clips" mode). */
   oauthToken?: string;
+  /** User comment overlay settings (density, font, filters, etc). */
+  commentSettings?: CommentOverlaySettings;
   signal?: AbortSignal;
 };
 
 export type ArchiveAutoAnalyzeWarning = {
-  stage: "metadata" | "download" | "chat" | "analysis" | "clip" | "transcription" | "comments" | "package";
+  stage: "metadata" | "download" | "chat" | "analysis" | "clip" | "transcription" | "comments" | "burn" | "package";
   candidateId?: string;
   message: string;
 };
@@ -72,6 +75,7 @@ export type ArchiveAutoAnalyzeResult = {
   generatedClipCount: number;
   transcribedCount: number;
   commentAssetCount: number;
+  burnedCount: number;
   packageCount: number;
   pipelineWarnings: ArchiveAutoAnalyzeWarning[];
 };
@@ -294,6 +298,7 @@ export async function runArchiveAutoAnalysis(
       generatedClipCount: 0,
       transcribedCount: 0,
       commentAssetCount: 0,
+      burnedCount: 0,
       packageCount: 0,
       pipelineWarnings: warnings,
     };
@@ -325,6 +330,7 @@ export async function runArchiveAutoAnalysis(
           generatedClipCount: 0,
           transcribedCount: 0,
           commentAssetCount: 0,
+          burnedCount: 0,
           packageCount: 0,
           pipelineWarnings: warnings,
         };
@@ -358,6 +364,7 @@ export async function runArchiveAutoAnalysis(
   // we keep a conservative cap to avoid I/O thrash on HDDs.
   const clipLimit = createLimiter(Math.max(1, Math.floor(cpuCount / 2)));
   const transcribeLimit = createLimiter(4);
+  const burnLimit = createLimiter(2);
 
   const processed = await Promise.all(
     sourceCandidates.map(async (candidate, candidateIndex): Promise<ClipCandidate> => {
@@ -437,7 +444,8 @@ export async function runArchiveAutoAnalysis(
         selectedVariant.duration,
         fetchedChat.normalizedMessages,
         clipStartSeconds,
-        clipStartSeconds + clipDurationSeconds
+        clipStartSeconds + clipDurationSeconds,
+        input.commentSettings
       );
       const commentsJsonStr = generateCommentsJson(commentBundle);
       const commentsAssStr = generateScrollingCommentsAss(commentBundle);
@@ -484,6 +492,32 @@ export async function runArchiveAutoAnalysis(
         );
 
         await Promise.all(tasks);
+      }
+
+      // Stage 3.5: comment burn-in (runs after both transcription + comments
+      // complete). The ASS content is already computed above — pass it directly
+      // to avoid a redundant file write. Errors are non-fatal: the clean clip
+      // is still usable.
+      let commentBurnedClip = generatedCandidate.commentBurnedClip;
+      if (generatedClip && commentsAssStr && !commentBurnedClip) {
+        emitProgress({ stage: "burn", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Burning comments into clip ${indexLabel}...` });
+        const burnStartTime = Date.now();
+        try {
+          commentBurnedClip = await burnLimit(() => burnCommentsIntoClip({
+            clipPath: generatedClip!.outputPath,
+            candidateId: candidate.id,
+            variantId: selectedVariant.id,
+            assContent: commentsAssStr,
+            encoder: input.encoder,
+          }));
+          generatedCandidate = { ...generatedCandidate, commentBurnedClip };
+          const burnElapsed = Math.round((Date.now() - burnStartTime) / 1000);
+          emitProgress({ stage: "burn", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Comments burned in ${burnElapsed}s` });
+        } catch (error) {
+          const burnErr = errorMessage(error, "Could not burn comments into clip.");
+          warnings.push({ stage: "burn", candidateId: candidate.id, message: burnErr });
+          emitProgress({ stage: "burn", status: "error", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: errorMessage(error, "Comment burn-in failed") });
+        }
       }
 
       // Stage 4: export package (reuses pre-computed JSON/ASS strings)
@@ -541,6 +575,7 @@ export async function runArchiveAutoAnalysis(
     generatedClipCount: candidates.filter((candidate) => candidate.generatedClip).length,
     transcribedCount: candidates.filter((candidate) => candidate.transcription).length,
     commentAssetCount: candidates.filter((candidate) => candidate.commentAssets).length,
+    burnedCount: candidates.filter((candidate) => candidate.commentBurnedClip).length,
     packageCount: candidates.filter((candidate) => candidate.exportPackage).length,
     pipelineWarnings: warnings
   };
@@ -581,10 +616,11 @@ function buildCommentBundle(
   duration: string,
   chatEntries: ChatLogEntry[],
   clipStartSeconds: number,
-  clipEndSeconds: number
+  clipEndSeconds: number,
+  userSettings?: CommentOverlaySettings
 ) {
   const durationSeconds = Math.max(1, parseTimecode(duration, "comment duration"));
-  const settings = defaultCommentOverlaySettings;
+  const settings = userSettings ?? defaultCommentOverlaySettings;
   // Prefer the real-time chat as the source of comments. If the chat slice
   // is empty (e.g. clip from a region with no chat), fall back to the
   // synthetic representative-comment generator so the user still sees

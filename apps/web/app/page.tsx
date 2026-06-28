@@ -35,6 +35,7 @@ type PipelineResult = {
   candidates: ClipCandidate[];
   generatedClipCount: number;
   transcribedCount: number;
+  burnedCount: number;
   pipelineWarnings: Array<{ stage: string; candidateId?: string; message: string }>;
 };
 
@@ -49,7 +50,7 @@ type SSEProgressEvent = {
 
 // ── constants ──
 
-const STAGE_ORDER = ["metadata", "download", "chat", "analysis", "clip", "transcription", "comments", "package", "links"];
+const STAGE_ORDER = ["metadata", "download", "chat", "analysis", "clip", "transcription", "comments", "burn", "package", "links"];
 const STAGE_KEYS: Record<string, string> = {
   metadata: "archive.stageMetadata",
   download: "archive.stageDownload",
@@ -58,6 +59,7 @@ const STAGE_KEYS: Record<string, string> = {
   clip: "archive.stageClip",
   transcription: "archive.stageTranscription",
   comments: "archive.stageComments",
+  burn: "archive.stageBurn",
   package: "archive.stagePackage",
   links: "archive.stageLinks"
 };
@@ -105,10 +107,15 @@ export default function Home() {
   const [encoder, setEncoder] = usePersistedState<"libx264" | "h264_nvenc" | "hevc_nvenc">("encoder", "h264_nvenc");
   const [pipelineMode, setPipelineMode] = usePersistedState<"full" | "links" | "clips" | "sections">("pipelineMode", "full");
   const [oauthToken, setOauthToken] = usePersistedState("oauthToken", "");
+  const [clipLength, setClipLength] = usePersistedState<"short" | "standard" | "long">("clipLength", "standard");
+  const [useTimeRange, setUseTimeRange] = useState(false);
+  const [timeRangeStart, setTimeRangeStart] = useState("");
+  const [timeRangeEnd, setTimeRangeEnd] = useState("");
   const [keepFilter, setKeepFilter] = useState<"all" | "keep" | "discard" | "unreviewed">("all");
   const [minConfidence, setMinConfidence] = usePersistedState("minConfidence", 50);
   const [batchBurning, setBatchBurning] = useState(false);
   const [batchProgress, setBatchProgress] = useState("");
+  const [batchCurrentItem, setBatchCurrentItem] = useState("");
   const [stageTimestamps, setStageTimestamps] = useState<Record<string, number>>({});
   const [sortBy, setSortBy] = usePersistedState<SortMode>("sortBy", "confidence");
   const [searchQuery, setSearchQuery] = useState("");
@@ -217,7 +224,7 @@ export default function Home() {
         }
       } else if (e.key === "Delete" && expandedId) {
         e.preventDefault();
-        if (window.confirm("この候補を削除しますか？")) deleteCandidate(expandedId);
+        if (window.confirm(t("main.confirmDelete"))) deleteCandidate(expandedId);
       }
     }
     window.addEventListener("keydown", handleKeyDown);
@@ -276,10 +283,10 @@ export default function Home() {
         } else if (Array.isArray(data)) {
           setCandidates(data);
         } else {
-          setError("インポート失敗: データの形式が正しくありません");
+          setError(t("main.importErrorData"));
         }
       } catch {
-        setError("インポート失敗: JSONの形式が正しくありません");
+        setError(t("main.importErrorJson"));
       }
     };
     input.click();
@@ -310,13 +317,13 @@ export default function Home() {
 
   const handleRun = useCallback(async () => {
     const trimmed = url.trim();
-    if (!trimmed) { setError("URLを入力してください"); return; }
-    if (!/^https?:\/\//i.test(trimmed)) { setError("URLは http:// または https:// で始まる必要があります"); return; }
+    if (!trimmed) { setError(t("main.urlRequired")); return; }
+    if (!/^https?:\/\//i.test(trimmed)) { setError(t("main.urlInvalid")); return; }
     if (typeof Notification !== "undefined" && Notification.permission === "default") {
       Notification.requestPermission();
     }
     setError(null);
-    setResult(null);
+    if (!result) setResult(null);
     setIsRunning(true);
     setElapsed(0);
     setProgress(0);
@@ -346,6 +353,10 @@ export default function Home() {
           llmProvider,
           pipelineMode,
           oauthToken: oauthToken || undefined,
+          commentSettings,
+          clipLength,
+          timeStartSeconds: useTimeRange ? parseTimeToSeconds(timeRangeStart) : undefined,
+          timeEndSeconds: useTimeRange ? parseTimeToSeconds(timeRangeEnd) : undefined,
         }),
         signal: abort.signal
       });
@@ -470,7 +481,7 @@ export default function Home() {
   // Manual clip: load VOD for preview
   const handleLoadVod = useCallback(async () => {
     const trimmedUrl = clipUrl.trim();
-    if (!trimmedUrl) { setError("URLを入力してください"); return; }
+    if (!trimmedUrl) { setError(t("main.urlRequired")); return; }
 
     setError(null);
     setVodLoading(true);
@@ -498,7 +509,7 @@ export default function Home() {
   // Manual clip: generate clip from selected range
   const handleManualClip = useCallback(async () => {
     const trimmedUrl = clipUrl.trim();
-    if (!trimmedUrl || !clipRange.end) { setError("範囲を選択してください"); return; }
+    if (!trimmedUrl || !clipRange.end) { setError(t("main.rangeRequired")); return; }
 
     setError(null);
     setManualClipLoading(true);
@@ -541,8 +552,11 @@ export default function Home() {
       const variant = c.variants.find(v => v.id === c.selectedVariantId) ?? c.variants[0];
       if (!variant) return;
       const dur = Math.max(1, parseTime(variant?.duration ?? c.duration));
-      const overlay = generateCommentOverlayItems(c, dur);
+      const overlay = c.commentOverlayItems?.length
+        ? c.commentOverlayItems as CommentOverlayItem[]
+        : generateCommentOverlayItems(c, dur, commentSettings);
       const bundle = createCommentExportPayload({ candidate: c, comments: overlay, settings: commentSettings, duration: dur });
+      setBatchCurrentItem(c.title);
       try {
         const res = await fetch("/api/media/clips-with-comments", {
           method: "POST",
@@ -576,11 +590,12 @@ export default function Home() {
     }
 
     setBatchBurning(false);
+    setBatchCurrentItem("");
     if (errors.length > 0) {
-      setBatchProgress(`${errors.length}件失敗`);
-      setError(`バッチダウンロード: ${errors.length}件が失敗しました (${errors.map(e => e.id).join(", ")})`);
+      setBatchProgress(t("main.batchFailed", { count: errors.length }));
+      setError(t("main.batchFailedDetail", { count: errors.length }) + ` (${errors.map(e => e.id).join(", ")})`);
     } else {
-      setBatchProgress("完了");
+      setBatchProgress(t("main.batchComplete"));
     }
   }, [candidates, commentSettings]);
 
@@ -633,10 +648,10 @@ export default function Home() {
               </span>
             )}
             <LanguageSwitcher />
-            <button type="button" onClick={() => setShowKeyHelp(true)} className="rounded-full border border-white/10 bg-white/[0.03] px-2 py-1 text-xs text-slate-500 transition hover:text-slate-300" title="Keyboard shortcuts">
+            <button type="button" onClick={() => setShowKeyHelp(true)} className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-slate-500 transition hover:text-slate-300" title="Keyboard shortcuts" aria-label={t("main.keyboardShortcuts")}>
               ?
             </button>
-            <a href="/dev" className="rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 text-xs text-slate-500 transition hover:text-slate-300">
+            <a href="/dev" className="opacity-50 hover:opacity-100 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 text-xs text-slate-500 transition hover:text-slate-300">
               dev
             </a>
           </div>
@@ -661,10 +676,10 @@ export default function Home() {
                 onClick={handleRun}
                 disabled={isRunning || !url.trim()}
                 className={cn(
-                  "h-14 w-32 shrink-0 rounded-2xl text-base font-bold transition disabled:cursor-not-allowed disabled:opacity-40",
+                  "h-14 w-36 shrink-0 rounded-2xl text-base font-bold transition disabled:cursor-not-allowed disabled:opacity-40",
                   isRunning
                     ? "border border-rose-300/40 bg-rose-400/10 text-rose-100"
-                    : "border border-cyan-200/45 bg-cyan-300/15 text-cyan-50 hover:bg-cyan-300/25"
+                    : "border border-cyan-200/50 bg-gradient-to-r from-cyan-400/20 to-cyan-300/15 text-cyan-50 shadow-[0_0_15px_-3px_rgba(34,211,238,0.2)] hover:from-cyan-400/30 hover:to-cyan-300/25 hover:shadow-[0_0_20px_-3px_rgba(34,211,238,0.3)]"
                 )}
               >
                 {isRunning ? t("main.stop") : t("main.start")}
@@ -706,7 +721,7 @@ export default function Home() {
                 </div>
                 <div className="flex items-end gap-3">
                   <label className={cn("flex cursor-pointer items-center gap-2 rounded-xl border px-3 py-1.5 text-sm transition",
-                    encoder !== "libx264" ? "border-emerald-300/40 bg-emerald-400/10 text-emerald-100" : "border-white/10 text-slate-400")}>
+                    encoder !== "libx264" ? "border-emerald-300/40 bg-emerald-400/10 text-emerald-100" : "border-white/10 text-slate-400")} title={t("main.highSpeedHint")}>
                     <input type="checkbox" checked={encoder !== "libx264"} onChange={(e) => setEncoder(e.target.checked ? "h264_nvenc" : "libx264")} className="h-3.5 w-3.5 accent-emerald-300" />
                     {t("main.highSpeed")}
                   </label>
@@ -746,7 +761,41 @@ export default function Home() {
                     {t("main.aiAutoEvaluate")}
                   </label>
                 </div>
-                <div className="flex items-end gap-2">
+              </div>
+
+              {/* Clip length + time range row */}
+              <div className="flex flex-wrap items-end gap-4">
+                <div>
+                  <span className="mb-1 block text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">{t("archive.clipLength")}</span>
+                  <select value={clipLength} onChange={(e) => setClipLength(e.target.value as "short" | "standard" | "long")}
+                    className="rounded-xl border border-white/10 bg-white/[0.06] px-3 py-1.5 text-sm text-slate-200 outline-none focus:border-cyan-200/60">
+                    <option value="short">{t("archive.clipLengthShort")}</option>
+                    <option value="standard">{t("archive.clipLengthStandard")}</option>
+                    <option value="long">{t("archive.clipLengthLong")}</option>
+                  </select>
+                </div>
+                <label className="flex cursor-pointer items-center gap-2 rounded-xl border px-3 py-1.5 text-sm transition"
+                  style={{ borderColor: useTimeRange ? "rgba(167,139,250,0.4)" : "rgba(255,255,255,0.1)", backgroundColor: useTimeRange ? "rgba(167,139,250,0.1)" : "transparent", color: useTimeRange ? "#e0e7ff" : "#94a3b8" }}>
+                  <input type="checkbox" checked={useTimeRange} onChange={(e) => setUseTimeRange(e.target.checked)} className="h-3.5 w-3.5 accent-violet-300" />
+                  {t("archive.timeRange")}
+                </label>
+                {useTimeRange && (
+                  <>
+                    <label className="text-xs text-slate-400">
+                      {t("archive.timeStart")}
+                      <input value={timeRangeStart} onChange={(e) => setTimeRangeStart(e.target.value)} placeholder="00:00:00"
+                        className="mt-1 w-28 rounded-lg border border-white/10 bg-slate-950/60 px-2 py-1.5 text-sm text-slate-200 outline-none focus:border-violet-200/60 font-mono placeholder:text-slate-500" />
+                    </label>
+                    <label className="text-xs text-slate-400">
+                      {t("archive.timeEnd")}
+                      <input value={timeRangeEnd} onChange={(e) => setTimeRangeEnd(e.target.value)} placeholder="02:00:00"
+                        className="mt-1 w-28 rounded-lg border border-white/10 bg-slate-950/60 px-2 py-1.5 text-sm text-slate-200 outline-none focus:border-violet-200/60 font-mono placeholder:text-slate-500" />
+                    </label>
+                  </>
+                )}
+              </div>
+
+              <div className="flex items-end gap-2">
                   {result && (
                     <button type="button"
                       onClick={() => { if (!confirm(t("main.clearAllWarning"))) return; clearCandidates(); setCandidates([]); setResult(null); setExpandedId(null); }}
@@ -760,7 +809,6 @@ export default function Home() {
                   <button type="button" onClick={handleImport} className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs text-slate-400 transition hover:text-slate-200">
                     {t("main.settingsImport")}
                   </button>
-                </div>
               </div>
               <p className="mt-2 text-[0.55rem] text-slate-600">{t("main.vodDeleteNotice")}</p>
             </>)}
@@ -769,7 +817,7 @@ export default function Home() {
 
         {/* Step 2: pipeline progress */}
         {isRunning && (
-          <section className="glass-panel rounded-3xl p-5 sm:p-6">
+          <section className="glass-panel rounded-3xl p-5 sm:p-6" aria-live="polite">
             <div className="mb-4 flex items-center justify-between gap-3">
               <p className="text-sm font-semibold text-white">{t("main.analyzing")}</p>
               <p className="font-mono text-xs text-slate-400">
@@ -815,14 +863,15 @@ export default function Home() {
 
         {/* errors */}
         {error && (
-          <section className="glass-panel rounded-3xl border border-rose-300/30 bg-rose-400/10 p-5 sm:p-6">
+          <section className="glass-panel rounded-3xl border border-rose-300/30 bg-rose-400/10 p-5 sm:p-6" aria-live="assertive">
             <div className="flex items-start justify-between">
               <div>
                 <p className="text-sm font-semibold text-rose-100">{t("main.error")}</p>
                 <p className="mt-1 text-sm text-rose-200/80">{error}</p>
+                {getErrorMessage(error)}
               </div>
               <button type="button" onClick={() => setError(null)}
-                className="ml-3 shrink-0 rounded-lg p-1 text-rose-300/60 transition hover:text-rose-100" title="閉じる">
+                className="ml-3 shrink-0 rounded-lg p-1 text-rose-300/60 transition hover:text-rose-100" title={t("common.close")} aria-label={t("common.close")}>
                 ✕
               </button>
             </div>
@@ -837,8 +886,8 @@ export default function Home() {
         {undoAction && (
           <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 flex items-center gap-3 rounded-xl border border-white/20 bg-slate-900/90 px-4 py-2.5 text-sm text-white shadow-lg backdrop-blur">
             <span>{undoAction.message}</span>
-            <button type="button" onClick={performUndo} className="rounded-lg bg-cyan-500/30 px-3 py-1 text-xs font-semibold text-cyan-100 transition hover:bg-cyan-500/50">
-              Undo
+              <button type="button" onClick={performUndo} className="rounded-lg bg-cyan-500/30 px-3 py-1 text-xs font-semibold text-cyan-100 transition hover:bg-cyan-500/50">
+              {t("main.undo")}
             </button>
           </div>
         )}
@@ -877,8 +926,8 @@ export default function Home() {
             <div className="flex flex-wrap items-center gap-2">
               <div className="flex flex-wrap gap-1 sm:hidden">
                 {(["all", "keep", "discard", "unreviewed"] as const).map(f => (
-                  <button key={f} type="button" onClick={() => setKeepFilter(f)} className={cn(
-                    "rounded-full border px-2 py-0.5 text-[0.65rem] font-semibold transition",
+                  <button key={f} type="button" onClick={() => setKeepFilter(f)} aria-pressed={keepFilter === f} className={cn(
+                    "rounded-full border px-3 py-2 text-[0.65rem] font-semibold transition",
                     keepFilter === f ? "border-cyan-200/60 bg-cyan-300/15 text-cyan-50" : "border-white/10 text-slate-400 hover:text-slate-200"
                   )}>
                     {f === "all" ? t("main.filterAll") : f === "keep" ? t("main.filterKeep") : f === "discard" ? t("main.filterDiscard") : t("main.filterUnreviewed")}
@@ -888,7 +937,7 @@ export default function Home() {
               </div>
               <div className="hidden sm:flex sm:flex-wrap sm:gap-1">
                 {(["all", "keep", "discard", "unreviewed"] as const).map(f => (
-                  <button key={f} type="button" onClick={() => setKeepFilter(f)} className={cn(
+                  <button key={f} type="button" onClick={() => setKeepFilter(f)} aria-pressed={keepFilter === f} className={cn(
                     "rounded-full border px-3 py-1 text-xs font-semibold transition",
                     keepFilter === f ? "border-cyan-200/60 bg-cyan-300/15 text-cyan-50" : "border-white/10 text-slate-400 hover:text-slate-200"
                   )}>
@@ -901,7 +950,7 @@ export default function Home() {
               <div className="flex-1" />
 
               <input value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder={t("main.searchPlaceholder")}
-                className="h-7 w-36 rounded-lg border border-white/10 bg-white/[0.04] px-2 text-xs text-slate-200 outline-none placeholder:text-slate-500 focus:border-cyan-200/60 sm:w-48" />
+                className="h-10 w-36 rounded-lg border border-white/10 bg-white/[0.04] px-2 text-xs text-slate-200 outline-none placeholder:text-slate-500 focus:border-cyan-200/60 sm:w-48" />
 
               <select value={sortBy} onChange={(e) => setSortBy(e.target.value as SortMode)}
                 className="h-7 rounded-lg border border-white/10 bg-slate-950/60 px-2 text-xs text-slate-200 outline-none focus:border-cyan-200/60 cursor-pointer">
@@ -910,7 +959,7 @@ export default function Home() {
                 <option value="duration">{t("main.sortByDuration")}</option>
               </select>
 
-              <label className={`flex items-center gap-2 text-xs ${keepFilter !== "all" ? "text-slate-600" : "text-slate-400"}`} title={keepFilter !== "all" ? "フィルタを「すべて」にすると有効になります" : ""}>
+              <label className={`flex items-center gap-2 text-xs ${keepFilter !== "all" ? "text-slate-600" : "text-slate-400"}`} title={keepFilter !== "all" ? t("main.filterAllHint") : ""}>
                 {t("main.minConfidence", { value: minConfidence })}
                 <input type="range" min={0} max={100} step={5} value={minConfidence} onChange={e => setMinConfidence(Number(e.target.value))} disabled={keepFilter !== "all"} className={`w-20 accent-cyan-300 ${keepFilter !== "all" ? "opacity-40" : ""}`} />
               </label>
@@ -922,7 +971,12 @@ export default function Home() {
 
               <button type="button" onClick={handleBatchDownload} disabled={batchBurning || candidates.filter(c => c.editorStatus === "keep" && c.generatedClip && !c.commentBurnedClip).length === 0}
                 className="rounded-xl border border-emerald-200/40 bg-emerald-300/10 px-3 py-1.5 text-xs font-semibold text-emerald-50 transition hover:bg-emerald-300/20 disabled:opacity-30">
-                {batchBurning ? `Burn ${batchProgress}` : t("main.batchDL")}
+                {batchBurning ? (
+                  <span className="flex flex-col items-center leading-tight">
+                    <span>Burn {batchProgress}</span>
+                    {batchCurrentItem && <span className="max-w-[120px] truncate text-[0.6rem] font-normal opacity-70">{batchCurrentItem}</span>}
+                  </span>
+                ) : t("main.batchDL")}
               </button>
             </div>
 
@@ -1022,6 +1076,8 @@ export default function Home() {
             <div className="mx-auto max-w-md space-y-4">
               <p className="text-lg font-semibold text-white">{t("main.emptyTitle")}</p>
               <p className="text-sm leading-6 text-slate-400">{t("main.emptyDesc")}</p>
+              <p className="text-xs text-cyan-300/70">{t("main.supportedPlatforms")}</p>
+              <p className="font-mono text-xs text-slate-500">{t("main.exampleUrl")}</p>
               <p className="text-xs text-slate-500">{t("main.emptyHint")}</p>
             </div>
           </div>
@@ -1031,15 +1087,15 @@ export default function Home() {
         {showKeyHelp && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={() => setShowKeyHelp(false)}>
             <div className="glass-panel rounded-2xl border border-white/20 p-6 max-w-sm w-full space-y-3" onClick={e => e.stopPropagation()}>
-              <h3 className="text-sm font-semibold text-white">Keyboard Shortcuts</h3>
+              <h3 className="text-sm font-semibold text-white">{t("main.keyboardShortcuts")}</h3>
               <div className="space-y-1.5 text-xs text-slate-300">
-                <div className="flex justify-between"><span>Next candidate</span><kbd className="rounded bg-white/10 px-1.5 py-0.5 font-mono">→</kbd></div>
-                <div className="flex justify-between"><span>Previous candidate</span><kbd className="rounded bg-white/10 px-1.5 py-0.5 font-mono">←</kbd></div>
-                <div className="flex justify-between"><span>Play / Pause</span><kbd className="rounded bg-white/10 px-1.5 py-0.5 font-mono">Space</kbd></div>
-                <div className="flex justify-between"><span>Delete candidate</span><kbd className="rounded bg-white/10 px-1.5 py-0.5 font-mono">Del</kbd></div>
-                <div className="flex justify-between"><span>Toggle this help</span><kbd className="rounded bg-white/10 px-1.5 py-0.5 font-mono">?</kbd></div>
+                <div className="flex justify-between"><span>{t("main.kbdNext")}</span><kbd className="rounded bg-white/10 px-1.5 py-0.5 font-mono">→</kbd></div>
+                <div className="flex justify-between"><span>{t("main.kbdPrev")}</span><kbd className="rounded bg-white/10 px-1.5 py-0.5 font-mono">←</kbd></div>
+                <div className="flex justify-between"><span>{t("main.kbdPlay")}</span><kbd className="rounded bg-white/10 px-1.5 py-0.5 font-mono">Space</kbd></div>
+                <div className="flex justify-between"><span>{t("main.kbdDelete")}</span><kbd className="rounded bg-white/10 px-1.5 py-0.5 font-mono">Del</kbd></div>
+                <div className="flex justify-between"><span>{t("main.kbdHelp")}</span><kbd className="rounded bg-white/10 px-1.5 py-0.5 font-mono">?</kbd></div>
               </div>
-              <button type="button" onClick={() => setShowKeyHelp(false)} className="mt-2 w-full rounded-xl border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs text-slate-400 transition hover:text-white">
+              <button type="button" onClick={() => setShowKeyHelp(false)} className="mt-2 w-full rounded-xl border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs text-slate-400 transition hover:text-white" aria-label={t("common.close")}>
                 {t("common.close")}
               </button>
             </div>
@@ -1164,6 +1220,16 @@ function CommentSettingsPanel({ settings, onUpdate }: { settings: CommentOverlay
             <ToggleSetting label={t("main.commentFilterRepeated")} checked={settings.filterRepeatedComments} onChange={v => onUpdate({ ...settings, filterRepeatedComments: v })} />
             <ToggleSetting label={t("main.commentHideNames")} checked={settings.hideUserNames} onChange={v => onUpdate({ ...settings, hideUserNames: v })} />
           </div>
+          <div className="grid grid-cols-2 gap-2">
+            <label className="text-xs text-slate-400">
+              {t("main.commentLongLimit")}
+              <input type="number" min={10} max={200} value={settings.longCommentLimit} onChange={e => onUpdate({ ...settings, longCommentLimit: Math.max(10, Number(e.target.value)) })} className="mt-1 w-full rounded-lg border border-white/10 bg-slate-950/60 px-2 py-1 text-xs text-slate-200 outline-none" />
+            </label>
+            <label className="text-xs text-slate-400">
+              {t("main.commentRepeatWindow")}
+              <input type="number" min={500} max={10000} step={500} value={settings.repeatedCommentWindowMs} onChange={e => onUpdate({ ...settings, repeatedCommentWindowMs: Math.max(500, Number(e.target.value)) })} className="mt-1 w-full rounded-lg border border-white/10 bg-slate-950/60 px-2 py-1 text-xs text-slate-200 outline-none" />
+            </label>
+          </div>
         </div>
       )}
     </div>
@@ -1216,23 +1282,24 @@ const SimpleCandidateCard = memo(function SimpleCandidateCard({ candidate, isExp
 
         <div className="absolute top-2 left-2">
           <button type="button" onClick={(e) => { e.stopPropagation(); onDelete(); }}
-            className="flex h-7 w-7 items-center justify-center rounded-lg bg-black/50 text-white/50 text-xs backdrop-blur transition hover:bg-red-900/70 hover:text-rose-200" title={t("main.deleteCandidate")}>✕</button>
+            className="flex h-11 w-11 items-center justify-center rounded-lg bg-black/50 text-white/50 text-xs backdrop-blur transition hover:bg-red-900/70 hover:text-rose-200" title={t("main.deleteCandidate")} aria-label={t("main.deleteCandidate")}>✕</button>
         </div>
         <div className="absolute top-2 left-1/2 -translate-x-1/2 flex gap-1">
           <button type="button" onClick={(e) => { e.stopPropagation(); onUpdate({ ...candidate, editorStatus: editorStatus === "keep" ? undefined : "keep" }); }}
-            className={cn("flex h-7 items-center gap-1 rounded-lg px-2 text-xs backdrop-blur transition",
+            className={cn("flex h-11 items-center gap-1 rounded-lg px-2 text-xs backdrop-blur transition",
               editorStatus === "keep" ? "bg-emerald-500/60 text-emerald-50" : "bg-black/40 text-white/50 hover:bg-emerald-700/50 hover:text-emerald-100")}>
             {t("main.filterKeep")}
           </button>
           <button type="button" onClick={(e) => { e.stopPropagation(); onUpdate({ ...candidate, editorStatus: editorStatus === "discard" ? undefined : "discard" }); }}
-            className={cn("flex h-7 items-center gap-1 rounded-lg px-2 text-xs backdrop-blur transition",
+            className={cn("flex h-11 items-center gap-1 rounded-lg px-2 text-xs backdrop-blur transition",
               editorStatus === "discard" ? "bg-rose-500/60 text-rose-50" : "bg-black/40 text-white/50 hover:bg-rose-700/50 hover:text-rose-100")}>
             {t("main.filterDiscard")}
           </button>
         </div>
         <div className="absolute top-2 right-2">
           <button type="button" onClick={(e) => { e.stopPropagation(); onToggle(); }}
-            className="flex h-7 w-7 items-center justify-center rounded-lg bg-black/50 text-white/70 text-xs backdrop-blur transition hover:bg-black/70 hover:text-white">
+            className="flex h-11 w-11 items-center justify-center rounded-lg bg-black/50 text-white/70 text-xs backdrop-blur transition hover:bg-black/70 hover:text-white"
+            aria-label={isExpanded ? t("main.collapse") : t("main.expand")} aria-expanded={isExpanded}>
             {isExpanded ? "▲" : "▼"}
           </button>
         </div>
@@ -1353,8 +1420,8 @@ function VideoWithComments({ candidate, variant, commentSettings }: {
     if (candidate.commentOverlayItems && candidate.commentOverlayItems.length > 0) {
       return candidate.commentOverlayItems as CommentOverlayItem[];
     }
-    return generateCommentOverlayItems(candidate, clipDuration);
-  }, [candidate, clipDuration]);
+    return generateCommentOverlayItems(candidate, clipDuration, commentSettings);
+  }, [candidate, clipDuration, commentSettings]);
 
   const overlaySettings: CommentOverlaySettings = { ...commentSettings, enabled: true };
 
@@ -1533,7 +1600,9 @@ function PackageButton({ candidate, onDone, commentSettings }: {
     try {
       const variant = candidate.variants.find(v => v.id === candidate.selectedVariantId) ?? candidate.variants[0];
       const dur = Math.max(1, parseTime(variant?.duration ?? candidate.duration));
-      const overlay = generateCommentOverlayItems(candidate, dur);
+      const overlay = candidate.commentOverlayItems?.length
+        ? candidate.commentOverlayItems as CommentOverlayItem[]
+        : generateCommentOverlayItems(candidate, dur, commentSettings);
       const bundle = createCommentExportPayload({ candidate, comments: overlay, settings: commentSettings, duration: dur });
       const res = await fetch("/api/media/packages", { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ candidate: { id: candidate.id, title: candidate.title }, selectedVariant: variant, generatedClip: candidate.generatedClip, commentBurnedClip: candidate.commentBurnedClip, transcription: candidate.transcription,
@@ -1592,7 +1661,9 @@ function BurnButton({ candidate, onDone, commentSettings }: {
     try {
       const variant = candidate.variants.find((v) => v.id === candidate.selectedVariantId) ?? candidate.variants[0];
       const duration = Math.max(1, parseTime(variant?.duration ?? candidate.duration));
-      const overlay = generateCommentOverlayItems(candidate, duration);
+      const overlay = candidate.commentOverlayItems?.length
+        ? candidate.commentOverlayItems as CommentOverlayItem[]
+        : generateCommentOverlayItems(candidate, duration, commentSettings);
       const bundle = createCommentExportPayload({ candidate, comments: overlay, settings: commentSettings, duration });
       const response = await fetch("/api/media/clips-with-comments", { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ clipPath: candidate.generatedClip.outputPath, candidateId: candidate.id, variantId: variant?.id, assContent: generateScrollingCommentsAss(bundle), assFileName: bundle.files.assFileName, encoder: "h264_nvenc", normalizeAudio }) });
@@ -1677,7 +1748,18 @@ function parseTime(time: string): number {
   const parts = time.split(":").map(Number);
   if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
   if (parts.length === 2) return parts[0] * 60 + parts[1];
-  return Number.isFinite(parts[0]) ? parts[0] : 0;
+  return Number(time) || 0;
+}
+
+function parseTimeToSeconds(input: string): number | undefined {
+  const trimmed = input.trim();
+  if (!trimmed) return undefined;
+  const parts = trimmed.split(":").map(Number);
+  if (parts.some((p) => !Number.isFinite(p) || p < 0)) return undefined;
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  if (parts.length === 1) return parts[0];
+  return undefined;
 }
 
 function secondsToClock(total: number): string {
@@ -1726,4 +1808,22 @@ function humanizeError(raw: string, t: (key: string) => string): string {
   if (/timeout/i.test(text)) return t("archive.pipelineTimeout");
   if (!raw.trim()) return t("archive.unknownError");
   return raw;
+}
+
+function getErrorMessage(error: string) {
+  const text = error.toLowerCase();
+  let suggestion = "";
+  if (/fetch failed|econnrefused|econnreset|etimedout|enetunreach|network error|failed to fetch/.test(text)) {
+    suggestion = "バックエンドサーバーが起動しているか確認してください";
+  } else if (/http 4\d\d/.test(text) || /status:\s*4\d\d/.test(text)) {
+    suggestion = "URLが正しいか確認してください";
+  } else if (/timeout/.test(text)) {
+    suggestion = "VODが長すぎる可能性があります。短いVODを試してください";
+  }
+  if (!suggestion) return null;
+  return (
+    <p className="mt-2 text-xs text-rose-300/70 bg-rose-400/5 rounded-lg px-2.5 py-1.5 border border-rose-300/10">
+      💡 {suggestion}
+    </p>
+  );
 }
