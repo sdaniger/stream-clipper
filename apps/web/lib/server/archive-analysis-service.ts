@@ -383,6 +383,18 @@ export async function runArchiveAutoAnalysis(
   for (const result of processed) candidates.push(result);
   emitProgress({ stage: "comments", status: "done", message: "Pipeline complete" });
 
+  // Delete the downloaded VOD now that clips are generated. The full
+  // archive is typically 10-15 GB per VOD and the generated clips are
+  // only ~100 MB each, so keeping the original download wastes disk.
+  try {
+    const { unlink } = await import("node:fs/promises");
+    await unlink(downloadedVideo.absolutePath).catch(() => undefined);
+    emitProgress({ stage: "download", status: "done", message: "Cleaned up download" });
+  } catch {
+    // Non-critical — the download will accumulate and can be cleared
+    // later via the 'すべてクリア' button or manual rm.
+  }
+
   return {
     sourceUrl: url,
     metadata,

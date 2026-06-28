@@ -550,27 +550,38 @@ export async function generateExportPackage(input: GenerateExportPackageInput): 
   await mkdir(path.join(absolutePackagePath, "thumbnail_candidates"), { recursive: true });
 
   if (cleanClip?.outputPath) {
-    copiedAssets.push(await copyPackageAsset({
-      label: "Clean clip",
+    // Don't copy the clip (~100 MB) — just record its path. The file
+    // already lives under output/clips/ and is served via /api/media/files.
+    copiedAssets.push({
+      label: "Clean clip (reference)",
       kind: "video",
+      fileName: path.basename(cleanClip.outputPath),
+      packagePath: `${packagePath}`,
       sourcePath: cleanClip.outputPath,
-      packagePath,
-      absolutePackagePath,
-      targetDir: ".",
-      targetFileName: `clip_clean${extensionForRelativePath(cleanClip.outputPath, ".mp4")}`
-    }));
+      sizeBytes: 0
+    });
+    // Write a small .ref file so editors know the clip path
+    await writeFile(
+      path.join(absolutePackagePath, "clip_clean.mp4.ref"),
+      `${cleanClip.outputPath}\n${cleanClip.absoluteOutputPath}\n`,
+      "utf8"
+    ).catch(() => undefined);
   }
 
   if (commentBurnedClip?.outputPath) {
-    copiedAssets.push(await copyPackageAsset({
-      label: "Comment-burned clip",
+    copiedAssets.push({
+      label: "Comment-burned clip (reference)",
       kind: "video",
+      fileName: path.basename(commentBurnedClip.outputPath),
+      packagePath: `${packagePath}`,
       sourcePath: commentBurnedClip.outputPath,
-      packagePath,
-      absolutePackagePath,
-      targetDir: ".",
-      targetFileName: `clip_with_comments${extensionForRelativePath(commentBurnedClip.outputPath, ".mp4")}`
-    }));
+      sizeBytes: 0
+    });
+    await writeFile(
+      path.join(absolutePackagePath, "clip_with_comments.mp4.ref"),
+      `${commentBurnedClip.outputPath}\n${commentBurnedClip.absoluteOutputPath}\n`,
+      "utf8"
+    ).catch(() => undefined);
   }
 
   if (transcription?.outputs.jsonPath) {
