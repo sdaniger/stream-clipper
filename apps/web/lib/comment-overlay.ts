@@ -27,10 +27,13 @@ export const commentCategoryColors: Record<CommentOverlayCategory, string> = {
 };
 
 export const commentFontSizes: Record<CommentOverlaySettings["fontSize"], number> = {
-  small: 28,
-  medium: 36,
-  large: 44
+  small: 36,
+  medium: 52,
+  large: 68
 };
+
+/** NicoNico-style line height — 60px matches the narinico tool's LINE_HEIGHT. */
+const LINE_HEIGHT = 60;
 
 const densityModulo: Record<CommentOverlaySettings["density"], number> = {
   low: 4,
@@ -48,14 +51,41 @@ const densityModulo: Record<CommentOverlaySettings["density"], number> = {
 const MAX_CONCURRENT_COMMENTS = 12;
 
 /**
- * How long each comment takes to scroll across the screen, in seconds.
- * Longer comments = faster scroll (so they leave the screen before the
- * next barrage arrives), matching the narinico tool's behavior where
- * long comments are sped up.
+ * Narinico-style variable scroll speed. Longer comments scroll faster,
+ * but the speed-variance is capped so all comments look natural.
+ *
+ * Formula from twitch_nico.py compute_speed_px_per_sec:
+ *   base_v = (out_w + comment_w) / BASE_DWELL_SEC
+ *   scale = (comment_w / REF_WIDTH_PX)^GAMMA
+ *   boost = clamp(scale, SHORT_SPEED_MIN, LONG_SPEED_MAX)
+ *   v = base_v * boost
+ *   duration = (out_w + comment_w) / v
+ *
+ * For a typical 10-char comment at 52px on a 1920px screen:
+ *   w ≈ 322px, base_v = 2242/5.0 = 448 px/s
+ *   scale = 0.68^0.5 = 0.82, clipped to 0.80 → v = 358 px/s
+ *   duration = 2242/358 = 6.3s (consistent, nice flow)
+ *
+ * For a 30-char long comment: w ≈ 967px, scale = 1.38^0.5 = 1.17, clipped
+ * to 1.0 → v = 577 px/s, duration = 2887/577 = 5.0s (sped up, still
+ * readable).
  */
-const BASE_SCROLL_SECONDS = 5.4;
-const LONGTEXT_SPEEDUP_PER_CHAR = 0.04;
-const MIN_SCROLL_SECONDS = 1.5;
+const REF_SCREEN_WIDTH = 1920;
+const REF_WIDTH_PX = 700;
+const SPEED_GAMMA = 0.5;
+const SPEED_MIN = 0.80;
+const SPEED_MAX = 1.00;
+const BASE_DWELL_SEC = 5.0;
+const SAFE_GAP_PX = 24;
+
+function computeScrollDuration(commentWidth: number): number {
+  const outW = REF_SCREEN_WIDTH;
+  const rawBase = (outW + commentWidth + SAFE_GAP_PX) / BASE_DWELL_SEC;
+  const scaleRaw = Math.pow(commentWidth / Math.max(1, REF_WIDTH_PX), SPEED_GAMMA);
+  const boost = Math.min(SPEED_MAX, Math.max(SPEED_MIN, scaleRaw));
+  const v = rawBase * boost;
+  return (outW + commentWidth + SAFE_GAP_PX) / Math.max(0.01, v);
+}
 
 export function categorizeComment(text: string): CommentOverlayCategory {
   const normalized = text.toLowerCase();
@@ -104,7 +134,7 @@ export function generateCommentOverlayItems(candidate: ClipCandidate, durationSe
         mode: "scroll" as const,
         color: commentCategoryColors[category],
         size: commentFontSizes.medium,
-        duration: category === "clip" ? 6.2 : 5.4,
+        duration: roundTime(computeScrollDuration(estimateAssTextWidth(comment.text, commentFontSizes.medium))),
         weight: comment.intensity === "high" ? 3 : comment.intensity === "medium" ? 2 : 1,
         category
       };
@@ -173,10 +203,9 @@ export function generateCommentOverlayItemsFromChat(
     }
 
     const category = categorizeComment(text);
-    const duration = Math.max(
-      MIN_SCROLL_SECONDS,
-      BASE_SCROLL_SECONDS - text.length * LONGTEXT_SPEEDUP_PER_CHAR
-    );
+    const fontSize = commentFontSizes[settings.fontSize];
+    const estimatedWidth = estimateAssTextWidth(text, fontSize);
+    const duration = computeScrollDuration(estimatedWidth);
 
     out.push({
       id: `${candidate.id}-chat-${index}`,
@@ -228,18 +257,28 @@ export function prepareOverlayComments(
   // Only re-apply content filters (URL / long / repeated) as a safety net
   // for comments coming from the fallback synthetic generator.
   const filtered = applyCommentFilters(comments, settings);
-  const lanes = Math.max(1, Math.floor(getDisplayArea(canvasHeight, settings.displayArea).height / Math.max(fontSize + 8, 1)));
+  const lanes = Math.max(1, Math.floor(getDisplayArea(canvasHeight, settings.displayArea).height / LINE_HEIGHT));
   const laneAvailability = Array.from({ length: lanes }, () => 0);
+  const laneLastSpeed = Array.from({ length: lanes }, () => Infinity);
 
   return filtered.map((comment) => {
+    const estimatedWidth = estimateAssTextWidth(comment.text, fontSize);
+    const scrollDuration = computeScrollDuration(estimatedWidth);
+    const speed = (REF_SCREEN_WIDTH + estimatedWidth + SAFE_GAP_PX) / Math.max(0.01, scrollDuration);
     const lane = chooseLane(laneAvailability);
-    laneAvailability[lane] = comment.time + Math.max(0.75, comment.duration / 3);
+    // Full duration occupancy — narinico-style: the lane is freed when
+    // the comment has fully exited the screen, including safe gap.
+    laneAvailability[lane] = comment.time + scrollDuration;
+    // Speed inheritance: don't make this comment scroll faster than
+    // the previous one on the same lane (same as narinico).
+    laneLastSpeed[lane] = Math.min(speed, laneLastSpeed[lane]);
 
     return {
       ...comment,
       lane,
       size: fontSize,
-      color: settings.colorMode === "reaction" ? commentCategoryColors[comment.category ?? "normal"] : "#ffffff"
+      color: settings.colorMode === "reaction" ? commentCategoryColors[comment.category ?? "normal"] : "#ffffff",
+      duration: scrollDuration
     };
   });
 }
@@ -277,21 +316,24 @@ export function applyCommentFilters(comments: CommentOverlayItem[], settings: Co
 }
 
 export function getDisplayArea(canvasHeight: number, displayArea: CommentOverlaySettings["displayArea"]) {
+  // Narinico-style margins: MARGIN_TOP=3, MARGIN_BOTTOM=80 out of 1080.
+  const topPx = Math.round(canvasHeight * 3 / 1080);
+  const bottomPx = Math.round(canvasHeight * 80 / 1080);
+
   if (displayArea === "top") {
-    return { top: 0, height: canvasHeight * 0.45 };
+    return { top: topPx, height: canvasHeight * 0.5 };
   }
 
   if (displayArea === "bottom") {
-    return { top: canvasHeight * 0.55, height: canvasHeight * 0.45 };
+    return { top: canvasHeight * 0.5, height: canvasHeight * 0.5 - bottomPx };
   }
 
-  return { top: canvasHeight * 0.04, height: canvasHeight * 0.82 };
+  return { top: topPx, height: canvasHeight - topPx - bottomPx };
 }
 
 export function getCommentY(lane: number, canvasHeight: number, settings: CommentOverlaySettings) {
-  const fontSize = commentFontSizes[settings.fontSize];
   const area = getDisplayArea(canvasHeight, settings.displayArea);
-  return area.top + fontSize + lane * (fontSize + 8);
+  return area.top + lane * LINE_HEIGHT + LINE_HEIGHT * 0.85;
 }
 
 export function getActiveCommentPosition(
@@ -429,8 +471,10 @@ function buildSourceComments(candidate: ClipCandidate): RepresentativeComment[] 
 
 function buildAssStyles(settings: CommentOverlaySettings) {
   const fontName = settings.fontName || "Noto Sans JP";
-  const outline = Math.max(0, Math.min(8, Math.round(settings.outlineWidth ?? 4)));
-  return `Style: NicoComment,${fontName},36,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,1,${outline},1,7,20,20,20,1`;
+  const outline = Math.max(3, Math.min(8, Math.round(settings.outlineWidth ?? 4)));
+  // Bold + strong outline + semi-transparent black shadow for the
+  // NicoNico-like white-text-with-black-glow look.
+  return `Style: NicoComment,${fontName},36,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,1,0,0,0,100,100,0,0,1,${outline},3,7,20,20,20,1`;
 }
 
 function formatAssTime(seconds: number) {
@@ -455,7 +499,18 @@ function escapeAssText(text: string) {
 }
 
 function estimateAssTextWidth(text: string, fontSize: number) {
-  return Math.ceil(Array.from(text).reduce((total, character) => total + (character.charCodeAt(0) > 255 ? fontSize : fontSize * 0.62), 0));
+  let width = 0;
+  for (const char of text) {
+    const code = char.charCodeAt(0);
+    // Full-width CJK, emoji, and kana get full fontSize; everything else
+    // gets ~60% (half-width Latin).
+    if (code > 255) {
+      width += fontSize;
+    } else {
+      width += fontSize * 0.6;
+    }
+  }
+  return Math.max(1, Math.round(width));
 }
 
 function roundTime(value: number) {
