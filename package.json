@@ -5,7 +5,9 @@
     "apps/*"
   ],
   "scripts": {
-    "dev": "npm --workspace apps/web run dev",
+    "dev": "concurrently --names api,web --prefix-colors blue,green \"npm run dev:api\" \"npm run dev:web\"",
+    "dev:web": "npm --workspace apps/web run dev",
+    "dev:api": "bash -c 'cd apps/api && export $(grep -v \"^#\" .env | xargs) && .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload'",
     "build": "npm --workspace apps/web run build",
     "lint": "npm --workspace apps/web run lint",
     "typecheck": "npm --workspace apps/web run typecheck"
@@ -14,6 +16,7 @@
     "postcss": "8.5.10"
   },
   "devDependencies": {
-    "@playwright/test": "^1.61.1"
+    "@playwright/test": "^1.61.1",
+    "concurrently": "^10.0.3"
   }
 }

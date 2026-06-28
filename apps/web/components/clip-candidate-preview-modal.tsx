@@ -41,22 +41,7 @@ type ClipCandidatePreviewModalProps = {
   onThumbnailGenerated: (candidateId: string, thumbnail: ThumbnailCandidateReference) => void;
 };
 
-const previewModes: Array<{ value: PreviewMode; label: string; description: string }> = [
-  { value: "source", label: "元動画", description: "Archive framing only" },
-  { value: "comments", label: "コメントON", description: "Mock chat overlay" },
-  { value: "subtitles", label: "字幕ON", description: "Mock subtitle layer" },
-  { value: "combined", label: "コメント+字幕", description: "Both review layers" }
-];
-
 const markerKinds: Array<ClipCandidateMarker["kind"]> = ["setup", "funny", "peak", "ending", "note"];
-
-const markerKindLabels: Record<ClipCandidateMarker["kind"], string> = {
-  setup: "Setup",
-  funny: "Funny",
-  peak: "Peak",
-  ending: "Ending",
-  note: "Note"
-};
 
 const statusTone: Record<CandidateStatus, string> = {
   selected: "border-emerald-300/50 bg-emerald-400/15 text-emerald-100 shadow-[0_0_36px_rgba(16,185,129,0.12)]",
@@ -104,6 +89,22 @@ export function ClipCandidatePreviewModal({
   onThumbnailGenerated
 }: ClipCandidatePreviewModalProps) {
   const { t } = useI18n();
+
+  const previewModes: Array<{ value: PreviewMode; label: string; description: string }> = [
+    { value: "source", label: t("previewModal.previewOriginal"), description: "Archive framing only" },
+    { value: "comments", label: t("previewModal.previewComments"), description: "Mock chat overlay" },
+    { value: "subtitles", label: t("previewModal.previewSubtitles"), description: "Mock subtitle layer" },
+    { value: "combined", label: t("previewModal.previewBoth"), description: "Both review layers" }
+  ];
+
+  const markerKindLabels: Record<ClipCandidateMarker["kind"], string> = {
+    setup: t("previewModal.markerSetup"),
+    funny: t("previewModal.markerFunny"),
+    peak: t("previewModal.markerPeak"),
+    ending: t("previewModal.markerEnding"),
+    note: t("previewModal.markerNote")
+  };
+
   const [previewMode, setPreviewMode] = useState<PreviewMode>("combined");
   const [mockTimeIndex, setMockTimeIndex] = useState(0);
   const [isPlaying, setIsPlaying] = useState(true);
@@ -233,9 +234,9 @@ export function ClipCandidatePreviewModal({
   const playbackDuration = hasRealClip && videoDuration > 0 ? videoDuration : durationSeconds;
   const showSubtitles = previewMode === "subtitles" || previewMode === "combined";
   const sortedMarkers = [...candidate.markers].sort((a, b) => parseTimeToSeconds(a.time) - parseTimeToSeconds(b.time));
-  const peakLabel = candidate.chat.peakPerMinute >= 500 ? "弾幕 高" : candidate.chat.peakPerMinute >= 250 ? "弾幕 中" : "弾幕 低";
-  const moodLabel = candidate.tags.includes("funny") || candidate.tags.includes("comedy") ? "爆笑" : candidate.tags.includes("wholesome") ? "感動" : "盛り上がり";
-  const activeSubtitle = getActiveSubtitle(candidate, currentMockSeconds);
+  const peakLabel = candidate.chat.peakPerMinute >= 500 ? t("previewModal.peakHigh") : candidate.chat.peakPerMinute >= 250 ? t("previewModal.peakMedium") : t("previewModal.peakLow");
+  const moodLabel = candidate.tags.includes("funny") || candidate.tags.includes("comedy") ? t("previewModal.moodFunny") : candidate.tags.includes("wholesome") ? t("previewModal.moodTouching") : t("previewModal.moodHype");
+  const activeSubtitle = getActiveSubtitle(candidate, currentMockSeconds, t("previewModal.subtitlePreview"));
 
   function togglePlayback() {
     const video = videoRef.current;
@@ -622,12 +623,12 @@ export function ClipCandidatePreviewModal({
                       download={generatedClip.outputPath.split("/").pop()}
                       className="rounded-2xl border border-emerald-200/40 bg-emerald-300/15 px-4 py-2 text-xs font-semibold text-emerald-50 transition hover:bg-emerald-300/25"
                     >
-                      MP4 ダウンロード
+                      {t("previewModal.mp4Download")}
                     </a>
                   </div>
                   {videoError && (
                     <p className="rounded-xl border border-rose-300/35 bg-rose-400/10 p-2 text-xs leading-5 text-rose-100">
-                      動画読み込みエラー: {videoError}
+                      {`${t("previewModal.videoLoadError")} ${videoError}`}
                     </p>
                   )}
                 </div>
@@ -758,40 +759,40 @@ export function ClipCandidatePreviewModal({
             <Panel title={t("preview.editingNotes")}>
               <div className="space-y-3">
                 <NoteField
-                  label="Edit plan"
+                  label={t("previewModal.editPlan")}
                   value={candidate.notes.editPlan}
                   rows={5}
                   onChange={(value) => onNotesChange(candidate.id, "editPlan", value)}
                   placeholder="Timing, pacing, context to preserve, and cut strategy."
                 />
                 <NoteField
-                  label="Title idea"
+                  label={t("previewModal.titleIdeaLabel")}
                   value={candidate.notes.titleIdea}
                   rows={2}
                   onChange={(value) => onNotesChange(candidate.id, "titleIdea", value)}
                   placeholder="Working title angle."
                 />
                 <NoteField
-                  label="Thumbnail idea"
+                  label={t("previewModal.thumbnailIdeaLabel")}
                   value={candidate.notes.thumbnailIdea}
                   rows={3}
                   onChange={(value) => onNotesChange(candidate.id, "thumbnailIdea", value)}
                   placeholder="Face, text, crop, emotion, or visual gag."
                 />
                 <NoteField
-                  label="Upload text"
+                  label={t("previewModal.uploadTextLabel")}
                   value={candidate.notes.uploadText}
                   rows={3}
                   onChange={(value) => onNotesChange(candidate.id, "uploadText", value)}
                   placeholder="Description notes, credits, warnings, or pinned comment ideas."
                 />
               </div>
-              <p className="mt-3 text-xs text-slate-500">Saved locally in client state for this mock prototype.</p>
+              <p className="mt-3 text-xs text-slate-500">{t("previewModal.savedLocally")}</p>
             </Panel>
 
             <Panel title={t("preview.timestampMarkers")}>
               <div className="rounded-2xl border border-cyan-300/25 bg-cyan-400/10 p-3">
-                <p className="text-xs uppercase tracking-[0.2em] text-cyan-100/75">Add from current mock time</p>
+                <p className="text-xs uppercase tracking-[0.2em] text-cyan-100/75">{t("previewModal.addFromTime")}</p>
                 <p className="mt-1 text-2xl font-bold text-cyan-50">+{currentMockTime}</p>
                 <div className="mt-3 grid grid-cols-[0.85fr_1.15fr] gap-2">
                   <select
@@ -811,7 +812,7 @@ export function ClipCandidatePreviewModal({
                   value={newMarkerLabel}
                   onChange={(event) => setNewMarkerLabel(event.target.value)}
                   className="mt-2 w-full rounded-2xl border border-white/10 bg-slate-950/60 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-cyan-200/60"
-                  placeholder="Optional marker label"
+                  placeholder={t("previewModal.optionalMarkerLabel")}
                 />
               </div>
 
@@ -824,7 +825,7 @@ export function ClipCandidatePreviewModal({
                         <MarkerKindBadge kind={marker.kind} />
                       </div>
                       <button type="button" onClick={() => onRemoveMarker(candidate.id, marker.id)} className="rounded-full border border-white/10 px-2 py-1 text-xs text-slate-400 transition hover:border-rose-300/40 hover:text-rose-100">
-                        Remove
+                        {t("common.remove")}
                       </button>
                     </div>
                     <input
@@ -841,7 +842,7 @@ export function ClipCandidatePreviewModal({
             <Panel title={t("preview.commentSettings")}>
               <div className="space-y-4">
                 <RangeField
-                  label={`同期: ${commentSettings.syncOffsetSeconds.toFixed(1)}s`}
+                  label={`${t("previewModal.commentSync")}: ${commentSettings.syncOffsetSeconds.toFixed(1)}s`}
                   min={-8}
                   max={8}
                   step={0.5}
@@ -849,65 +850,65 @@ export function ClipCandidatePreviewModal({
                   onChange={(value) => setCommentSettings((current) => ({ ...current, syncOffsetSeconds: value }))}
                 />
                 <SegmentedControl
-                  label="密度"
+                  label={t("previewModal.commentDensity")}
                   value={commentSettings.density}
                   options={[
-                    ["low", "低"],
-                    ["medium", "中"],
-                    ["high", "高"],
-                    ["danmaku", "弾幕"]
+                    ["low", t("previewModal.densityLow")],
+                    ["medium", t("previewModal.densityMedium")],
+                    ["high", t("previewModal.densityHigh")],
+                    ["danmaku", t("previewModal.densityDanmaku")]
                   ]}
                   onChange={(value) => setCommentSettings((current) => ({ ...current, density: value as CommentOverlaySettings["density"] }))}
                 />
                 <SegmentedControl
-                  label="表示範囲"
+                  label={t("previewModal.commentDisplayArea")}
                   value={commentSettings.displayArea}
                   options={[
-                    ["full", "全体"],
-                    ["top", "上部のみ"],
-                    ["bottom", "下部のみ"]
+                    ["full", t("previewModal.displayAll")],
+                    ["top", t("previewModal.displayTop")],
+                    ["bottom", t("previewModal.displayBottom")]
                   ]}
                   onChange={(value) => setCommentSettings((current) => ({ ...current, displayArea: value as CommentOverlaySettings["displayArea"] }))}
                 />
                 <SegmentedControl
-                  label="サイズ"
+                  label={t("previewModal.commentFontSize")}
                   value={commentSettings.fontSize}
                   options={[
-                    ["small", "小"],
-                    ["medium", "中"],
-                    ["large", "大"]
+                    ["small", t("previewModal.fontSizeSmall")],
+                    ["medium", t("previewModal.fontSizeMedium")],
+                    ["large", t("previewModal.fontSizeLarge")]
                   ]}
                   onChange={(value) => setCommentSettings((current) => ({ ...current, fontSize: value as CommentOverlaySettings["fontSize"] }))}
                 />
                 <SegmentedControl
-                  label="色"
+                  label={t("previewModal.commentColorMode")}
                   value={commentSettings.colorMode}
                   options={[
-                    ["white", "白のみ"],
-                    ["reaction", "反応別カラー"]
+                    ["white", t("previewModal.colorWhite")],
+                    ["reaction", t("previewModal.colorReaction")]
                   ]}
                   onChange={(value) => setCommentSettings((current) => ({ ...current, colorMode: value as CommentOverlaySettings["colorMode"] }))}
                 />
                 <div className="grid grid-cols-2 gap-2">
-                  <ToggleButton label="URL除外" enabled={commentSettings.filterUrls} onClick={() => setCommentSettings((current) => ({ ...current, filterUrls: !current.filterUrls }))} />
-                  <ToggleButton label="長文除外" enabled={commentSettings.filterLongComments} onClick={() => setCommentSettings((current) => ({ ...current, filterLongComments: !current.filterLongComments }))} />
-                  <ToggleButton label="連投除外" enabled={commentSettings.filterRepeatedComments} onClick={() => setCommentSettings((current) => ({ ...current, filterRepeatedComments: !current.filterRepeatedComments }))} />
-                  <ToggleButton label="ユーザー名非表示" enabled={commentSettings.hideUserNames} onClick={() => setCommentSettings((current) => ({ ...current, hideUserNames: !current.hideUserNames }))} />
+                  <ToggleButton label={t("previewModal.filterUrls")} enabled={commentSettings.filterUrls} onClick={() => setCommentSettings((current) => ({ ...current, filterUrls: !current.filterUrls }))} />
+                  <ToggleButton label={t("previewModal.filterLongComments")} enabled={commentSettings.filterLongComments} onClick={() => setCommentSettings((current) => ({ ...current, filterLongComments: !current.filterLongComments }))} />
+                  <ToggleButton label={t("previewModal.filterRepeatedComments")} enabled={commentSettings.filterRepeatedComments} onClick={() => setCommentSettings((current) => ({ ...current, filterRepeatedComments: !current.filterRepeatedComments }))} />
+                  <ToggleButton label={t("previewModal.hideUserNames")} enabled={commentSettings.hideUserNames} onClick={() => setCommentSettings((current) => ({ ...current, hideUserNames: !current.hideUserNames }))} />
                 </div>
 
                 <div className="space-y-2 rounded-2xl border border-white/10 bg-black/15 p-3">
-                  <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">フォント</p>
+                  <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">{t("previewModal.commentFont")}</p>
                   <input
                     value={commentSettings.fontName}
                     onChange={(event) => setCommentSettings((current) => ({ ...current, fontName: event.target.value }))}
                     placeholder="Noto Sans JP"
                     className="h-10 w-full rounded-xl border border-white/10 bg-slate-950/60 px-3 text-sm text-slate-100 outline-none focus:border-cyan-200/60"
                   />
-                  <p className="text-[0.65rem] leading-4 text-slate-500">FFmpeg burn-in で使用。MS PGothic や Noto Sans CJK を推奨。</p>
+                  <p className="text-[0.65rem] leading-4 text-slate-500">{t("previewModal.commentFontHint")}</p>
                 </div>
 
                 <RangeField
-                  label={`縁取り: ${commentSettings.outlineWidth}px`}
+                  label={`${t("previewModal.commentOutline")}: ${commentSettings.outlineWidth}px`}
                   min={0}
                   max={8}
                   step={1}
@@ -915,7 +916,7 @@ export function ClipCandidatePreviewModal({
                   onChange={(value) => setCommentSettings((current) => ({ ...current, outlineWidth: value }))}
                 />
                 <RangeField
-                  label={`秒あたり上限: ${commentSettings.maxPerSecond}コメ`}
+                  label={`${t("previewModal.commentMaxPerSecond")}: ${commentSettings.maxPerSecond}`}
                   min={1}
                   max={30}
                   step={1}
@@ -945,14 +946,14 @@ export function ClipCandidatePreviewModal({
                     onClick={() => downloadTextFile(commentExportPayload.files.jsonFileName, commentsJson, "application/json;charset=utf-8")}
                     className="rounded-2xl border border-cyan-200/40 bg-cyan-300/15 px-3 py-2 text-xs font-semibold text-cyan-50 transition hover:bg-cyan-300/25"
                   >
-                    JSON保存
+                    {t("previewModal.jsonSave")}
                   </button>
                   <button
                     type="button"
                     onClick={() => downloadTextFile(commentExportPayload.files.assFileName, commentsAss, "text/plain;charset=utf-8")}
                     className="rounded-2xl border border-fuchsia-200/40 bg-fuchsia-300/15 px-3 py-2 text-xs font-semibold text-fuchsia-50 transition hover:bg-fuchsia-300/25"
                   >
-                    ASS保存
+                    {t("previewModal.assSave")}
                   </button>
                 </div>
                 <div className="rounded-2xl border border-violet-300/25 bg-violet-400/10 p-3">
@@ -966,9 +967,9 @@ export function ClipCandidatePreviewModal({
                     disabled={isBurningComments || !generatedClip}
                     className="mt-3 w-full rounded-2xl border border-violet-200/45 bg-violet-300/15 px-3 py-2 text-xs font-semibold text-violet-50 transition hover:bg-violet-300/25 disabled:cursor-not-allowed disabled:opacity-60"
                   >
-                    {isBurningComments ? "コメント焼き込み中..." : "コメント付きMP4生成"}
+                    {isBurningComments ? t("previewModal.commentBurnLoading") : t("previewModal.commentBurnTitle")}
                   </button>
-                  {!generatedClip && <p className="mt-2 text-xs leading-5 text-amber-100">Local media dev toolsで先にclipを生成してください。</p>}
+                  {!generatedClip && <p className="mt-2 text-xs leading-5 text-amber-100">{t("previewModal.commentBurnNoClip")}</p>}
                   {commentBurnError && <p className="mt-2 rounded-xl border border-rose-300/35 bg-rose-400/10 p-2 text-xs leading-5 text-rose-100">{commentBurnError}</p>}
                   {commentBurnedClip && (
                     <div className="mt-3 rounded-xl border border-emerald-300/30 bg-emerald-400/10 p-2 font-mono text-xs leading-5 text-emerald-100">
@@ -1111,7 +1112,15 @@ function VariantButton({ variant, selected, onClick }: { variant: ClipCandidateV
 }
 
 function MarkerKindBadge({ kind }: { kind: ClipCandidateMarker["kind"] }) {
-  return <span className={cn("rounded-full border px-2 py-1 text-[0.65rem] font-bold uppercase tracking-[0.12em]", markerKindTone[kind])}>{markerKindLabels[kind]}</span>;
+  const { t } = useI18n();
+  const labels: Record<ClipCandidateMarker["kind"], string> = {
+    setup: t("previewModal.markerSetup"),
+    funny: t("previewModal.markerFunny"),
+    peak: t("previewModal.markerPeak"),
+    ending: t("previewModal.markerEnding"),
+    note: t("previewModal.markerNote")
+  };
+  return <span className={cn("rounded-full border px-2 py-1 text-[0.65rem] font-bold uppercase tracking-[0.12em]", markerKindTone[kind])}>{labels[kind]}</span>;
 }
 
 function PostingAssetsPanel({
@@ -1262,14 +1271,15 @@ function ExportPackagePreview({
   error: string | null;
   onGenerate: () => void;
 }) {
+  const { t } = useI18n();
   const checks = [
-    { label: "Status selected", ready: candidate.status === "selected" },
-    { label: "Length variant chosen", ready: Boolean(selectedVariant) },
-    { label: "Markers added", ready: markerCount > 0 },
-    { label: "Title idea drafted", ready: candidate.notes.titleIdea.trim().length > 0 },
-    { label: "Clean clip generated", ready: Boolean(generatedClip) },
-    { label: "Comment-burned clip generated", ready: Boolean(commentBurnedClip) },
-    { label: "Transcript generated", ready: Boolean(candidate.transcription) }
+    { label: t("previewModal.checkStatusSelected"), ready: candidate.status === "selected" },
+    { label: t("previewModal.checkLengthChosen"), ready: Boolean(selectedVariant) },
+    { label: t("previewModal.checkMarkersAdded"), ready: markerCount > 0 },
+    { label: t("previewModal.checkTitleDrafted"), ready: candidate.notes.titleIdea.trim().length > 0 },
+    { label: t("previewModal.checkCleanClip"), ready: Boolean(generatedClip) },
+    { label: t("previewModal.checkCommentClip"), ready: Boolean(commentBurnedClip) },
+    { label: t("previewModal.checkTranscript"), ready: Boolean(candidate.transcription) }
   ];
 
   return (
@@ -1289,13 +1299,13 @@ function ExportPackagePreview({
         {checks.map((check) => (
           <div key={check.label} className="flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/[0.04] px-3 py-2 text-sm">
             <span className="text-slate-300">{check.label}</span>
-            <span className={cn("rounded-full px-2 py-1 text-xs font-bold", check.ready ? "bg-emerald-300/15 text-emerald-100" : "bg-amber-300/15 text-amber-100")}>{check.ready ? "Ready" : "Missing"}</span>
+            <span className={cn("rounded-full px-2 py-1 text-xs font-bold", check.ready ? "bg-emerald-300/15 text-emerald-100" : "bg-amber-300/15 text-amber-100")}>{check.ready ? t("previewModal.checkReady") : t("previewModal.checkMissing")}</span>
           </div>
         ))}
       </div>
 
       <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-3 text-sm leading-6 text-slate-300">
-        <p className="font-semibold text-white">Package contents</p>
+        <p className="font-semibold text-white">{t("previewModal.packageContents")}</p>
         <p>metadata.json</p>
         <p>notes.md</p>
         <p>assets/video/clean_clip.mp4 when available</p>
@@ -1311,7 +1321,7 @@ function ExportPackagePreview({
         disabled={isGenerating}
         className="w-full rounded-2xl border border-emerald-200/45 bg-emerald-300/15 px-4 py-3 text-sm font-semibold text-emerald-50 transition hover:bg-emerald-300/25 disabled:cursor-not-allowed disabled:opacity-60"
       >
-        {isGenerating ? "Generating package..." : "Generate editor package"}
+        {isGenerating ? t("previewModal.generatingPackage") : t("previewModal.generateEditorPackage")}
       </button>
 
       {error && <div className="rounded-2xl border border-rose-300/35 bg-rose-400/10 p-3 text-sm leading-6 text-rose-100">{error}</div>}
@@ -1342,14 +1352,14 @@ function parseTimeToSeconds(time: string) {
   return Number.isFinite(parts[0]) ? parts[0] : 0;
 }
 
-function getActiveSubtitle(candidate: ClipCandidate, currentTime: number) {
+function getActiveSubtitle(candidate: ClipCandidate, currentTime: number, fallbackLabel: string) {
   const activeSegment = candidate.transcriptSegments.find((segment) => {
     const start = parseTimeToSeconds(segment.start);
     const end = parseTimeToSeconds(segment.end);
     return currentTime >= start && currentTime <= Math.max(end, start + 1);
   });
 
-  return activeSegment?.text ?? candidate.transcriptSegments.find((segment) => segment.highlight)?.text ?? candidate.transcript[0] ?? "字幕プレビュー";
+  return activeSegment?.text ?? candidate.transcriptSegments.find((segment) => segment.highlight)?.text ?? candidate.transcript[0] ?? fallbackLabel;
 }
 
 function secondsToTime(totalSeconds: number) {

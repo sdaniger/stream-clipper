@@ -208,6 +208,9 @@
     "transcribeSkipped": "文字起こしスキップ",
     "generatePackages": "編集パッケージを生成",
     "generatePackagesHint": "編集用の zip パッケージを生成 (クリップ・文字起こし・コメント・メモを同梱)",
+    "burnComments": "コメントをクリップに焼込む",
+    "burnCommentsEnabledHint": "パイプライン時にスクロールコメントを動画にハードエンコードする",
+    "burnCommentsDisabledHint": "コメント焼込みをスキップして高速にクリップを生成",
     "timeRange": "時間範囲を指定 (部分解析)",
     "timeRangeHint": "配信全体ではなく、指定した範囲だけを解析・ダウンロード。長尺配信の高速化に有効。",
     "timeStart": "開始 (HH:MM:SS)",
@@ -274,6 +277,7 @@
     "customMax": "自由",
     "transcribe": "文字起こし",
     "withComments": "コメント付き",
+    "burnComments": "コメント焼込み",
     "manualClip": "手動クリップ",
     "manualClipLoad": "VOD読み込み",
     "manualClipGenerate": "クリップ生成",
@@ -404,7 +408,8 @@
     "kbdPrev": "前の候補",
     "kbdPlay": "再生 / 一時停止",
     "kbdDelete": "候補を削除",
-    "kbdHelp": "このヘルプを表示"
+    "kbdHelp": "このヘルプを表示",
+    "hideVod": "非表示"
   },
   "previewModal": {
     "previewOriginal": "元動画",

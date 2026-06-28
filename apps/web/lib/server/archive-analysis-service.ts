@@ -52,6 +52,8 @@ export type ArchiveAutoAnalyzeInput = {
   pipelineMode?: "full" | "links" | "clips" | "sections";
   /** Twitch OAuth token for creating clips via Helix API (required for "clips" mode). */
   oauthToken?: string;
+  /** Burn scrolling comments (ASS overlay) into the generated clip via FFmpeg. Default: true. */
+  burnComments?: boolean;
   /** User comment overlay settings (density, font, filters, etc). */
   commentSettings?: CommentOverlaySettings;
   signal?: AbortSignal;
@@ -497,9 +499,9 @@ export async function runArchiveAutoAnalysis(
       // Stage 3.5: comment burn-in (runs after both transcription + comments
       // complete). The ASS content is already computed above — pass it directly
       // to avoid a redundant file write. Errors are non-fatal: the clean clip
-      // is still usable.
+      // is still usable. Controlled by the burnComments option (default: true).
       let commentBurnedClip = generatedCandidate.commentBurnedClip;
-      if (generatedClip && commentsAssStr && !commentBurnedClip) {
+      if (input.burnComments !== false && generatedClip && commentsAssStr && !commentBurnedClip) {
         emitProgress({ stage: "burn", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Burning comments into clip ${indexLabel}...` });
         const burnStartTime = Date.now();
         try {

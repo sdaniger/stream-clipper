@@ -77,14 +77,14 @@ export default function DevPage() {
       <div className="mx-auto max-w-7xl space-y-6">
         <header className="flex items-center justify-between">
           <div>
-            <a href="/" className="text-sm text-slate-400 transition hover:text-slate-200">← 戻る</a>
-            <h1 className="mt-1 text-xl font-semibold text-white">Developer Tools</h1>
+            <a href="/" className="text-sm text-slate-400 transition hover:text-slate-200">{t("main.devBack")}</a>
+            <h1 className="mt-1 text-xl font-semibold text-white">{t("main.devTools")}</h1>
           </div>
           <LanguageSwitcher />
         </header>
 
         <p className="text-sm text-slate-400">
-          一般ユーザーには必要ないツールです。FFmpeg の挙動確認やチャットJSONの手動取り込みに使います。
+          {t("main.devDescription")}
         </p>
 
         {/* yt-dlp diagnostic */}
@@ -143,10 +143,10 @@ export default function DevPage() {
 
         <button
           type="button"
-          onClick={() => { if (!window.confirm("全データを削除しますか？この操作は取り消せません。")) return; clearCandidates(); setCandidates([]); }}
+          onClick={() => { if (!window.confirm(t("main.devClearConfirm"))) return; clearCandidates(); setCandidates([]); }}
           className="rounded-xl border border-white/10 bg-white/[0.03] px-4 py-2 text-sm text-slate-400 transition hover:text-rose-300"
         >
-          保存データを消去
+          {t("main.devClearData")}
         </button>
       </div>
     </main>

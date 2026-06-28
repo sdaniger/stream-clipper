@@ -208,6 +208,9 @@
     "transcribeSkipped": "Transcription skipped",
     "generatePackages": "Generate editor packages",
     "generatePackagesHint": "Bundle clip + transcript + comments + notes into a downloadable zip",
+    "burnComments": "Burn comments into clips",
+    "burnCommentsEnabledHint": "Hard-encode scrolling comments into the video during pipeline",
+    "burnCommentsDisabledHint": "Skip comment burn-in for faster clip generation",
     "timeRange": "Time range (partial analysis)",
     "timeRangeHint": "Analyze only a portion of the VOD instead of the full stream. Saves bandwidth and time on long streams.",
     "timeStart": "Start (HH:MM:SS)",
@@ -274,6 +277,7 @@
     "customMax": "Custom",
     "transcribe": "Transcribe",
     "withComments": "With comments",
+    "burnComments": "Burn comments",
     "manualClip": "Manual Clip",
     "manualClipLoad": "Load VOD",
     "manualClipGenerate": "Generate clip",
@@ -404,7 +408,8 @@
     "kbdPrev": "Previous candidate",
     "kbdPlay": "Play / Pause",
     "kbdDelete": "Delete candidate",
-    "kbdHelp": "Toggle this help"
+    "kbdHelp": "Toggle this help",
+    "hideVod": "Hide"
   },
   "previewModal": {
     "previewOriginal": "Original",

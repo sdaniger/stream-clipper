@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useI18n } from "@/lib/i18n";
 
 type VideoRangeSelectorProps = {
   videoSrc: string;
@@ -17,6 +18,7 @@ function formatTime(seconds: number): string {
 }
 
 export function VideoRangeSelector({ videoSrc, duration, onChange }: VideoRangeSelectorProps) {
+  const { t } = useI18n();
   const videoRef = useRef<HTMLVideoElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
   const [start, setStart] = useState(0);
@@ -54,6 +56,21 @@ export function VideoRangeSelector({ videoSrc, duration, onChange }: VideoRangeS
     videoRef.current.currentTime = time;
   }, [percentToTime]);
 
+  const applyDrag = useCallback((clientX: number) => {
+    if (!timelineRef.current || !dragging) return;
+    const rect = timelineRef.current.getBoundingClientRect();
+    const pct = ((clientX - rect.left) / rect.width) * 100;
+    const time = percentToTime(pct);
+
+    if (dragging === "start") {
+      const clamped = Math.min(time, end - 1);
+      setStart(Math.max(0, clamped));
+    } else {
+      const clamped = Math.max(time, start + 1);
+      setEnd(Math.min(actualDuration, clamped));
+    }
+  }, [dragging, start, end, actualDuration, percentToTime]);
+
   const handleMarkerMouseDown = useCallback((marker: "start" | "end") => (e: React.MouseEvent) => {
     e.stopPropagation();
     e.preventDefault();
@@ -61,33 +78,38 @@ export function VideoRangeSelector({ videoSrc, duration, onChange }: VideoRangeS
     dragRef.current = { startX: e.clientX, startVal: marker === "start" ? start : end };
   }, [start, end]);
 
+  const handleMarkerTouchStart = useCallback((marker: "start" | "end") => (e: React.TouchEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    setDragging(marker);
+    dragRef.current = { startX: e.touches[0].clientX, startVal: marker === "start" ? start : end };
+  }, [start, end]);
+
   useEffect(() => {
     if (!dragging) return;
 
     const handleMouseMove = (e: MouseEvent) => {
-      if (!timelineRef.current) return;
-      const rect = timelineRef.current.getBoundingClientRect();
-      const pct = ((e.clientX - rect.left) / rect.width) * 100;
-      const time = percentToTime(pct);
-
-      if (dragging === "start") {
-        const clamped = Math.min(time, end - 1);
-        setStart(Math.max(0, clamped));
-      } else {
-        const clamped = Math.max(time, start + 1);
-        setEnd(Math.min(actualDuration, clamped));
-      }
+      applyDrag(e.clientX);
     };
 
-    const handleMouseUp = () => setDragging(null);
+    const handleTouchMove = (e: TouchEvent) => {
+      e.preventDefault();
+      applyDrag(e.touches[0].clientX);
+    };
+
+    const handleStop = () => setDragging(null);
 
     window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", handleMouseUp);
+    window.addEventListener("mouseup", handleStop);
+    window.addEventListener("touchmove", handleTouchMove, { passive: false });
+    window.addEventListener("touchend", handleStop);
     return () => {
       window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", handleMouseUp);
+      window.removeEventListener("mouseup", handleStop);
+      window.removeEventListener("touchmove", handleTouchMove);
+      window.removeEventListener("touchend", handleStop);
     };
-  }, [dragging, start, end, actualDuration, percentToTime]);
+  }, [dragging, applyDrag]);
 
   const handleVideoLoaded = useCallback(() => {
     const v = videoRef.current;
@@ -142,6 +164,7 @@ export function VideoRangeSelector({ videoSrc, duration, onChange }: VideoRangeS
             className="absolute top-0 h-full w-1.5 bg-emerald-400 cursor-ew-resize z-10 group"
             style={{ left: `calc(${timeToPercent(start)}% - 3px)` }}
             onMouseDown={handleMarkerMouseDown("start")}
+            onTouchStart={handleMarkerTouchStart("start")}
           >
             <div className="absolute -top-6 left-1/2 -translate-x-1/2 rounded bg-emerald-400 px-1.5 py-0.5 text-[0.6rem] font-mono font-bold text-black whitespace-nowrap opacity-0 group-hover:opacity-100 transition">
               {formatTime(start)}
@@ -153,6 +176,7 @@ export function VideoRangeSelector({ videoSrc, duration, onChange }: VideoRangeS
             className="absolute top-0 h-full w-1.5 bg-rose-400 cursor-ew-resize z-10 group"
             style={{ left: `calc(${timeToPercent(end)}% - 3px)` }}
             onMouseDown={handleMarkerMouseDown("end")}
+            onTouchStart={handleMarkerTouchStart("end")}
           >
             <div className="absolute -top-6 left-1/2 -translate-x-1/2 rounded bg-rose-400 px-1.5 py-0.5 text-[0.6rem] font-mono font-bold text-black whitespace-nowrap opacity-0 group-hover:opacity-100 transition">
               {formatTime(end)}
@@ -162,7 +186,7 @@ export function VideoRangeSelector({ videoSrc, duration, onChange }: VideoRangeS
 
         {/* Time display */}
         <div className="mt-2 flex items-center justify-between text-xs text-slate-400">
-          <span>全体: {formatTime(actualDuration)}</span>
+          <span>{t("videoRange.total")}{formatTime(actualDuration)}</span>
           <span className="font-mono">
             <span className="text-emerald-300">{formatTime(start)}</span>
             {" → "}
@@ -173,11 +197,11 @@ export function VideoRangeSelector({ videoSrc, duration, onChange }: VideoRangeS
           <div className="flex gap-2">
             <button type="button" onClick={seekToStart}
               className="rounded border border-emerald-300/30 px-1.5 py-0.5 text-[0.6rem] text-emerald-300 transition hover:bg-emerald-300/10">
-              ▶ 開始へ
+              {t("videoRange.goToStart")}
             </button>
             <button type="button" onClick={seekToEnd}
               className="rounded border border-rose-300/30 px-1.5 py-0.5 text-[0.6rem] text-rose-300 transition hover:bg-rose-300/10">
-              ▶ 終了へ
+              {t("videoRange.goToEnd")}
             </button>
           </div>
         </div>

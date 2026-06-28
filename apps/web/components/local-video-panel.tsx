@@ -556,7 +556,7 @@ export function LocalVideoPanel({ candidates, onClipGenerated, onTranscriptionCo
               <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">{t("media.transcription")}</p>
               <div className="mt-3 grid gap-3 lg:grid-cols-[1fr_0.7fr_auto]">
                 <label className="block">
-                  <span className="mb-2 block text-xs text-slate-500">faster-whisper model</span>
+                  <span className="mb-2 block text-xs text-slate-500">{t("localVideo.whisperModel")}</span>
                   <input
                     value={modelName}
                     onChange={(event) => setModelName(event.target.value)}
@@ -565,7 +565,7 @@ export function LocalVideoPanel({ candidates, onClipGenerated, onTranscriptionCo
                   />
                 </label>
                 <label className="block">
-                  <span className="mb-2 block text-xs text-slate-500">Language hint</span>
+                  <span className="mb-2 block text-xs text-slate-500">{t("localVideo.languageHint")}</span>
                   <input
                     value={language}
                     onChange={(event) => setLanguage(event.target.value)}
@@ -584,13 +584,13 @@ export function LocalVideoPanel({ candidates, onClipGenerated, onTranscriptionCo
                   </button>
                 </div>
               </div>
-              <p className="mt-3 text-xs leading-5 text-slate-500">Requires the FastAPI backend running on `TRANSCRIPTION_API_BASE_URL` or `http://127.0.0.1:8000`.</p>
+              <p className="mt-3 text-xs leading-5 text-slate-500">{t("localVideo.requiresBackend")}</p>
             </div>
 
             {lastTranscript && (
               <div className="rounded-3xl border border-fuchsia-300/35 bg-fuchsia-400/10 p-4 text-sm leading-6 text-fuchsia-100">
-                <p className="font-semibold text-white">Transcript saved</p>
-                <p className="mt-2">Segments: {lastTranscript.segments.length}</p>
+                <p className="font-semibold text-white">{t("localVideo.transcriptSaved")}</p>
+                <p className="mt-2">{t("localVideo.segments")}{lastTranscript.segments.length}</p>
                 <p>TXT: {lastTranscript.outputs.txtPath}</p>
                 <p>SRT: {lastTranscript.outputs.srtPath}</p>
               </div>
@@ -626,8 +626,8 @@ export function LocalVideoPanel({ candidates, onClipGenerated, onTranscriptionCo
                   <MiniStat label="File" value={metadata.filename} />
                   <MiniStat label={t("media.duration")} value={metadata.duration ?? t("common.unknown")} />
                   <MiniStat label="Format" value={metadata.formatName ?? t("common.unknown")} />
-                  <MiniStat label="Video" value={metadata.video ? `${metadata.video.codec ?? "?"} · ${metadata.video.width ?? "?"}x${metadata.video.height ?? "?"} · ${metadata.video.fps ?? "?"} fps` : "No video stream"} />
-                  <MiniStat label="Audio" value={metadata.audio ? `${metadata.audio.codec ?? "?"} · ${metadata.audio.channels ?? "?"} ch` : "No audio stream"} />
+                  <MiniStat label="Video" value={metadata.video ? `${metadata.video.codec ?? "?"} · ${metadata.video.width ?? "?"}x${metadata.video.height ?? "?"} · ${metadata.video.fps ?? "?"} fps` : t("localVideo.noVideoStream")} />
+                  <MiniStat label="Audio" value={metadata.audio ? `${metadata.audio.codec ?? "?"} · ${metadata.audio.channels ?? "?"} ch` : t("localVideo.noAudioStream")} />
                 </div>
               </div>
             )}
@@ -639,13 +639,13 @@ export function LocalVideoPanel({ candidates, onClipGenerated, onTranscriptionCo
                   <div className={cn("rounded-2xl border p-3", transcriptionHealth.available ? "border-fuchsia-300/35 bg-fuchsia-400/10 text-fuchsia-100" : "border-rose-300/35 bg-rose-400/10 text-rose-100")}>
                     <div className="flex items-center justify-between gap-3">
                       <p className="text-sm font-semibold">{transcriptionHealth.engine}</p>
-                      <span className="rounded-full bg-black/20 px-2 py-1 text-xs font-bold">{transcriptionHealth.available ? "Available" : "Missing"}</span>
+                      <span className="rounded-full bg-black/20 px-2 py-1 text-xs font-bold">{transcriptionHealth.available ? t("localVideo.toolAvailable") : t("localVideo.toolMissing")}</span>
                     </div>
                     <p className="mt-2 text-xs leading-5 opacity-85">{transcriptionHealth.error ?? `model ${transcriptionHealth.default_model} · ${transcriptionHealth.device} · ${transcriptionHealth.compute_type}`}</p>
                   </div>
                 </div>
               ) : (
-                <p className="mt-3 text-sm text-slate-400">Check Whisper to load transcription status.</p>
+                <p className="mt-3 text-sm text-slate-400">{t("localVideo.checkWhisper")}</p>
               )}
             </div>
 
@@ -689,11 +689,12 @@ function mapTranscriptionResponse(response: TranscriptionResponse): ClipTranscri
 }
 
 function ToolBadge({ status }: { status: ToolStatus }) {
+  const { t } = useI18n();
   return (
     <div className={cn("rounded-2xl border p-3", status.available ? "border-emerald-300/35 bg-emerald-400/10 text-emerald-100" : "border-rose-300/35 bg-rose-400/10 text-rose-100")}>
       <div className="flex items-center justify-between gap-3">
         <p className="text-sm font-semibold">{status.command}</p>
-        <span className="rounded-full bg-black/20 px-2 py-1 text-xs font-bold">{status.available ? "Available" : "Missing"}</span>
+        <span className="rounded-full bg-black/20 px-2 py-1 text-xs font-bold">{status.available ? t("localVideo.toolAvailable") : t("localVideo.toolMissing")}</span>
       </div>
       <p className="mt-2 text-xs leading-5 opacity-85">{status.version ?? status.error}</p>
     </div>

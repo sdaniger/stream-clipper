@@ -63,6 +63,7 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
   const [clipMode, setClipMode] = useState<"copy" | "reencode">("copy");
   const [transcribe, setTranscribe] = useState(true);
   const [generatePackages, setGeneratePackages] = useState(true);
+  const [burnComments, setBurnComments] = useState(true);
   const [autoOpenModal, setAutoOpenModal] = useState(true);
   const [isRunning, setIsRunning] = useState(false);
   const [useTimeRange, setUseTimeRange] = useState(false);
@@ -194,6 +195,7 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
           clipMode,
           transcribe,
           generatePackages,
+          burnComments,
           timeStartSeconds: useTimeRange ? parseTimeToSeconds(timeRangeStart) : undefined,
           timeEndSeconds: useTimeRange ? parseTimeToSeconds(timeRangeEnd) : undefined,
           clipLength,
@@ -278,7 +280,11 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
     if (!result) {
       return;
     }
-    onImport(result.candidates, mode, result.summary);
+    onImport(
+      result.sourceUrl ? result.candidates.map((c) => ({ ...c, sourceUrl: result.sourceUrl })) : result.candidates,
+      mode,
+      result.summary
+    );
   }
 
   function handleRetry() {
@@ -474,6 +480,27 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
                       </span>
                       <p className="mt-0.5 text-[0.7rem] leading-4 text-slate-400">
                         {t("archive.generatePackagesHint")}
+                      </p>
+                    </div>
+                  </label>
+                </div>
+
+                <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-3">
+                  <label className="flex items-start gap-3">
+                    <input
+                      type="checkbox"
+                      checked={burnComments}
+                      onChange={(event) => setBurnComments(event.target.checked)}
+                      className="mt-1 h-4 w-4 accent-orange-300"
+                    />
+                    <div className="min-w-0 flex-1">
+                      <span className="text-sm font-semibold text-slate-100">
+                        {t("archive.burnComments")}
+                      </span>
+                      <p className="mt-0.5 text-[0.7rem] leading-4 text-slate-400">
+                        {burnComments
+                          ? t("archive.burnCommentsEnabledHint")
+                          : t("archive.burnCommentsDisabledHint")}
                       </p>
                     </div>
                   </label>

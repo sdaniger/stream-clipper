@@ -150,6 +150,8 @@ export type ClipCandidate = {
   title: string;
   streamer: string;
   archiveTitle: string;
+  /** Source VOD URL (set at pipeline import time) */
+  sourceUrl?: string;
   detectedAt: string;
   duration: string;
   confidence: number;

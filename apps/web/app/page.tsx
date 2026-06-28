@@ -104,6 +104,7 @@ export default function Home() {
   const [customMax, setCustomMax] = usePersistedState("customMax", "");
   const [transcribe, setTranscribe] = usePersistedState("transcribe", true);
   const [withComments, setWithComments] = usePersistedState("withComments", true);
+  const [burnComments, setBurnComments] = usePersistedState("burnComments", true);
   const [encoder, setEncoder] = usePersistedState<"libx264" | "h264_nvenc" | "hevc_nvenc">("encoder", "h264_nvenc");
   const [pipelineMode, setPipelineMode] = usePersistedState<"full" | "links" | "clips" | "sections">("pipelineMode", "full");
   const [oauthToken, setOauthToken] = usePersistedState("oauthToken", "");
@@ -111,6 +112,7 @@ export default function Home() {
   const [useTimeRange, setUseTimeRange] = useState(false);
   const [timeRangeStart, setTimeRangeStart] = useState("");
   const [timeRangeEnd, setTimeRangeEnd] = useState("");
+  const [hiddenVodKeys, setHiddenVodKeys] = usePersistedState<string[]>("hiddenVodKeys", []);
   const [keepFilter, setKeepFilter] = useState<"all" | "keep" | "discard" | "unreviewed">("all");
   const [minConfidence, setMinConfidence] = usePersistedState("minConfidence", 50);
   const [batchBurning, setBatchBurning] = useState(false);
@@ -148,6 +150,8 @@ export default function Home() {
   // candidates
   const [candidates, setCandidates] = useState<ClipCandidate[]>(() => loadCandidates() ?? []);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [selectedVodTab, setSelectedVodTab] = useState("all");
+  const [collapsedVods, setCollapsedVods] = useState<Set<string>>(new Set());
 
   // undo
   const [undoAction, setUndoAction] = useState<UndoAction | null>(null);
@@ -348,6 +352,7 @@ export default function Home() {
           maxCandidates: effectiveMax,
           transcribe,
           generatePackages: withComments,
+          burnComments,
           encoder,
           clipMode: encoder !== "libx264" ? "reencode" : "copy",
           llmProvider,
@@ -424,13 +429,19 @@ export default function Home() {
               } else if (currentEvent === "complete") {
                 const res = data as PipelineResult;
                 setResult(res);
-                setCandidates(res.candidates);
+                setCandidates((prev) => {
+                  const newSourceUrl = res.sourceUrl;
+                  const enriched = res.candidates.map((c) => ({ ...c, sourceUrl: newSourceUrl }));
+                  const kept = prev.filter((c) => (c.sourceUrl || c.archiveTitle || "unknown") !== newSourceUrl);
+                  setSelectedVodTab("all");
+                  return [...kept, ...enriched];
+                });
                 setProgress(100);
                 setStages(STAGE_ORDER.map((id) => ({ id, label: t(STAGE_KEYS[id] ?? id), status: "done" })));
                 if (typeof Notification !== "undefined" && Notification.permission === "granted") {
                   new Notification("Stream Clipper", { body: `${res.candidates.length} candidates found` });
                 }
-                autoEvaluateCandidates(res.candidates);
+                autoEvaluateCandidates(res.candidates.map((c) => ({ ...c, sourceUrl: res.sourceUrl })));
               } else if (currentEvent === "error") {
                 setError(data?.error ?? t("archive.unknownError"));
               } else if (currentEvent === "cancelled") {
@@ -616,13 +627,61 @@ export default function Home() {
     return Math.max(0, Math.round(estimatedTotal - elapsed));
   })();
 
-  const filteredCandidates = useMemo(() => {
-    return getFilteredCandidates(getSortedCandidates(candidates, sortBy), keepFilter, minConfidence, searchQuery);
-  }, [candidates, keepFilter, minConfidence, sortBy, searchQuery]);
+  type VODGroup = { key: string; title: string; count: number; candidates: ClipCandidate[] };
 
-  const totalCandidates = candidates.length;
-  const withClips = candidates.filter((c) => c.generatedClip).length;
-  const withTranscriptions = candidates.filter((c) => c.transcription).length;
+  const vodGroups = useMemo<VODGroup[]>(() => {
+    const groups = new Map<string, VODGroup>();
+    for (const c of candidates) {
+      const key = c.sourceUrl || c.archiveTitle || "unknown";
+      let g = groups.get(key);
+      if (!g) {
+        g = { key, title: c.archiveTitle || key, count: 0, candidates: [] };
+        groups.set(key, g);
+      }
+      g.candidates.push(c);
+      g.count++;
+    }
+    return Array.from(groups.values()).filter((g) => !hiddenVodKeys.includes(g.key)).sort((a, b) => b.count - a.count);
+  }, [candidates, hiddenVodKeys]);
+
+  const candidatesForVodTab = useMemo(() => {
+    if (selectedVodTab === "all") return candidates;
+    if (hiddenVodKeys.includes(selectedVodTab)) return candidates;
+    return candidates.filter((c) => (c.sourceUrl || c.archiveTitle || "unknown") === selectedVodTab);
+  }, [candidates, selectedVodTab, hiddenVodKeys]);
+
+  const filteredCandidates = useMemo(() => {
+    return getFilteredCandidates(getSortedCandidates(candidatesForVodTab, sortBy), keepFilter, minConfidence, searchQuery);
+  }, [candidatesForVodTab, keepFilter, minConfidence, sortBy, searchQuery]);
+
+  const toggleVodCollapse = useCallback((key: string) => {
+    setCollapsedVods((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
+
+  const hideVodGroup = useCallback((key: string) => {
+    setHiddenVodKeys((prev) => (prev.includes(key) ? prev : [...prev, key]));
+    setSelectedVodTab((prev) => (prev === key ? "all" : prev));
+  }, []);
+
+  const restoreHiddenVods = useCallback(() => {
+    setHiddenVodKeys([]);
+  }, []);
+
+  // reset tab if current tab's VOD is hidden by another action
+  useEffect(() => {
+    if (selectedVodTab !== "all" && hiddenVodKeys.includes(selectedVodTab)) {
+      setSelectedVodTab("all");
+    }
+  }, [hiddenVodKeys, selectedVodTab]);
+
+  const totalCandidates = candidatesForVodTab.length;
+  const withClips = candidatesForVodTab.filter((c) => c.generatedClip).length;
+  const withTranscriptions = candidatesForVodTab.filter((c) => c.transcription).length;
 
   return (
     <main className="min-h-screen px-4 py-8 sm:px-6">
@@ -695,6 +754,11 @@ export default function Home() {
                 withComments ? "border-cyan-300/40 bg-cyan-400/10 text-cyan-100" : "border-white/10 text-slate-400")}>
                 <input type="checkbox" checked={withComments} onChange={(e) => setWithComments(e.target.checked)} className="h-3.5 w-3.5 accent-cyan-300" />
                 {t("main.withComments")}
+              </label>
+              <label className={cn("flex cursor-pointer items-center gap-2 rounded-xl border px-3 py-1.5 text-sm transition",
+                burnComments ? "border-orange-300/40 bg-orange-400/10 text-orange-100" : "border-white/10 text-slate-400")}>
+                <input type="checkbox" checked={burnComments} onChange={(e) => setBurnComments(e.target.checked)} className="h-3.5 w-3.5 accent-orange-300" />
+                {t("main.burnComments")}
               </label>
               <button type="button" onClick={() => setShowSettings((v) => !v)} className="text-xs text-slate-500 transition hover:text-slate-300">
                 {showSettings ? t("main.settingsToggleOpen") : t("main.settingsToggle")}
@@ -922,6 +986,26 @@ export default function Home() {
               </div>
             )}
 
+            {/* VOD tabs */}
+            {vodGroups.length >= 2 && (
+              <div className="flex flex-wrap gap-1.5 border-b border-white/5 pb-2">
+                <button type="button" onClick={() => setSelectedVodTab("all")}
+                  className={cn("rounded-full border px-3 py-1 text-xs font-semibold transition truncate max-w-[160px]",
+                    selectedVodTab === "all" ? "border-violet-200/60 bg-violet-300/15 text-violet-50" : "border-white/10 text-slate-400 hover:text-slate-200"
+                  )}>
+                  {t("main.filterAll")} <span className="text-white/40">{candidates.length}</span>
+                </button>
+                {vodGroups.map((g) => (
+                  <button key={g.key} type="button" onClick={() => setSelectedVodTab(g.key)}
+                    className={cn("rounded-full border px-3 py-1 text-xs font-semibold transition truncate max-w-[200px]",
+                      selectedVodTab === g.key ? "border-violet-200/60 bg-violet-300/15 text-violet-50" : "border-white/10 text-slate-400 hover:text-slate-200"
+                    )} title={g.title}>
+                    {g.title.length > 25 ? g.title.slice(0, 25) + "…" : g.title} <span className="text-white/40">{g.count}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+
             {/* filter bar + batch actions */}
             <div className="flex flex-wrap items-center gap-2">
               <div className="flex flex-wrap gap-1 sm:hidden">
@@ -931,7 +1015,7 @@ export default function Home() {
                     keepFilter === f ? "border-cyan-200/60 bg-cyan-300/15 text-cyan-50" : "border-white/10 text-slate-400 hover:text-slate-200"
                   )}>
                     {f === "all" ? t("main.filterAll") : f === "keep" ? t("main.filterKeep") : f === "discard" ? t("main.filterDiscard") : t("main.filterUnreviewed")}
-                    <span className="ml-0.5 text-white/40">{f === "all" ? candidates.length : f === "keep" ? candidates.filter(c => c.editorStatus === "keep").length : f === "discard" ? candidates.filter(c => c.editorStatus === "discard").length : candidates.filter(c => !c.editorStatus).length}</span>
+                    <span className="ml-0.5 text-white/40">{f === "all" ? candidatesForVodTab.length : f === "keep" ? candidatesForVodTab.filter(c => c.editorStatus === "keep").length : f === "discard" ? candidatesForVodTab.filter(c => c.editorStatus === "discard").length : candidatesForVodTab.filter(c => !c.editorStatus).length}</span>
                   </button>
                 ))}
               </div>
@@ -942,7 +1026,7 @@ export default function Home() {
                     keepFilter === f ? "border-cyan-200/60 bg-cyan-300/15 text-cyan-50" : "border-white/10 text-slate-400 hover:text-slate-200"
                   )}>
                     {f === "all" ? t("main.filterAll") : f === "keep" ? t("main.filterKeep") : f === "discard" ? t("main.filterDiscard") : t("main.filterUnreviewed")}
-                    <span className="ml-1 text-white/40">{f === "all" ? candidates.length : f === "keep" ? candidates.filter(c => c.editorStatus === "keep").length : f === "discard" ? candidates.filter(c => c.editorStatus === "discard").length : candidates.filter(c => !c.editorStatus).length}</span>
+                    <span className="ml-1 text-white/40">{f === "all" ? candidatesForVodTab.length : f === "keep" ? candidatesForVodTab.filter(c => c.editorStatus === "keep").length : f === "discard" ? candidatesForVodTab.filter(c => c.editorStatus === "discard").length : candidatesForVodTab.filter(c => !c.editorStatus).length}</span>
                   </button>
                 ))}
               </div>
@@ -987,20 +1071,67 @@ export default function Home() {
             {/* comment settings global panel */}
             <CommentSettingsPanel settings={commentSettings} onUpdate={setCommentSettings} />
 
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {filteredCandidates.map((candidate) => (
-                <SimpleCandidateCard
-                  key={candidate.id}
-                  candidate={candidate}
-                  isExpanded={expandedId === candidate.id}
-                  onToggle={() => setExpandedId((id) => (id === candidate.id ? null : candidate.id))}
-                  onUpdate={(updated) => setCandidates(prev => prev.map(c => c.id === updated.id ? updated : c))}
-                  onDelete={() => deleteCandidate(candidate.id)}
-                  commentSettings={commentSettings}
-                  llmProvider={llmProvider}
-                />
-              ))}
-            </div>
+            {selectedVodTab === "all" && vodGroups.length >= 2 ? (
+              vodGroups.map((g) => {
+                const groupFiltered = getFilteredCandidates(getSortedCandidates(g.candidates, sortBy), keepFilter, minConfidence, searchQuery);
+                if (groupFiltered.length === 0) return null;
+                return (
+                  <div key={g.key} className="mb-4 last:mb-0">
+                    <div className="mb-3 flex items-center gap-2">
+                      <button type="button" onClick={() => toggleVodCollapse(g.key)}
+                        className="text-slate-400 hover:text-white transition text-xs">
+                        {collapsedVods.has(g.key) ? "▶" : "▼"}
+                      </button>
+                      <h3 className="text-sm font-semibold text-slate-200 truncate" title={g.title}>
+                        {g.title}
+                      </h3>
+                      <span className="text-xs text-slate-500">{g.count}{t("main.candidates")}</span>
+                      <button type="button" onClick={() => hideVodGroup(g.key)}
+                        className="ml-auto text-[0.6rem] text-slate-500 hover:text-rose-300 transition">
+                        {t("main.hideVod")}
+                      </button>
+                    </div>
+                    {!collapsedVods.has(g.key) && (
+                      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                        {groupFiltered.map((candidate) => (
+                          <SimpleCandidateCard
+                            key={candidate.id}
+                            candidate={candidate}
+                            isExpanded={expandedId === candidate.id}
+                            onToggle={() => setExpandedId((id) => (id === candidate.id ? null : candidate.id))}
+                            onUpdate={(updated) => setCandidates(prev => prev.map(c => c.id === updated.id ? updated : c))}
+                            onDelete={() => deleteCandidate(candidate.id)}
+                            commentSettings={commentSettings}
+                            llmProvider={llmProvider}
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            ) : (
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                {filteredCandidates.map((candidate) => (
+                  <SimpleCandidateCard
+                    key={candidate.id}
+                    candidate={candidate}
+                    isExpanded={expandedId === candidate.id}
+                    onToggle={() => setExpandedId((id) => (id === candidate.id ? null : candidate.id))}
+                    onUpdate={(updated) => setCandidates(prev => prev.map(c => c.id === updated.id ? updated : c))}
+                    onDelete={() => deleteCandidate(candidate.id)}
+                    commentSettings={commentSettings}
+                    llmProvider={llmProvider}
+                  />
+                ))}
+              </div>
+            )}
+            {hiddenVodKeys.length > 0 && (
+              <button type="button" onClick={restoreHiddenVods}
+                className="mt-2 text-xs text-slate-500 hover:text-slate-300 transition">
+                隠したVOD ({hiddenVodKeys.length}) を表示に戻す
+              </button>
+            )}
           </section>
         )}
 
