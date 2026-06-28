@@ -495,7 +495,14 @@ function assColor(hexColor: string) {
 }
 
 function escapeAssText(text: string) {
-  return text.replace(/\\/g, "\\\\").replace(/\{/g, "\\{").replace(/\}/g, "\\}").replace(/\n/g, "\\N");
+  // Only escape ASS special characters. Emoji, CJK, and all other
+  // Unicode pass through unchanged — modern CJK fonts (Noto Sans JP,
+  // MS PGothic) render them fine.
+  return text
+    .replace(/\\/g, "\\\\")
+    .replace(/\{/g, "\\{")
+    .replace(/\}/g, "\\}")
+    .replace(/\n/g, "\\N");
 }
 
 function estimateAssTextWidth(text: string, fontSize: number) {

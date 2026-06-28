@@ -105,15 +105,27 @@ export function CommentCanvasOverlay({ comments, currentTime, duration, settings
       }
 
       const y = getCommentY(comment.lane ?? 0, height, state.settings);
+
+      // Gaussian-blurred outline (narinico's OUTLINE_BLUR=3.0, OUTLINE_ALPHA=250).
+      // Renders a thick black blurred outline, then sharp white text on top —
+      // producing the characteristic NicoNico glow effect.
+      context.save();
+      if (typeof context.filter !== "undefined") {
+        context.filter = "blur(3px)";
+      }
       context.lineJoin = "round";
-      context.shadowColor = "rgba(0, 0, 0, 0.45)";
-      context.shadowBlur = 8;
-      context.strokeStyle = "rgba(0, 0, 0, 0.92)";
-      context.lineWidth = Math.max(4, Math.round(fontSize / 7));
+      context.strokeStyle = "rgba(0, 0, 0, 0.98)";
+      context.lineWidth = Math.max(4, Math.round(fontSize / 6));
       context.strokeText(text, x, y);
-      context.shadowBlur = 0;
+      context.restore();
+
+      // Sharp white fill on top
+      context.lineJoin = "round";
+      context.shadowColor = "rgba(0, 0, 0, 0.55)";
+      context.shadowBlur = 2;
       context.fillStyle = comment.color;
       context.fillText(text, x, y);
+      context.shadowBlur = 0;
     }
   }
 

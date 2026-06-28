@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { access, copyFile, mkdir, stat, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { ClipCandidate, ClipCandidateVariant, ClipTranscription, CommentAssetReference, CommentBurnedClipReference, GeneratedClipReference, ThumbnailCandidateReference } from "@/lib/mock-candidates";
@@ -105,6 +105,13 @@ export type BurnCommentsIntoClipInput = {
    * already-loud sources.
    */
   normalizeAudio?: boolean;
+  /**
+   * Post-process the output for fast seeking (CFR, short 2s GOP,
+   * sc_threshold=0). This matches narinico's `seek_optimize` pass
+   * which makes the video responsive in players. Defaults to true
+   * because it's cheap and the UX improvement is huge.
+   */
+  seekOptimize?: boolean;
 };
 
 export type CommentBurnedClip = {
@@ -419,6 +426,28 @@ function resolveFfmpegPath() {
   return process.env.FFMPEG_PATH || "ffmpeg";
 }
 
+/**
+ * Narinico-style seek optimization (CFR, short GOP, sc_threshold=0, faststart).
+ * Re-encodes the given MP4 in-place so video players can seek instantly.
+ * Non-critical — failures are swallowed with a console.warn.
+ */
+async function optimizeForSeeking(outputPath: string) {
+  const tmp = outputPath.replace(/\.mp4$/i, ".seekopt.tmp.mp4");
+  const fps = 60;
+  const gop = fps * 2; // 2-second GOP (narinico default)
+  const args = [
+    "-hide_banner", "-y", "-i", outputPath,
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+    "-r", String(fps), "-g", String(gop), "-sc_threshold", "0",
+    "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
+    "-movflags", "+faststart",
+    tmp
+  ];
+  await execFileAsync("ffmpeg", args, { timeout: 10 * 60_000, maxBuffer: 32 * 1024 * 1024 });
+  // Replace original with optimized version
+  await rename(tmp, outputPath);
+}
+
 export async function burnCommentsIntoClip(input: BurnCommentsIntoClipInput): Promise<CommentBurnedClip> {
   const absoluteClipPath = resolveMediaPath(input.clipPath);
   await assertFileExists(absoluteClipPath, "Clip file");
@@ -474,6 +503,17 @@ export async function burnCommentsIntoClip(input: BurnCommentsIntoClipInput): Pr
     await execFileAsync("ffmpeg", args, { cwd: getMediaRoot(), timeout: 20 * 60_000, maxBuffer: 32 * 1024 * 1024 });
   } catch (error) {
     throw new Error(`FFmpeg comment burn-in failed: ${formatExecError(error)}`);
+  }
+
+  // Narinico-style seek optimization: CFR + short 2s GOP for responsive
+  // seeking in video players. Disable with seekOptimize: false.
+  if (input.seekOptimize !== false) {
+    try {
+      await optimizeForSeeking(outputPath);
+    } catch (error) {
+      // Seek optimization is non-critical; warn and continue.
+      console.warn("Seek optimization failed (non-critical):", formatExecError(error));
+    }
   }
 
   return {
