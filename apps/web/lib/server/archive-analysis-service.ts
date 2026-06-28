@@ -48,6 +48,10 @@ export type ArchiveAutoAnalyzeInput = {
   windowSeconds?: number;
   /** Clip length preset — controls variant durations. Defaults to "standard". */
   clipLength?: ClipLengthPreset;
+  /** Weight multiplier for keyword/reaction hits in highlight score. Default 1 (current behavior). */
+  keywordWeight?: number;
+  /** Minimum gap between peak centers for deduplication (seconds). Default: no dedup. */
+  minGap?: number;
   /** Pipeline mode: full VOD, VOD timestamp links, Twitch clips, or section downloads. */
   pipelineMode?: "full" | "links" | "clips" | "sections";
   /** Twitch OAuth token for creating clips via Helix API (required for "clips" mode). */
@@ -238,7 +242,7 @@ export async function runArchiveAutoAnalysis(
   // can finish gracefully instead of throwing inside analyzeChatEntries.
   const analysis =
     filteredChat.length > 0
-      ? analyzeChatEntries(filteredChat, buildCandidatePrefix(metadata), { windowSeconds: windowSec, clipLength: input.clipLength })
+      ? analyzeChatEntries(filteredChat, buildCandidatePrefix(metadata), { windowSeconds: windowSec, clipLength: input.clipLength, keywordWeight: input.keywordWeight, minGap: input.minGap })
       : {
           candidates: [],
           summary: {

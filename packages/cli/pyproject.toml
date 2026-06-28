@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "stream-clipper-cli"
+version = "0.1.0"
+description = "Livestream highlight detection and clipping CLI tool"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+stream-clipper-cli = "stream_clipper_cli.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["stream_clipper_cli*"]

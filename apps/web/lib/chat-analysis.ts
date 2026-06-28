@@ -129,17 +129,18 @@ export function parseChatJson(input: string) {
   return parsed.map((item, index) => validateChatEntry(item, index)).sort((a, b) => a.timestamp_seconds - b.timestamp_seconds);
 }
 
-export function analyzeChatJson(input: string, idPrefix = `chat-${Date.now()}`): ChatAnalysisResult {
+export function analyzeChatJson(input: string, idPrefix = `chat-${Date.now()}`, options?: { windowSeconds?: number; clipLength?: ClipLengthPreset; keywordWeight?: number; minGap?: number }): ChatAnalysisResult {
   const entries = parseChatJson(input);
-  return analyzeChatEntries(entries, idPrefix);
+  return analyzeChatEntries(entries, idPrefix, options);
 }
 
 export function analyzeChatEntries(
   entries: ChatLogEntry[],
   idPrefix = `chat-${Date.now()}`,
-  options?: { windowSeconds?: number; clipLength?: ClipLengthPreset }
+  options?: { windowSeconds?: number; clipLength?: ClipLengthPreset; keywordWeight?: number; minGap?: number }
 ): ChatAnalysisResult {
   const windowSec = options?.windowSeconds ?? DEFAULT_WINDOW_SECONDS;
+  const keywordWeight = options?.keywordWeight ?? 1;
 
   const normalizedEntries = entries
     .filter((entry) => entry.message.trim().length > 0)
@@ -158,7 +159,7 @@ export function analyzeChatEntries(
     };
   }
 
-  const buckets = buildBuckets(normalizedEntries, windowSec);
+  const buckets = buildBuckets(normalizedEntries, windowSec, keywordWeight);
   const counts = buckets.map((bucket) => bucket.entries.length);
   const baselinePerMinute = Math.round(median(counts) * (60 / windowSec));
   const peakPerMinute = Math.round(Math.max(...counts) * (60 / windowSec));
@@ -204,7 +205,10 @@ export function analyzeChatEntries(
   const ctxAfter = contextAfterSeconds(windowSec);
   const windows = mergeHighlightedBuckets(highlightedBuckets, normalizedEntries, ctxBefore, ctxAfter);
   const clipLength = options?.clipLength ?? "standard";
-  const candidates = windows
+  const minGap = options?.minGap;
+
+  const dedupedWindows = minGap ? deduplicateWindows(windows, minGap) : windows;
+  const candidates = dedupedWindows
     .sort((a, b) => b.score - a.score)
     .slice(0, MAX_CANDIDATES)
     .map((window, index) => buildCandidateFromWindow(window, index, idPrefix, baselinePerMinute, peakPerMinute, windowSec, clipLength));
@@ -250,7 +254,7 @@ function validateChatEntry(item: unknown, index: number): ChatLogEntry {
   };
 }
 
-function buildBuckets(entries: ChatLogEntry[], windowSec: number): Bucket[] {
+function buildBuckets(entries: ChatLogEntry[], windowSec: number, keywordWeight = 1): Bucket[] {
   const bucketMap = new Map<number, ChatLogEntry[]>();
 
   for (const entry of entries) {
@@ -275,7 +279,7 @@ function buildBuckets(entries: ChatLogEntry[], windowSec: number): Bucket[] {
       entries: bucketEntries,
       uniqueAuthors,
       reactionCounts,
-      signalScore: bucketEntries.length + uniqueAuthors * 0.8 + keywordScore
+      signalScore: bucketEntries.length + uniqueAuthors * 0.8 + keywordScore * keywordWeight
     });
   }
 
@@ -310,6 +314,26 @@ function mergeHighlightedBuckets(highlightedBuckets: Bucket[], entries: ChatLogE
 
     return { start, end, clipStart, clipEnd, buckets: cluster, entries: windowEntries, peakBucket, score, dominantReaction };
   });
+}
+
+function deduplicateWindows(windows: CandidateWindow[], minGap: number): CandidateWindow[] {
+  const sorted = [...windows].sort((a, b) => b.score - a.score);
+  const result: CandidateWindow[] = [];
+  for (const w of sorted) {
+    const peakA = w.peakBucket.start + (w.peakBucket.end - w.peakBucket.start) / 2;
+    let tooClose = false;
+    for (const existing of result) {
+      const peakB = existing.peakBucket.start + (existing.peakBucket.end - existing.peakBucket.start) / 2;
+      if (Math.abs(peakA - peakB) < minGap) {
+        tooClose = true;
+        break;
+      }
+    }
+    if (!tooClose) {
+      result.push(w);
+    }
+  }
+  return result.sort((a, b) => a.start - b.start);
 }
 
 function buildCandidateFromWindow(
@@ -724,3 +748,58 @@ export function secondsToClock(totalSeconds: number) {
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
+
+export type ChatAnalysisCsvRow = {
+  start: number;
+  end: number;
+  score: number;
+  chatCount: number;
+  keywordHits: number;
+  matchedKeywords: string[];
+};
+
+export function exportChatAnalysisCsv(
+  entries: ChatLogEntry[],
+  windowSeconds = 30,
+  keywordWeight = 1
+): ChatAnalysisCsvRow[] {
+  if (entries.length === 0) return [];
+
+  const sorted = [...entries].filter(e => e.message.trim().length > 0).sort((a, b) => a.timestamp_seconds - b.timestamp_seconds);
+  const minTs = sorted[0].timestamp_seconds;
+  const maxTs = sorted[sorted.length - 1].timestamp_seconds;
+
+  const buckets = buildBuckets(sorted, windowSeconds, keywordWeight);
+  const rows: ChatAnalysisCsvRow[] = [];
+
+  for (let ts = minTs; ts <= maxTs; ts += windowSeconds) {
+    const bucketIndex = Math.floor(ts / windowSeconds);
+    const bucket = buckets.find(b => b.index === bucketIndex) ?? null;
+    const start = bucketIndex * windowSeconds;
+    const end = (bucketIndex + 1) * windowSeconds;
+
+    if (bucket) {
+      const reactions = bucket.reactionCounts;
+      const totalKeywordHits = reactions.laughter + reactions.surprise + reactions.praise + reactions.clip;
+      const matchedKeywords = [
+        ...(reactions.laughter > 0 ? ["laughter"] : []),
+        ...(reactions.surprise > 0 ? ["surprise"] : []),
+        ...(reactions.praise > 0 ? ["praise"] : []),
+        ...(reactions.clip > 0 ? ["clip"] : []),
+      ];
+      rows.push({
+        start,
+        end,
+        score: bucket.signalScore,
+        chatCount: bucket.entries.length,
+        keywordHits: totalKeywordHits,
+        matchedKeywords,
+      });
+    } else {
+      rows.push({ start, end, score: 0, chatCount: 0, keywordHits: 0, matchedKeywords: [] });
+    }
+  }
+
+  return rows;
+}
+
