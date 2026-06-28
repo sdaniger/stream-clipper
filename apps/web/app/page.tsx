@@ -713,6 +713,9 @@ export default function Home() {
             <a href="/dev" className="opacity-50 hover:opacity-100 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 text-xs text-slate-500 transition hover:text-slate-300">
               dev
             </a>
+            <a href="/studio" className="opacity-50 hover:opacity-100 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 text-xs text-slate-500 transition hover:text-slate-300">
+              studio
+            </a>
           </div>
         </header>
 
