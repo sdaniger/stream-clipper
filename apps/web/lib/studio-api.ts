@@ -383,11 +383,15 @@ export type DanmakuExportResponse = {
   duration_seconds?: number;
 };
 
-export async function exportDanmakuClip(input: DanmakuExportRequest): Promise<DanmakuExportResponse> {
+export async function exportDanmakuClip(
+  input: DanmakuExportRequest,
+  signal?: AbortSignal
+): Promise<DanmakuExportResponse> {
   const res = await fetch("/api/studio/export-danmaku-clip", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
+    signal,
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ message: `HTTP ${res.status}` }));
@@ -423,7 +427,10 @@ export type GenerateAssResponse = {
   };
 };
 
-export async function generateAssOnly(input: GenerateAssRequest): Promise<GenerateAssResponse> {
+export async function generateAssOnly(
+  input: GenerateAssRequest,
+  signal?: AbortSignal
+): Promise<GenerateAssResponse> {
   // Use the export endpoint with source="ass_only" — this is the proper
   // path that doesn't require a video_path. If the user provided an
   // output_path, treat its parent as the output_dir.
@@ -441,6 +448,7 @@ export async function generateAssOnly(input: GenerateAssRequest): Promise<Genera
         output_dir: outputDir,
       },
     }),
+    signal,
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ message: `HTTP ${res.status}` }));

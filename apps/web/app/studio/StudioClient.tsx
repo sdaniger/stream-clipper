@@ -154,6 +154,7 @@ export default function StudioClient() {
   // Danmaku export state
   const [normalizedChat, setNormalizedChat] = useState<DanmakuChatMessage[]>([]);
   const [danmakuExporting, setDanmakuExporting] = useState<DanmakuExportKind>(null);
+  const [danmakuAbortController, setDanmakuAbortController] = useState<AbortController | null>(null);
   const [danmakuLastResult, setDanmakuLastResult] = useState<DanmakuExportResponse | null>(null);
   // Danmaku form state (all-comments mode by default — no per-stream cap)
   const [danmakuDensity, setDanmakuDensity] = useState<DanmakuDensity>("medium");
@@ -530,6 +531,8 @@ export default function StudioClient() {
     setDanmakuExporting(kind);
     setDanmakuLastResult(null);
     setErrorMessage(null);
+    const controller = new AbortController();
+    setDanmakuAbortController(controller);
     const start = getStart(selectedCandidate);
     const end = getEnd(selectedCandidate);
     addLog("user", `Export source: ${exportSource}`);
@@ -549,8 +552,10 @@ export default function StudioClient() {
           video_id: exportSource === "twitch_vod" ? videoId : null,
           candidate: selectedCandidate,
           chat: chatInRange,
+          edited_start: getStart(selectedCandidate),
+          edited_end: getEnd(selectedCandidate),
           options: { ...options, with_danmaku: true, all_comments: true, safety_comment_limit: null },
-        });
+        }, controller.signal);
         if (!result.ok) {
           addLog("error", t("studio.logExportSourceFailed", { source: exportSource, message: result.message ?? "Unknown error" }));
           setErrorMessage(result.message ?? t("studio.errorExportFailed", { message: "" }));
@@ -594,8 +599,10 @@ export default function StudioClient() {
           video_id: exportSource === "twitch_vod" ? videoId : null,
           candidate: selectedCandidate,
           chat: [],
+          edited_start: getStart(selectedCandidate),
+          edited_end: getEnd(selectedCandidate),
           options: { ...options, with_danmaku: false, all_comments: true, safety_comment_limit: null },
-        });
+        }, controller.signal);
         if (!result.ok) {
           addLog("error", t("studio.logExportNoFallback", { message: result.message ?? "Unknown error" }));
           setErrorMessage(result.message ?? t("studio.errorExportFailed", { message: "" }));
@@ -621,7 +628,7 @@ export default function StudioClient() {
           clip_end: end,
           output_path: `output/clip_${Date.now()}_${selectedCandidate.rank}.ass`,
           options: { ...options, all_comments: true, safety_comment_limit: null },
-        });
+        }, controller.signal);
         if (!result.ok) {
           addLog("error", `${t("studio.errorExportFailed", { message: "ASS generation" })}: ${result.message ?? "Unknown error"}`);
           setErrorMessage(result.message ?? "ASS generation failed");
@@ -643,13 +650,26 @@ export default function StudioClient() {
         }
       }
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Unknown error";
-      addLog("error", msg);
-      setErrorMessage(msg);
+      // AbortError is expected when the user cancels; show a friendly log.
+      if (e instanceof DOMException && e.name === "AbortError") {
+        addLog("user", t("studio.btnCancelExport"));
+      } else {
+        const msg = e instanceof Error ? e.message : "Unknown error";
+        addLog("error", msg);
+        setErrorMessage(msg);
+      }
     } finally {
       setDanmakuExporting(null);
+      setDanmakuAbortController(null);
     }
   }, [selectedCandidate, canExport, videoPath, chatInRange, addLog, exportSource, mode, videoId, vodUrl, t]);
+
+  const handleDanmakuCancel = useCallback(() => {
+    if (danmakuAbortController) {
+      danmakuAbortController.abort();
+      addLog("user", t("studio.btnCancelExport"));
+    }
+  }, [danmakuAbortController, addLog]);
 
   // ─── Action panel handlers ────────────────────────────────────────────────
 
@@ -938,6 +958,7 @@ export default function StudioClient() {
               onExportWithDanmaku={(opts) => handleDanmakuExport("with", opts)}
               onExportWithoutDanmaku={(opts) => handleDanmakuExport("without", opts)}
               onExportAssOnly={(opts) => handleDanmakuExport("ass", opts)}
+              onCancel={handleDanmakuCancel}
               density={danmakuDensity}
               setDensity={setDanmakuDensity}
               fontSize={danmakuFontSize}

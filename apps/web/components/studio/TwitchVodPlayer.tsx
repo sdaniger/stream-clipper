@@ -4,6 +4,7 @@ import { secondsToTwitchTime } from "@/lib/twitch-time";
 
 export interface TwitchVodPlayerHandle {
   getCurrentTime: () => number;
+  seekTo: (timeSeconds: number) => void;
 }
 
 interface Props {
@@ -12,6 +13,10 @@ interface Props {
   reloadKey: number;
   onTimeUpdate?: (time: number) => void;
 }
+
+// Toggle: set to true to attempt postMessage-based current time tracking.
+// Falls back to simulated time if Twitch doesn't emit events.
+const USE_POSTMESSAGE = false;
 
 const TwitchVodPlayer = forwardRef<TwitchVodPlayerHandle, Props>(function TwitchVodPlayer(
   { videoId, startTimeSeconds, reloadKey, onTimeUpdate },
@@ -22,6 +27,7 @@ const TwitchVodPlayer = forwardRef<TwitchVodPlayerHandle, Props>(function Twitch
   const lastReportedTimeRef = useRef(0);
   const onTimeUpdateRef = useRef(onTimeUpdate);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const postMessageActiveRef = useRef(false);
 
   useEffect(() => {
     onTimeUpdateRef.current = onTimeUpdate;
@@ -33,6 +39,28 @@ const TwitchVodPlayer = forwardRef<TwitchVodPlayerHandle, Props>(function Twitch
 
   useImperativeHandle(ref, () => ({
     getCurrentTime: () => lastReportedTimeRef.current,
+    seekTo: (timeSeconds: number) => {
+      // Try postMessage seek first (no reload); falls back to reload-based
+      // seek handled by the parent via `reloadKey`.
+      if (USE_POSTMESSAGE && iframeRef.current?.contentWindow) {
+        try {
+          iframeRef.current.contentWindow.postMessage(
+            JSON.stringify({
+              event: "video.seek",
+              data: { time: timeSeconds },
+            }),
+            "*",
+          );
+          lastReportedTimeRef.current = timeSeconds;
+          if (onTimeUpdateRef.current) onTimeUpdateRef.current(timeSeconds);
+          return;
+        } catch {
+          // fall through to simulated update
+        }
+      }
+      lastReportedTimeRef.current = timeSeconds;
+      if (onTimeUpdateRef.current) onTimeUpdateRef.current(timeSeconds);
+    },
   }));
 
   const src = useMemo(() => {
@@ -40,26 +68,67 @@ const TwitchVodPlayer = forwardRef<TwitchVodPlayerHandle, Props>(function Twitch
     return `https://player.twitch.tv/?video=v${videoId}&parent=${parentHost}&time=${time}&autoplay=true`;
   }, [videoId, startTimeSeconds, parentHost]);
 
-  // Poll the current time from the player via the Twitch player iframe API.
-  // Twitch embed doesn't expose a JS API for VODs by default, so we simulate
-  // a best-effort tracker by remembering the latest seek position. The
-  // parent application will get the real time once we have a "playing" event.
+  // Listen for Twitch player postMessage events (when enabled).
+  // Twitch's embed sends events like:
+  //   { event: "video.timeupdate", data: { currentTime, duration } }
+  //   { event: "video.pause", data: {} }
+  //   { event: "video.play", data: {} }
+  useEffect(() => {
+    if (!USE_POSTMESSAGE) return;
+
+    function handleMessage(event: MessageEvent) {
+      // Only accept messages from the Twitch iframe
+      if (!iframeRef.current || event.source !== iframeRef.current.contentWindow) {
+        return;
+      }
+      let payload: { event?: string; data?: { currentTime?: number; duration?: number } };
+      try {
+        payload = typeof event.data === "string" ? JSON.parse(event.data) : event.data;
+      } catch {
+        return;
+      }
+      if (!payload || !payload.event) return;
+
+      if (payload.event === "video.timeupdate" && typeof payload.data?.currentTime === "number") {
+        postMessageActiveRef.current = true;
+        lastReportedTimeRef.current = payload.data.currentTime;
+        if (onTimeUpdateRef.current) onTimeUpdateRef.current(payload.data.currentTime);
+      } else if (payload.event === "video.pause" || payload.event === "video.play") {
+        if (typeof payload.data?.currentTime === "number") {
+          lastReportedTimeRef.current = payload.data.currentTime;
+          if (onTimeUpdateRef.current) onTimeUpdateRef.current(payload.data.currentTime);
+        }
+      }
+    }
+
+    window.addEventListener("message", handleMessage);
+    return () => {
+      window.removeEventListener("message", handleMessage);
+    };
+  }, []);
+
+  // Initialise current time, then either listen to postMessage events
+  // (when active) or fall back to a simulated 1x playback counter.
   useEffect(() => {
     lastReportedTimeRef.current = startTimeSeconds;
     if (onTimeUpdateRef.current) {
       onTimeUpdateRef.current(startTimeSeconds);
     }
+    postMessageActiveRef.current = false;
 
     if (pollRef.current) {
       clearInterval(pollRef.current);
     }
-    // After initial seek, simulate playback at 1x. This is a best-effort
-    // approximation; for precise time the user can rely on the local player.
+
+    // The postMessage handler above will mark postMessageActiveRef=true
+    // as soon as Twitch emits a timeupdate event. Until then we simulate.
     pollRef.current = setInterval(() => {
+      // If postMessage is delivering real values, don't simulate.
+      if (postMessageActiveRef.current) return;
       if (document.visibilityState !== "visible") return;
       lastReportedTimeRef.current = Math.min(
         lastReportedTimeRef.current + 0.5,
-        startTimeSeconds + 60
+        startTimeSeconds + 60,
       );
       if (onTimeUpdateRef.current) {
         onTimeUpdateRef.current(lastReportedTimeRef.current);
@@ -81,6 +150,11 @@ const TwitchVodPlayer = forwardRef<TwitchVodPlayerHandle, Props>(function Twitch
         <span className="text-[10px] text-slate-600 ml-2 font-normal normal-case">
           v{videoId} · {secondsToTwitchTime(startTimeSeconds)}
         </span>
+        {USE_POSTMESSAGE && (
+          <span className="text-[9px] text-cyan-400 ml-2 font-normal normal-case">
+            (postMessage)
+          </span>
+        )}
       </div>
       <div className="aspect-video bg-black rounded overflow-hidden">
         <iframe

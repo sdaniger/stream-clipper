@@ -2,6 +2,7 @@
 import React from "react";
 import type { HighlightCandidate } from "@/lib/twitch-time";
 import type { DanmakuChatMessage, DanmakuDensity, DanmakuExportOptions, DanmakuExportSource, DanmakuFallback } from "@/lib/studio-api";
+import { useI18n } from "@/lib/i18n";
 
 export type FfmpegQuality = "high_speed" | "standard" | "high_quality";
 
@@ -43,6 +44,7 @@ interface Props {
   onExportWithDanmaku: (options: DanmakuExportOptions) => void;
   onExportWithoutDanmaku: (options: DanmakuExportOptions) => void;
   onExportAssOnly: (options: DanmakuExportOptions) => void;
+  onCancel?: () => void;
   // Form state lifted to parent
   density: DanmakuDensity;
   setDensity: (v: DanmakuDensity) => void;
@@ -74,6 +76,7 @@ export default function DanmakuPanel({
   onExportWithDanmaku,
   onExportWithoutDanmaku,
   onExportAssOnly,
+  onCancel,
   density,
   setDensity,
   fontSize,
@@ -95,6 +98,7 @@ export default function DanmakuPanel({
   const localAvailable = hasLocalVideo;
   const chatAvailable = chatInRange.length > 0;
   const candidateAvailable = !!candidate;
+  const { t } = useI18n();
 
   const twitchDisabled = !twitchAvailable;
   const localDisabled = !localAvailable;
@@ -444,6 +448,16 @@ export default function DanmakuPanel({
           {isExporting === "ass" ? "⏳ 生成中..." : "📄 ASSのみ生成"}
         </button>
       </div>
+
+      {/* Cancel button — visible only while exporting */}
+      {isExporting !== null && onCancel && (
+        <button
+          onClick={onCancel}
+          className="w-full mt-1.5 px-3 py-1.5 text-xs font-semibold rounded-md bg-red-700/70 hover:bg-red-600/80 text-white transition-colors"
+        >
+          ⛔ {t("studio.btnCancelExport")}
+        </button>
+      )}
 
       {/* Result */}
       {lastResult && (lastResult.output_file || lastResult.ass_file) && (
