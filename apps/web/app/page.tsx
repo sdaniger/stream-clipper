@@ -325,7 +325,14 @@ export default function Home() {
         const response = await fetch("/api/transcription/summarize", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ segments: candidate.transcription!.segments, provider: llmProvider })
+          body: JSON.stringify({
+            segments: candidate.transcription!.segments,
+            provider: llmProvider,
+            context: {
+              streamer: candidate.streamer,
+              archiveTitle: candidate.archiveTitle
+            }
+          })
         });
         if (response.ok) {
           const evaluation = await response.json();
@@ -397,14 +404,37 @@ export default function Home() {
       const decoder = new TextDecoder();
       let buffer = "";
 
-      const SSE_TIMEOUT_MS = 60_000;
+      // SSE inactivity timeout. Must be long enough to cover the slowest
+      // single stage (chat fetch can take ~20 min on first uncached VOD,
+      // and yt-dlp metadata with retries can take 4-5 min). Set to 30 min
+      // so the user sees the pipeline as running instead of "crashed" while
+      // the server-side work is still progressing.
+      const SSE_TIMEOUT_MS = 30 * 60_000;
       let lastEventTime = Date.now();
+      // currentEvent must persist across processLines() calls. SSE events
+      // arrive as `event: <name>` and `data: <payload>` on separate lines
+      // and can be split across multiple read() chunks. If we reset
+      // currentEvent to "" at the start of each processLines() invocation,
+      // any event whose `event:` line landed in one chunk and `data:` line
+      // landed in the next would be processed as a "data-only" line and
+      // silently dropped (the "complete" event was the most painful
+      // victim of this — the UI would stay stuck on whatever stage was
+      // last marked "running" forever).
+      let currentEvent = "";
 
       function processLines(lines: string[]) {
-        let currentEvent = "";
         for (const line of lines) {
           if (line.startsWith("event: ")) {
             currentEvent = line.slice(7).trim();
+          } else if (line.startsWith(": ")) {
+            // SSE comment line (e.g. ": keep-alive") — treat as a heartbeat
+            // so the inactivity timer doesn't fire while the server is
+            // sending keep-alives between real events.
+            lastEventTime = Date.now();
+          } else if (line === "") {
+            // Empty line marks the end of an event. Reset currentEvent so
+            // the next event starts clean.
+            currentEvent = "";
           } else if (line.startsWith("data: ")) {
             const raw = line.slice(6);
             try {
@@ -449,9 +479,9 @@ export default function Home() {
                   const newSourceUrl = res.sourceUrl;
                   const enriched = res.candidates.map((c) => ({ ...c, sourceUrl: newSourceUrl }));
                   const kept = prev.filter((c) => (c.sourceUrl || c.archiveTitle || "unknown") !== newSourceUrl);
-                  setSelectedVodTab("all");
                   return [...kept, ...enriched];
                 });
+                setSelectedVodTab("all");
                 setProgress(100);
                 setStages(STAGE_ORDER.map((id) => ({ id, label: t(STAGE_KEYS[id] ?? id), status: "done" })));
                 if (typeof Notification !== "undefined" && Notification.permission === "granted") {
@@ -1847,6 +1877,20 @@ function BurnButton({ candidate, onDone, commentSettings }: {
 
 // ── LLM evaluation box ──
 
+function ScoreBar({ label, score }: { label: string; score: number }) {
+  const pct = Math.max(0, Math.min(100, score));
+  const color = pct >= 75 ? "bg-emerald-300/80" : pct >= 50 ? "bg-amber-300/80" : "bg-rose-300/80";
+  return (
+    <span className="inline-flex items-center gap-1">
+      <span className="text-amber-100/60">{label}</span>
+      <span className="relative h-1.5 w-12 overflow-hidden rounded-full bg-white/10">
+        <span className={`absolute inset-y-0 left-0 ${color}`} style={{ width: `${pct}%` }} />
+      </span>
+      <span className="font-mono text-amber-50">{pct}</span>
+    </span>
+  );
+}
+
 function LlmEvaluationBox({ candidate, llmProvider, onEvaluated }: { candidate: ClipCandidate; llmProvider: string; onEvaluated: (evaluation: NonNullable<ClipCandidate["llmEvaluation"]>) => void }) {
   const { t } = useI18n();
   const [isLoading, setIsLoading] = useState(false);
@@ -1857,16 +1901,82 @@ function LlmEvaluationBox({ candidate, llmProvider, onEvaluated }: { candidate: 
     fetch("/api/transcription/summarize").then((r) => r.json()).then((d) => setStatusChecked(d.available === true)).catch(() => setStatusChecked(false));
   }, []);
 
+  const sendEvaluate = async (bypassCache: boolean) => {
+    if (!candidate.transcription) return;
+    setIsLoading(true); setError(null);
+    try {
+      const response = await fetch("/api/transcription/summarize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          segments: candidate.transcription.segments,
+          provider: llmProvider,
+          context: {
+            streamer: candidate.streamer,
+            archiveTitle: candidate.archiveTitle
+          },
+          noCache: bypassCache
+        })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data?.error ?? "LLM evaluation failed");
+      onEvaluated(data);
+    } catch (err) { setError(err instanceof Error ? err.message : "LLM error"); }
+    finally { setIsLoading(false); }
+  };
+
   if (candidate.llmEvaluation) {
     const eval_ = candidate.llmEvaluation;
+    const interestingness = eval_.interestingness;
+    const viral = eval_.viralPotential ?? interestingness;
+    const contentType = eval_.contentType ?? "other";
+    const contentTypeLabel = contentType.replace(/_/g, " ");
+    const moments = eval_.keyMoments ?? [];
+    const highlights = eval_.highlights ?? [];
     return (
       <div>
-        <p className="mb-1.5 text-xs font-semibold uppercase tracking-[0.2em] text-amber-100/70">{t("main.aiEval")} · {eval_.interestingness}/100</p>
-        <div className="rounded-xl border border-amber-300/25 bg-amber-400/10 p-3 space-y-2">
-          <p className="text-xs leading-5 text-amber-100/90">{eval_.summary}</p>
-          {eval_.highlights.length > 0 && <div className="space-y-1">{eval_.highlights.map((h, i) => <p key={i} className="text-[0.65rem] leading-4 text-amber-100/70">▸ {h}</p>)}</div>}
-          <p className="text-[0.65rem] leading-4 text-amber-100/50">{eval_.reason}</p>
+        <div className="mb-1.5 flex items-center justify-between text-[0.65rem] font-semibold uppercase tracking-[0.2em] text-amber-100/70">
+          <span>{t("main.aiEval")}</span>
+          <span className="text-amber-100/50 normal-case tracking-normal">{eval_.evaluatedBy ?? ""}</span>
         </div>
+        <div className="rounded-xl border border-amber-300/25 bg-amber-400/10 p-3 space-y-2">
+          {eval_.title && <p className="text-xs font-semibold text-amber-50">「{eval_.title}」</p>}
+          <div className="flex flex-wrap items-center gap-2 text-[0.6rem]">
+            <ScoreBar label="面白い" score={interestingness} />
+            <ScoreBar label="拡散性" score={viral} />
+            <span className="rounded-full border border-amber-300/30 bg-amber-300/10 px-1.5 py-0.5 text-amber-100/80">{contentTypeLabel}</span>
+            {eval_.language && <span className="rounded-full border border-white/10 bg-white/5 px-1.5 py-0.5 text-slate-200/80">{eval_.language}</span>}
+          </div>
+          <p className="text-xs leading-5 text-amber-100/90">{eval_.summary}</p>
+          {moments.length > 0 && (
+            <div className="space-y-1">
+              {moments.map((m, i) => (
+                <div key={i} className="rounded-lg border border-amber-200/15 bg-amber-300/5 px-2 py-1.5">
+                  <p className="text-[0.6rem] font-semibold uppercase tracking-wider text-amber-100/60">{m.label}</p>
+                  <p className="text-[0.7rem] leading-4 text-amber-50">「{m.quote}」</p>
+                </div>
+              ))}
+            </div>
+          )}
+          {moments.length === 0 && highlights.length > 0 && (
+            <div className="space-y-1">{highlights.map((h, i) => <p key={i} className="text-[0.65rem] leading-4 text-amber-100/70">▸ {h}</p>)}</div>
+          )}
+          {(eval_.targetAudience || eval_.audienceReaction) && (
+            <div className="space-y-0.5 border-t border-amber-200/15 pt-1.5 text-[0.6rem] leading-4 text-amber-100/60">
+              {eval_.targetAudience && <p><span className="text-amber-100/80">対象:</span> {eval_.targetAudience}</p>}
+              {eval_.audienceReaction && <p><span className="text-amber-100/80">反応:</span> {eval_.audienceReaction}</p>}
+            </div>
+          )}
+          {(eval_.reasoning || eval_.reason) && <p className="text-[0.6rem] leading-4 text-amber-100/45">{eval_.reasoning || eval_.reason}</p>}
+        </div>
+        <button
+          type="button"
+          onClick={() => sendEvaluate(false)}
+          disabled={isLoading}
+          className="mt-1 w-full rounded-lg border border-amber-200/20 bg-amber-300/5 px-2 py-1 text-[0.6rem] font-semibold text-amber-100/70 transition hover:bg-amber-300/15 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          {isLoading ? "再評価中…" : "再評価"}
+        </button>
       </div>
     );
   }
@@ -1875,21 +1985,9 @@ function LlmEvaluationBox({ candidate, llmProvider, onEvaluated }: { candidate: 
   if (!candidate.transcription) return <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3 text-xs text-slate-500">{t("main.aiRequiresTranscription")}</div>;
   if (!statusChecked) return <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3 text-xs text-slate-500">{t("main.aiNotConfigured")}</div>;
 
-  const handleEvaluate = async () => {
-    if (!candidate.transcription) return;
-    setIsLoading(true); setError(null);
-    try {
-      const response = await fetch("/api/transcription/summarize", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ segments: candidate.transcription.segments }) });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data?.error ?? "LLM evaluation failed");
-      onEvaluated(data);
-    } catch (err) { setError(err instanceof Error ? err.message : "LLM error"); }
-    finally { setIsLoading(false); }
-  };
-
   return (
     <div>
-      <button type="button" onClick={handleEvaluate} disabled={isLoading}
+      <button type="button" onClick={() => sendEvaluate(false)} disabled={isLoading}
         className="w-full rounded-xl border border-amber-200/40 bg-amber-300/10 px-3 py-2 text-xs font-semibold text-amber-50 transition hover:bg-amber-300/20 disabled:cursor-not-allowed disabled:opacity-40">
         {isLoading ? t("main.aiEvaluating") : t("main.aiEvaluateButton")}
       </button>

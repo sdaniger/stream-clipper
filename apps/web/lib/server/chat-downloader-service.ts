@@ -161,32 +161,56 @@ const chatCache = new ChatLruCache();
 /**
  * Get cached messages from in-memory LRU cache.
  * Falls back to filesystem cache.
+ *
+ * Tries both the current key (`<videoId>.rechat.json`) and the legacy
+ * `v` prefix used by an older version of the pipeline (`v<videoId>.rechat.json`).
+ * If a legacy file is found, it is migrated to the new key so future
+ * lookups are instant.
  */
 export async function getCachedChat(videoId: string): Promise<ChatLogEntry[] | null> {
   // 1. Check in-memory LRU
   const memCached = chatCache.get(videoId);
   if (memCached) return memCached;
 
-  // 2. Check filesystem cache
-  try {
-    const mediaPaths = getMediaPaths();
-    const cacheDir = path.join(mediaPaths.mediaRoot, "cache", "comments");
-    const cacheFilePath = path.join(cacheDir, `${videoId}.rechat.json`);
-    const fileStat = await stat(cacheFilePath);
+  // 2. Check filesystem cache (try current key, then legacy `v` prefix).
+  const mediaPaths = getMediaPaths();
+  const cacheDir = path.join(mediaPaths.mediaRoot, "cache", "comments");
+  const candidatePaths = [
+    path.join(cacheDir, `${videoId}.rechat.json`),
+    path.join(cacheDir, `v${videoId}.rechat.json`),
+  ];
 
-    // TTL check: 7 days
-    if (Date.now() - fileStat.mtimeMs > CACHE_TTL_MS) {
-      try { await unlink(cacheFilePath); } catch {}
-      return null;
-    }
+  for (const cacheFilePath of candidatePaths) {
+    try {
+      const fileStat = await stat(cacheFilePath);
 
-    const content = await readFile(cacheFilePath, "utf8");
-    const messages: ChatLogEntry[] = JSON.parse(content);
-    if (messages.length > 0) {
-      chatCache.set(videoId, messages);
-      return messages;
+      // TTL check: 7 days
+      if (Date.now() - fileStat.mtimeMs > CACHE_TTL_MS) {
+        try { await unlink(cacheFilePath); } catch {}
+        continue;
+      }
+
+      const content = await readFile(cacheFilePath, "utf8");
+      const messages: ChatLogEntry[] = JSON.parse(content);
+      if (messages.length > 0) {
+        // Migrate legacy `v` prefix to the new key so subsequent lookups are O(1).
+        const isLegacy = cacheFilePath.includes(`${path.sep}v${videoId}.rechat.json`);
+        if (isLegacy) {
+          const newPath = path.join(cacheDir, `${videoId}.rechat.json`);
+          try {
+            await writeFile(newPath, content, "utf8");
+            await unlink(cacheFilePath).catch(() => {});
+          } catch {
+            // Best-effort migration; ignore failures.
+          }
+        }
+        chatCache.set(videoId, messages);
+        return messages;
+      }
+    } catch {
+      // Try next candidate.
     }
-  } catch {}
+  }
   return null;
 }
 
@@ -197,13 +221,17 @@ export async function setCachedChat(videoId: string, messages: ChatLogEntry[]): 
   // 1. Save to in-memory LRU
   chatCache.set(videoId, messages);
 
-  // 2. Save to filesystem (compact JSON for speed and size)
+  // 2. Save to filesystem (compact JSON for speed and size).
+  // Also remove any legacy `v` prefix file so the cache directory doesn't
+  // accumulate duplicates.
   try {
     const mediaPaths = getMediaPaths();
     const cacheDir = path.join(mediaPaths.mediaRoot, "cache", "comments");
     await mkdir(cacheDir, { recursive: true });
     const cacheFilePath = path.join(cacheDir, `${videoId}.rechat.json`);
     await writeFile(cacheFilePath, JSON.stringify(messages), "utf8");
+    const legacyPath = path.join(cacheDir, `v${videoId}.rechat.json`);
+    await unlink(legacyPath).catch(() => {});
   } catch {}
 }
 

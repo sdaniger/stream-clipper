@@ -7,6 +7,123 @@ import { getMediaPaths, probeVideo } from "@/lib/server/media-service";
 
 const execFileAsync = promisify(execFile);
 
+// ── Metadata cache ──────────────────────────────────────────────────
+// In-memory LRU-style cache with 1-hour TTL. Avoids redundant yt-dlp
+// or GQL calls when the same URL is analysed multiple times.
+const metadataCache = new Map<string, { data: YtDlpMetadata; ts: number }>();
+const METADATA_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+function getCachedMetadata(url: string): YtDlpMetadata | null {
+  const entry = metadataCache.get(url);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > METADATA_CACHE_TTL_MS) {
+    metadataCache.delete(url);
+    return null;
+  }
+  return entry.data;
+}
+
+function setCachedMetadata(url: string, data: YtDlpMetadata): void {
+  // Cap cache size at 100 entries
+  if (metadataCache.size > 100) {
+    const oldest = metadataCache.keys().next().value;
+    if (oldest) metadataCache.delete(oldest);
+  }
+  metadataCache.set(url, { data, ts: Date.now() });
+}
+
+// ── Twitch GQL direct metadata ──────────────────────────────────────
+// Bypasses yt-dlp entirely — fetches VOD metadata via Twitch's internal
+// GQL API in ~200ms vs 5-30s for yt-dlp.
+const TWITCH_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko";
+const TWITCH_GQL_URL = "https://gql.twitch.tv/gql";
+
+type TwitchGqlVideoResult = {
+  data: {
+    video: {
+      id: string;
+      title: string;
+      lengthSeconds: number;
+      viewCount: number;
+      createdAt: string;
+      thumbnailHash: string | null;
+      owner: { displayName: string; login: string } | null;
+    } | null;
+  } | null;
+};
+
+function extractTwitchVideoId(url: string): string | null {
+  const m = url.match(/(?:twitch\.tv\/videos?|twitch\.tv\/\w+\/video)\/(\d+)/i);
+  return m?.[1] ?? null;
+}
+
+async function fetchTwitchMetadataViaGQL(url: string, signal?: AbortSignal): Promise<YtDlpMetadata | null> {
+  const videoId = extractTwitchVideoId(url);
+  if (!videoId) return null;
+
+  try {
+    const query = [{
+      operationName: "VideoMetadata",
+      variables: { videoId },
+      query: `query VideoMetadata($videoId: ID!) {
+        video(id: $videoId) {
+          id
+          title
+          lengthSeconds
+          viewCount
+          createdAt
+          thumbnailHash
+          owner { displayName login }
+        }
+      }`
+    }];
+
+    // Combine caller-provided abort signal with our internal 10s timeout.
+    const internalTimeout = AbortSignal.timeout(10_000);
+    const combinedSignal = signal
+      ? AbortSignal.any([signal, internalTimeout])
+      : internalTimeout;
+
+    const res = await fetch(TWITCH_GQL_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/plain;charset=UTF-8",
+        "Client-ID": TWITCH_CLIENT_ID,
+        "Origin": "https://www.twitch.tv",
+        "Referer": "https://www.twitch.tv/",
+      },
+      body: JSON.stringify(query),
+      signal: combinedSignal,
+    });
+
+    if (!res.ok) return null;
+    const json = await res.json() as TwitchGqlVideoResult;
+    const video = json.data?.video;
+    if (!video) return null;
+
+    const thumbnail = video.thumbnailHash
+      ? `https://static-cdn.jtvnw.net/cf_vods/d1m7jfoe9zdc1jn438ta7joiev/keys/thumb/thumb-${video.thumbnailHash}-320x180.jpg`
+      : null;
+
+    return {
+      source: "yt_dlp_url",
+      url,
+      id: video.id,
+      title: video.title,
+      uploader: video.owner?.displayName ?? null,
+      durationSeconds: video.lengthSeconds,
+      duration: formatSeconds(video.lengthSeconds),
+      webpageUrl: `https://www.twitch.tv/videos/${video.id}`,
+      thumbnail,
+      extractor: "twitch",
+      isLive: false,
+      commandPreview: "Twitch GQL (direct)",
+    };
+  } catch {
+    return null;
+  }
+}
+
 export type YtDlpProgressEvent = {
   percent: number;
   speed: string;
@@ -18,6 +135,7 @@ export type VideoSourceType = "local_file" | "yt_dlp_url" | "future_platform_api
 
 export type YtDlpMetadataInput = {
   url: string;
+  signal?: AbortSignal;
 };
 
 export type YtDlpDownloadInput = {
@@ -77,23 +195,78 @@ type RawYtDlpMetadata = {
 
 export async function extractYtDlpMetadata(input: YtDlpMetadataInput): Promise<YtDlpMetadata> {
   const url = validateUrl(input.url);
-  const args = ["--dump-json", "--skip-download", "--no-playlist", url];
 
-  try {
-    const { stdout } = await execFileAsync("yt-dlp", args, { timeout: 90_000, maxBuffer: 16 * 1024 * 1024 });
-    const firstLine = stdout.split(/\r?\n/).find((line) => line.trim());
-    if (!firstLine) {
-      throw new Error("yt-dlp returned empty metadata output.");
-    }
+  // 1. Check in-memory cache
+  const cached = getCachedMetadata(url);
+  if (cached) return cached;
 
-    return normalizeYtDlpMetadata(JSON.parse(firstLine) as RawYtDlpMetadata, url, `yt-dlp ${args.map(shellQuote).join(" ")}`);
-  } catch (error) {
-    if (error instanceof SyntaxError) {
-      throw new Error(`yt-dlp metadata JSON could not be parsed: ${error.message}`);
-    }
-
-    throw new Error(`yt-dlp metadata extraction failed: ${formatExecError(error)}. Install it with \`pip install yt-dlp\` and confirm \`yt-dlp\` is on PATH.`);
+  // Short-circuit on abort before doing any network work.
+  if (input.signal?.aborted) {
+    throw new DOMException("yt-dlp metadata extraction was cancelled.", "AbortError");
   }
+
+  // 2. For Twitch URLs, try GQL first (~200ms vs 5-30s for yt-dlp)
+  const isTwitch = /twitch\.tv/i.test(url);
+  if (isTwitch) {
+    const gqlResult = await fetchTwitchMetadataViaGQL(url, input.signal);
+    if (gqlResult) {
+      setCachedMetadata(url, gqlResult);
+      return gqlResult;
+    }
+  }
+
+  // 3. Fallback to yt-dlp
+  const args = ["--dump-json", "--skip-download", "--no-playlist", "--socket-timeout", "15", url];
+  const MAX_RETRIES = 2;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    // Check abort between retries so the caller's cancel propagates quickly.
+    if (input.signal?.aborted) {
+      throw new DOMException("yt-dlp metadata extraction was cancelled.", "AbortError");
+    }
+
+    try {
+      const { stdout } = await execFileAsync("yt-dlp", args, { timeout: 90_000, maxBuffer: 16 * 1024 * 1024, signal: input.signal });
+      const firstLine = stdout.split(/\r?\n/).find((line) => line.trim());
+      if (!firstLine) {
+        throw new Error("yt-dlp returned empty metadata output.");
+      }
+
+      const metadata = normalizeYtDlpMetadata(JSON.parse(firstLine) as RawYtDlpMetadata, url, `yt-dlp ${args.map(shellQuote).join(" ")}`);
+      setCachedMetadata(url, metadata);
+      return metadata;
+    } catch (error) {
+      // If the caller aborted, propagate immediately without retries.
+      if (error instanceof DOMException && error.name === "AbortError") {
+        throw error;
+      }
+
+      const isTransient = error instanceof Error && (
+        error.message.includes("handshake") ||
+        error.message.includes("timed out") ||
+        error.message.includes("ETIMEDOUT") ||
+        error.message.includes("ECONNRESET") ||
+        error.message.includes("ECONNREFUSED") ||
+        error.message.includes("SSL")
+      );
+
+      if (isTransient && attempt < MAX_RETRIES) {
+        await new Promise<void>((r) => {
+          const t = setTimeout(r, 2000 * (attempt + 1));
+          input.signal?.addEventListener("abort", () => { clearTimeout(t); r(); }, { once: true });
+        });
+        continue;
+      }
+
+      if (error instanceof SyntaxError) {
+        throw new Error(`yt-dlp metadata JSON could not be parsed: ${error.message}`);
+      }
+
+      throw new Error(`yt-dlp metadata extraction failed: ${formatExecError(error)}. Install it with \`pip install yt-dlp\` and confirm \`yt-dlp\` is on PATH.`);
+    }
+  }
+
+  throw new Error("yt-dlp metadata extraction failed after retries.");
 }
 
 export async function downloadVideoWithYtDlp(input: YtDlpDownloadInput): Promise<YtDlpDownloadedVideo> {
@@ -455,7 +628,6 @@ export async function downloadSectionWithYtDlp(input: YtDlpSectionInput): Promis
     "-o", outputTemplate,
     "--print", "after_move:filepath",
     "--download-sections", `*${startStr}-${endStr}`,
-    "--force-keyframes-at-cuts",
     url,
   ];
 
@@ -488,3 +660,5 @@ export async function downloadSectionsParallel(
     )
   );
 }
+
+
