@@ -11,6 +11,7 @@ import {
   type DanmakuDensity,
   type DanmakuExportOptions,
   type DanmakuExportResponse,
+  type DanmakuExportSource,
 } from "@/lib/studio-api";
 import TwitchVodPlayer, { type TwitchVodPlayerHandle } from "@/components/studio/TwitchVodPlayer";
 import LocalVideoPlayer, { type LocalVideoPlayerHandle } from "@/components/studio/LocalVideoPlayer";
@@ -162,6 +163,28 @@ export default function StudioClient() {
   const [danmakuDeduplicate, setDanmakuDeduplicate] = useState(true);
   // Danmaku export track (which candidates have been danmaku-exported)
   const [danmakuExportedIds, setDanmakuExportedIds] = useState<Set<string | number>>(new Set());
+  // Danmaku export source selection
+  const [exportSource, setExportSource] = useState<DanmakuExportSource>(
+    typeof window === "undefined" ? "twitch_vod" : (localStorage.getItem("danmaku-source") as DanmakuExportSource) || "twitch_vod",
+  );
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("danmaku-source", exportSource);
+    } catch {}
+  }, [exportSource]);
+
+  // Default to twitch_vod when we have a VOD URL and no local file.
+  // Default to local_file when we have a local file but no VOD URL.
+  // Default to ass_only when neither is available.
+  useEffect(() => {
+    if (mode === "twitch" && videoId && exportSource === "local_file") {
+      setExportSource("twitch_vod");
+    }
+    if (mode === "local" && videoPath.trim() && exportSource === "twitch_vod" && !videoId) {
+      setExportSource("local_file");
+    }
+  }, [mode, videoId, videoPath, exportSource]);
 
   // Player refs
   const localPlayerRef = useRef<LocalVideoPlayerHandle>(null);
@@ -482,24 +505,48 @@ export default function StudioClient() {
       addLog("error", "候補が選択されていません");
       return;
     }
-    if (!canExport) {
-      addLog("error", "弾幕付きmp4出力にはローカル動画ファイルが必要です");
-      setErrorMessage("弾幕付きmp4出力にはローカル動画ファイルが必要です");
-      return;
+    // Validate per-source requirements
+    const hasVod = mode === "twitch" && !!videoId;
+    const hasLocal = mode === "local" && videoPath.trim().length > 0;
+    if (kind !== "ass") {
+      // MP4 export requires either VOD or local file
+      if (exportSource === "twitch_vod" && !hasVod) {
+        addLog("error", "Twitch VOD sourceの選択にはVOD URLが必要です");
+        setErrorMessage("Twitch VOD sourceの選択にはVOD URLが必要です");
+        return;
+      }
+      if (exportSource === "local_file" && !hasLocal) {
+        addLog("error", "Local file sourceの選択にはローカル動画ファイルが必要です");
+        setErrorMessage("ローカル動画ファイルパスを入力してください");
+        return;
+      }
+      if (exportSource !== "twitch_vod" && exportSource !== "local_file") {
+        addLog("error", "MP4出力にはTwitch VODまたはlocal_file sourceが必要です");
+        return;
+      }
+    } else {
+      // ASS only: needs a candidate only
     }
     setDanmakuExporting(kind);
     setDanmakuLastResult(null);
     setErrorMessage(null);
     const start = getStart(selectedCandidate);
     const end = getEnd(selectedCandidate);
-    addLog("user", `候補 #${selectedCandidate.rank} を選択: ${formatTimecode(start)} - ${formatTimecode(end)}`);
+    addLog("user", `Export source: ${exportSource}`);
+    addLog("user", `選択範囲: ${formatTimecode(start)} - ${formatTimecode(end)}`);
     addLog("user", `範囲内コメントを抽出: ${chatInRange.length}件`);
 
     try {
       if (kind === "with") {
+        if (exportSource === "twitch_vod") {
+          addLog("info", "Twitch VODから選択範囲を取得中...");
+        }
         addLog("info", "弾幕ASSを生成中...");
         const result = await exportDanmakuClip({
-          video_path: videoPath,
+          source: exportSource as "twitch_vod" | "local_file",
+          video_path: exportSource === "local_file" ? videoPath : null,
+          vod_url: exportSource === "twitch_vod" ? vodUrl : null,
+          video_id: exportSource === "twitch_vod" ? videoId : null,
           candidate: selectedCandidate,
           chat: chatInRange,
           options: { ...options, with_danmaku: true },
@@ -508,7 +555,19 @@ export default function StudioClient() {
           addLog("error", `弾幕出力失敗: ${result.message ?? "Unknown error"}`);
           setErrorMessage(result.message ?? "弾幕出力に失敗しました");
           setDanmakuLastResult(result);
+          // If fallback is suggested, log it
+          if (result.fallback) {
+            const f = result.fallback;
+            const opts = [];
+            if (f.local_file) opts.push("ローカル動画");
+            if (f.twitch_vod) opts.push("Twitch VOD (再試行)");
+            if (f.ass_only) opts.push("ASSのみ");
+            if (opts.length > 0) addLog("warn", `フォールバック可能: ${opts.join(" / ")}`);
+          }
         } else {
+          if (result.temporary_video_file) {
+            addLog("user", `一時動画取得: ${result.temporary_video_file}`);
+          }
           addLog("user", `弾幕として使用: ${result.comment_count}件`);
           addLog("user", `ASS生成完了: ${result.ass_file}`);
           addLog("info", "FFmpegで弾幕付き動画を書き出し中...");
@@ -517,9 +576,15 @@ export default function StudioClient() {
           setDanmakuExportedIds((prev) => new Set(prev).add(selectedCandidate.id ?? selectedCandidate.rank));
         }
       } else if (kind === "without") {
+        if (exportSource === "twitch_vod") {
+          addLog("info", "Twitch VODから選択範囲を取得中...");
+        }
         addLog("info", "弾幕なしで範囲のみを切り出し中...");
         const result = await exportDanmakuClip({
-          video_path: videoPath,
+          source: exportSource as "twitch_vod" | "local_file",
+          video_path: exportSource === "local_file" ? videoPath : null,
+          vod_url: exportSource === "twitch_vod" ? vodUrl : null,
+          video_id: exportSource === "twitch_vod" ? videoId : null,
           candidate: selectedCandidate,
           chat: [],
           options: { ...options, with_danmaku: false },
@@ -528,6 +593,14 @@ export default function StudioClient() {
           addLog("error", `書き出し失敗: ${result.message ?? "Unknown error"}`);
           setErrorMessage(result.message ?? "書き出しに失敗しました");
           setDanmakuLastResult(result);
+          if (result.fallback) {
+            const f = result.fallback;
+            const opts = [];
+            if (f.local_file) opts.push("ローカル動画");
+            if (f.twitch_vod) opts.push("Twitch VOD (再試行)");
+            if (f.ass_only) opts.push("ASSのみ");
+            if (opts.length > 0) addLog("warn", `フォールバック可能: ${opts.join(" / ")}`);
+          }
         } else {
           addLog("user", `弾幕なし書き出し完了: ${result.output_file}`);
           setDanmakuLastResult(result);
@@ -539,7 +612,7 @@ export default function StudioClient() {
           chat: chatInRange,
           clip_start: start,
           clip_end: end,
-          output_path: `${videoPath.replace(/[^/]+$/, "")}clip_${Date.now()}_${selectedCandidate.rank}.ass`,
+          output_path: `output/clip_${Date.now()}_${selectedCandidate.rank}.ass`,
           options,
         });
         if (!result.ok) {
@@ -549,6 +622,7 @@ export default function StudioClient() {
           addLog("user", `ASS生成完了: ${result.ass_path} (${result.comment_count}件使用)`);
           setDanmakuLastResult({
             ok: true,
+            source: "ass_only",
             ass_file: result.ass_path,
             comment_count: result.comment_count,
             in_range_count: result.in_range_count,
@@ -836,15 +910,18 @@ export default function StudioClient() {
             />
           )}
 
-          {/* Danmaku export panel - only useful when a local video is available */}
+          {/* Danmaku export panel - works for Twitch VOD / Local file / ASS only */}
           {selectedCandidate && (
             <DanmakuPanel
               candidate={selectedCandidate}
               chatInRange={chatInRange}
               hasLocalVideo={canExport}
+              hasVodUrl={mode === "twitch" && !!videoId}
               localVideoPath={videoPath}
               isExporting={danmakuExporting}
               lastResult={danmakuLastResult}
+              exportSource={exportSource}
+              setExportSource={setExportSource}
               onExportWithDanmaku={(opts) => handleDanmakuExport("with", opts)}
               onExportWithoutDanmaku={() => handleDanmakuExport("without", { with_danmaku: false })}
               onExportAssOnly={(opts) => handleDanmakuExport("ass", opts)}

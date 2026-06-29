@@ -1,14 +1,19 @@
 import { NextResponse } from "next/server";
-import { exportDanmakuClip, type DanmakuOptions } from "@/lib/server/danmaku-service";
+import { exportDanmakuClip, type DanmakuOptions, type DanmakuExportSource } from "@/lib/server/danmaku-service";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-// Danmaku export can take a while (extract + ASS + burn).
+// Danmaku export can take a while (extract + ASS + burn + Twitch range fetch).
 export const maxDuration = 1800;
 
 type RequestBody = {
-  video_path?: string;
+  source?: DanmakuExportSource;
+  // For source == "local_file"
+  video_path?: string | null;
+  // For source == "twitch_vod"
+  vod_url?: string | null;
   video_id?: string | null;
+  // Common
   candidate?: {
     rank?: number;
     start?: number;
@@ -28,6 +33,7 @@ type RequestBody = {
     output_dir?: string;
     with_danmaku?: boolean;
     fast?: boolean;
+    format?: string;
   };
   // Allow the caller to override the clip range (e.g. after "Set from current")
   edited_start?: number;
@@ -45,19 +51,33 @@ export async function POST(request: Request) {
     );
   }
 
-  // 1. Validate video path
-  if (typeof body.video_path !== "string" || !body.video_path.trim()) {
+  // 1. Resolve source
+  const source: DanmakuExportSource =
+    body.source ?? (body.vod_url ? "twitch_vod" : (body.video_path ? "local_file" : "ass_only"));
+
+  // 2. Validate per-source requirements
+  if (source === "local_file" && (typeof body.video_path !== "string" || !body.video_path.trim())) {
     return NextResponse.json(
       {
         ok: false,
         error_code: "LOCAL_VIDEO_REQUIRED",
-        message: "弾幕付きmp4出力にはローカル動画ファイルが必要です。",
+        message: "ローカル動画ファイルのパスを指定してください。",
+      },
+      { status: 400 },
+    );
+  }
+  if (source === "twitch_vod" && (typeof body.vod_url !== "string" || !body.vod_url.trim())) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error_code: "VOD_URL_REQUIRED",
+        message: "Twitch VOD URLが必要です。",
       },
       { status: 400 },
     );
   }
 
-  // 2. Validate candidate
+  // 3. Validate candidate
   const c = body.candidate;
   if (!c || typeof c !== "object") {
     return NextResponse.json(
@@ -78,7 +98,7 @@ export async function POST(request: Request) {
     );
   }
 
-  // 3. Validate chat
+  // 4. Validate chat
   const chat = Array.isArray(body.chat) ? body.chat : [];
   const normalizedChat = chat
     .map((m) => ({
@@ -89,9 +109,12 @@ export async function POST(request: Request) {
     }))
     .filter((m) => m.message.length > 0);
 
-  // 4. Run export
+  // 5. Run export
   const result = await exportDanmakuClip({
-    video_path: body.video_path,
+    source,
+    video_path: body.video_path ?? null,
+    vod_url: body.vod_url ?? null,
+    video_id: body.video_id ?? null,
     chat: normalizedChat,
     clip_start: clipStart,
     clip_end: clipEnd,
@@ -101,6 +124,11 @@ export async function POST(request: Request) {
     options: body.options,
   });
 
-  const status = result.ok ? 200 : (result.error_code === "LOCAL_VIDEO_REQUIRED" ? 400 : 500);
+  // Status code by error type
+  const status = result.ok
+    ? 200
+    : result.error_code === "LOCAL_VIDEO_REQUIRED" || result.error_code === "VOD_URL_REQUIRED" || result.error_code === "CANDIDATE_REQUIRED" || result.error_code === "INVALID_RANGE" || result.error_code === "INVALID_JSON"
+      ? 400
+      : 500;
   return NextResponse.json(result, { status });
 }

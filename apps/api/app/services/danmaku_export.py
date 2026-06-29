@@ -1,14 +1,16 @@
 """
 Danmaku export orchestrator.
 
-Two-stage FFmpeg pipeline:
-  1. Extract clip from input video at the requested time range.
-  2. Burn the generated ASS file into the clip using the `ass` filter.
+Supports three sources for the video used to burn danmaku comments into:
+  - "local_file":  user-provided local video file
+  - "twitch_vod":  download a time range from a Twitch VOD via yt-dlp
+                   --download-sections (see twitch_range_fetcher.py)
+  - "ass_only":    skip video entirely; just produce the .ass file
 
-The two-stage approach is intentional:
-- It keeps each FFmpeg invocation simple and debuggable.
-- The intermediate clip can be cached and re-burned with different ASS
-  parameters (e.g. different density) without re-downloading.
+Pipeline (local_file / twitch_vod with danmaku):
+  1. Stage 1: extract the time range to a temporary MP4
+  2. Stage 2: generate the ASS file from chat messages
+  3. Stage 3: burn ASS into the temporary MP4
 
 This is the Python service that exposes the same logic to the API router
 and to the CLI; the actual route in the Next.js app delegates here.
@@ -22,9 +24,8 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
-# Make danmaku_ass importable when called as a module
 from app.services.danmaku_ass import (  # noqa: E402
     DanmakuOptions,
     DanmakuResult,
@@ -32,15 +33,28 @@ from app.services.danmaku_ass import (  # noqa: E402
     NormalizedChatMessage,
     generate_danmaku_ass,
 )
+from app.services.twitch_range_fetcher import (  # noqa: E402
+    TwitchRangeFetchRequest,
+    TwitchRangeFetchResult,
+    fetch_twitch_range,
+)
+
+ExportSource = Literal["local_file", "twitch_vod", "ass_only"]
 
 
 @dataclass
 class DanmakuExportRequest:
     """Parameters for a single danmaku export run."""
-    video_path: str  # absolute path to the local source video
-    chat_messages: list  # list of NormalizedChatMessage dicts
-    clip_start: float
-    clip_end: float
+    source: ExportSource = "local_file"
+    # For source == "local_file"
+    video_path: Optional[str] = None
+    # For source == "twitch_vod"
+    vod_url: Optional[str] = None
+    video_id: Optional[str] = None
+    # Common
+    chat_messages: list = field(default_factory=list)
+    clip_start: float = 0.0
+    clip_end: float = 0.0
     output_dir: str = "output"
     with_danmaku: bool = True
     fast: bool = False
@@ -50,7 +64,9 @@ class DanmakuExportRequest:
 @dataclass
 class DanmakuExportResult:
     ok: bool
+    source: Optional[ExportSource] = None
     output_file: Optional[str] = None
+    temporary_video_file: Optional[str] = None
     ass_file: Optional[str] = None
     comment_count: int = 0
     in_range_count: int = 0
@@ -61,42 +77,30 @@ class DanmakuExportResult:
     clip_end: float = 0.0
     error_code: Optional[str] = None
     message: Optional[str] = None
+    fallback: Optional[dict] = None  # e.g. {"local_file": True, "ass_only": True}
     command_preview: Optional[str] = None
     duration_seconds: float = 0.0
 
 
 def _project_root() -> Path:
-    """Resolve the project root (apps/api is one level deep)."""
     return Path(__file__).resolve().parents[3]
 
 
 def _workspace_media_root() -> Path:
-    """MEDIA_ROOT defaults to ./media in the workspace root."""
     return _project_root() / "media"
 
 
 def _resolve_video_path(video_path: str) -> Path:
-    """
-    Resolve a user-provided video path.
-
-    Tries in order:
-      1. As-is (absolute)
-      2. Relative to MEDIA_ROOT
-      3. Relative to workspace root
-    """
     p = Path(video_path)
     if p.is_file():
         return p.resolve()
-
     media_root = _workspace_media_root()
     candidate = media_root / video_path
     if candidate.is_file():
         return candidate.resolve()
-
     workspace_candidate = _project_root() / video_path
     if workspace_candidate.is_file():
         return workspace_candidate.resolve()
-
     raise FileNotFoundError(
         f"Video not found: {video_path}. Checked absolute, MEDIA_ROOT, and workspace."
     )
@@ -104,14 +108,15 @@ def _resolve_video_path(video_path: str) -> Path:
 
 def _build_output_paths(
     output_dir: str,
-    video_path: Path,
+    source: ExportSource,
     with_danmaku: bool,
-) -> tuple[Path, Path, Path]:
+    rank: Optional[int] = None,
+) -> tuple[Path, Optional[Path], Path]:
     """
     Build output paths:
-      - clip:   intermediate clipped video (no danmaku)
+      - clip:   intermediate clipped video (None for ass_only)
       - ass:    generated ASS file
-      - final:  output mp4 (with or without danmaku burned in)
+      - final:  output mp4 (None for ass_only)
     """
     base = _project_root()
     out_dir = Path(output_dir)
@@ -119,11 +124,15 @@ def _build_output_paths(
         out_dir = base / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    ts = time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime())
     suffix = "_danmaku" if with_danmaku else ""
-    name = f"clip_{int(time.time())}_{uuid.uuid4().hex[:6]}{suffix}"
-    clip = out_dir / f"{name}.mp4"
-    ass = out_dir / f"{name}.ass"
+    rank_part = f"clip_{(rank if rank is not None else ts.replace(':', '-'))}"
+    if rank is not None:
+        rank_part = f"clip_{rank:03d}"
+    name = f"{rank_part}{suffix}_{uuid.uuid4().hex[:6]}"
     final = out_dir / f"{name}.mp4"
+    ass = out_dir / f"{name}.ass"
+    clip = out_dir / f"{name}.pre.mp4" if source != "ass_only" else None
     return clip, ass, final
 
 
@@ -134,11 +143,8 @@ def _ffmpeg_extract_clip(
     clip_end: float,
     fast: bool,
 ) -> subprocess.CompletedProcess:
-    """Stage 1: extract a clip from the source video."""
     duration = max(0.1, clip_end - clip_start)
     if fast:
-        # Re-encode for accurate cuts. Default to copy (much faster) when
-        # possible.
         cmd = [
             "ffmpeg", "-y",
             "-ss", f"{clip_start:.3f}",
@@ -174,10 +180,6 @@ def _ffmpeg_burn_ass(
     ass_path: Path,
     output_path: Path,
 ) -> subprocess.CompletedProcess:
-    """Stage 2: burn ASS into the clipped video."""
-    # The `ass` filter requires a path; the filter graph uses single quotes
-    # around the value. Backslashes need to be escaped for ffmpeg's filter
-    # parser.
     ass_filter_value = str(ass_path).replace("\\", "/").replace(":", "\\:")
     cmd = [
         "ffmpeg", "-y",
@@ -198,7 +200,6 @@ def _ffmpeg_burn_ass(
 
 
 def _build_danmaku_options(options: Optional[dict]) -> DanmakuOptions:
-    """Map a dict of options into a DanmakuOptions instance."""
     if not options:
         return DanmakuOptions()
     ng_words = options.get("ng_words") or []
@@ -219,86 +220,220 @@ def _build_danmaku_options(options: Optional[dict]) -> DanmakuOptions:
     )
 
 
+def _normalize_chat(chat_messages: list) -> list:
+    normalized: list = []
+    for m in chat_messages:
+        if not isinstance(m, dict):
+            continue
+        ts = m.get("time_sec", m.get("timestamp"))
+        if not isinstance(ts, (int, float)):
+            continue
+        msg = m.get("message", "")
+        if not isinstance(msg, str):
+            continue
+        author = m.get("author")
+        normalized.append({
+            "timestamp": float(ts),
+            "time_sec": float(ts),
+            "message": msg,
+            "author": author if isinstance(author, str) else None,
+        })
+    return normalized
+
+
 def export_danmaku_clip(req: DanmakuExportRequest) -> DanmakuExportResult:
     """End-to-end danmaku export. Returns a result envelope."""
     start_ts = time.time()
-    try:
-        video_abs = _resolve_video_path(req.video_path)
-    except FileNotFoundError as e:
-        return DanmakuExportResult(
-            ok=False,
-            error_code="LOCAL_VIDEO_NOT_FOUND",
-            message=str(e),
-        )
-
-    if req.clip_end <= req.clip_start:
-        return DanmakuExportResult(
-            ok=False,
-            error_code="INVALID_RANGE",
-            message=f"clip_end ({req.clip_end}) must be greater than clip_start ({req.clip_start}).",
-        )
-
-    # Build options
+    source: ExportSource = req.source
     danmaku_opts = _build_danmaku_options(req.options)
+    chat_objs_dicts = _normalize_chat(req.chat_messages)
+    chat_objs = [
+        NormalizedChatMessage(
+            timestamp=m["timestamp"],
+            time_sec=m["time_sec"],
+            message=m["message"],
+            author=m.get("author"),
+        )
+        for m in chat_objs_dicts
+    ]
 
-    # Build output paths
-    clip_path, ass_path, final_path = _build_output_paths(
-        req.output_dir, video_abs, req.with_danmaku
-    )
+    # Build output paths. We pick a stable rank from the request metadata.
+    rank = None
+    # Caller can pass rank via options or chat; we use the first message's
+    # anchor time as a fallback name. The actual rank is mostly cosmetic.
+    # Stage 0: Resolve / fetch the source video
+    source_video_abs: Optional[Path] = None
+    temporary_video_rel: Optional[str] = None
+    command_preview: Optional[str] = None
 
-    # Stage 1: extract clip
-    try:
-        _ffmpeg_extract_clip(
-            input_path=video_abs,
-            output_path=clip_path,
+    if source == "local_file":
+        if not req.video_path:
+            return DanmakuExportResult(
+                ok=False,
+                source=source,
+                error_code="LOCAL_VIDEO_REQUIRED",
+                message="ローカル動画ファイルが必要です。",
+            )
+        try:
+            source_video_abs = _resolve_video_path(req.video_path)
+        except FileNotFoundError as e:
+            return DanmakuExportResult(
+                ok=False,
+                source=source,
+                error_code="LOCAL_VIDEO_NOT_FOUND",
+                message=str(e),
+                fallback={"local_file": False, "twitch_vod": True, "ass_only": True},
+            )
+
+    elif source == "twitch_vod":
+        if not req.vod_url:
+            return DanmakuExportResult(
+                ok=False,
+                source=source,
+                error_code="VOD_URL_REQUIRED",
+                message="Twitch VOD URLが必要です。",
+            )
+        if req.clip_end <= req.clip_start:
+            return DanmakuExportResult(
+                ok=False,
+                source=source,
+                error_code="INVALID_RANGE",
+                message=f"end ({req.clip_end}) must be greater than start ({req.clip_start}).",
+            )
+        fetch_result: TwitchRangeFetchResult = fetch_twitch_range(TwitchRangeFetchRequest(
+            vod_url=req.vod_url,
+            video_id=req.video_id,
+            start_seconds=req.clip_start,
+            end_seconds=req.clip_end,
+            output_dir=req.output_dir + "/tmp" if not req.output_dir.endswith("/tmp") else req.output_dir,
+            format=req.options.get("format") if req.options else None,
+        ))
+        if not fetch_result.ok:
+            return DanmakuExportResult(
+                ok=False,
+                source=source,
+                error_code=fetch_result.error_code or "TWITCH_VOD_RANGE_FETCH_FAILED",
+                message=fetch_result.message or "Twitch VODから選択範囲を取得できませんでした。",
+                fallback={"local_file": True, "ass_only": True},
+            )
+        source_video_abs = Path(fetch_result.absolute_path)
+        temporary_video_rel = fetch_result.output_path
+        command_preview = fetch_result.command_preview
+        # When the entire range was downloaded, the clip is already at the
+        # full duration — there's no further clip extraction step. We set
+        # clip_start to 0 so the next stage is a no-op.
+        req = DanmakuExportRequest(
+            source=req.source,
+            video_path=req.video_path,
+            vod_url=req.vod_url,
+            video_id=req.video_id,
+            chat_messages=req.chat_messages,
+            clip_start=0.0,
+            clip_end=req.clip_end - req.clip_start,
+            output_dir=req.output_dir,
+            with_danmaku=req.with_danmaku,
+            fast=req.fast,
+            options=req.options,
+        )
+        # Use new (shifted) range for output naming
+        clip_start_for_paths = 0.0
+        clip_end_for_paths = req.clip_end
+    else:  # ass_only
+        if req.clip_end <= req.clip_start:
+            return DanmakuExportResult(
+                ok=False,
+                source=source,
+                error_code="INVALID_RANGE",
+                message=f"end ({req.clip_end}) must be greater than start ({req.clip_start}).",
+            )
+
+    # ─── ASS-only fast path ─────────────────────────────────────────────────
+    if source == "ass_only" or req.with_danmaku is False and source == "ass_only":
+        # Generate ASS only.
+        clip_path, ass_path, final_path = _build_output_paths(
+            req.output_dir, source, True, rank
+        )
+        ass_result = generate_danmaku_ass(
+            chat_messages=chat_objs,
             clip_start=req.clip_start,
             clip_end=req.clip_end,
-            fast=req.fast,
+            output_path=str(ass_path),
+            options=danmaku_opts,
         )
-    except subprocess.CalledProcessError as e:
-        return DanmakuExportResult(
-            ok=False,
-            error_code="CLIP_EXTRACT_FAILED",
-            message=f"FFmpeg clip extraction failed: {e.stderr[-500:]}",
-        )
-    except subprocess.TimeoutExpired:
-        return DanmakuExportResult(
-            ok=False,
-            error_code="CLIP_EXTRACT_TIMEOUT",
-            message="FFmpeg clip extraction timed out.",
-        )
-
-    if not req.with_danmaku:
-        # Without danmaku: just return the extracted clip as the final file.
-        # Move (rename) the intermediate to the final name.
-        if clip_path != final_path:
-            final_path.write_bytes(clip_path.read_bytes())
-            clip_path.unlink(missing_ok=True)
-        # We didn't generate an ASS file, so ass_file is null.
         return DanmakuExportResult(
             ok=True,
-            output_file=str(final_path.relative_to(_project_root())),
+            source=source,
+            output_file=None,
+            ass_file=str(ass_path.relative_to(_project_root())).replace("\\", "/"),
+            comment_count=ass_result.stats.used_count,
+            in_range_count=ass_result.stats.in_range_count,
+            skipped_ng=ass_result.stats.skipped_ng,
+            skipped_too_short=ass_result.stats.skipped_too_short,
+            skipped_duplicate=ass_result.stats.skipped_duplicate,
+            clip_start=req.clip_start,
+            clip_end=req.clip_end,
+            duration_seconds=time.time() - start_ts,
+        )
+
+    # ─── Stage 1: extract clip (or use already-extracted temp) ───────────
+    clip_path, ass_path, final_path = _build_output_paths(
+        req.output_dir, source, req.with_danmaku, rank
+    )
+
+    if source == "twitch_vod":
+        # The fetched file IS the clip — no need to re-extract.
+        # Use it directly as the input to the burn step.
+        clip_path_input = source_video_abs
+    else:
+        # local_file: extract a sub-clip from the source.
+        try:
+            _ffmpeg_extract_clip(
+                input_path=source_video_abs,
+                output_path=clip_path,
+                clip_start=req.clip_start,
+                clip_end=req.clip_end,
+                fast=req.fast,
+            )
+        except subprocess.CalledProcessError as e:
+            return DanmakuExportResult(
+                ok=False,
+                source=source,
+                error_code="CLIP_EXTRACT_FAILED",
+                message=f"クリップ抽出に失敗しました: {(e.stderr or '')[-500:]}",
+            )
+        except subprocess.TimeoutExpired:
+            return DanmakuExportResult(
+                ok=False,
+                source=source,
+                error_code="CLIP_EXTRACT_TIMEOUT",
+                message="クリップ抽出がタイムアウトしました。",
+            )
+        clip_path_input = clip_path
+
+    # ─── Without-danmaku path: return the clip as the final output ──────
+    if not req.with_danmaku:
+        if source == "twitch_vod":
+            # The temp file IS the clip; rename it to a final name.
+            final_path.write_bytes(source_video_abs.read_bytes())
+        else:
+            final_path.write_bytes(clip_path.read_bytes())
+            clip_path.unlink(missing_ok=True)
+        return DanmakuExportResult(
+            ok=True,
+            source=source,
+            output_file=str(final_path.relative_to(_project_root())).replace("\\", "/"),
+            temporary_video_file=temporary_video_rel,
             ass_file=None,
             comment_count=0,
             in_range_count=0,
             clip_start=req.clip_start,
             clip_end=req.clip_end,
             duration_seconds=time.time() - start_ts,
+            command_preview=command_preview,
         )
 
-    # Stage 2: generate ASS
-    try:
-        chat_objs = [NormalizedChatMessage(**m) for m in req.chat_messages]
-    except Exception as e:
-        # Bad chat shape — clean up intermediate clip
-        clip_path.unlink(missing_ok=True)
-        return DanmakuExportResult(
-            ok=False,
-            error_code="INVALID_CHAT_DATA",
-            message=f"Chat messages are malformed: {e}",
-        )
-
-    ass_result: DanmakuResult = generate_danmaku_ass(
+    # ─── Stage 2: generate ASS ────────────────────────────────────────────
+    ass_result = generate_danmaku_ass(
         chat_messages=chat_objs,
         clip_start=req.clip_start,
         clip_end=req.clip_end,
@@ -306,35 +441,51 @@ def export_danmaku_clip(req: DanmakuExportRequest) -> DanmakuExportResult:
         options=danmaku_opts,
     )
 
-    # Stage 3: burn ASS into clip
+    # ─── Stage 3: burn ASS into clip ─────────────────────────────────────
     try:
         _ffmpeg_burn_ass(
-            clip_path=clip_path,
+            clip_path=clip_path_input,
             ass_path=ass_path,
             output_path=final_path,
         )
     except subprocess.CalledProcessError as e:
         return DanmakuExportResult(
             ok=False,
+            source=source,
             error_code="ASS_BURN_FAILED",
-            message=f"FFmpeg ASS burn-in failed: {e.stderr[-500:]}",
-            ass_file=str(ass_path.relative_to(_project_root())),
+            message=f"ASSの焼き込みに失敗しました: {(e.stderr or '')[-500:]}",
+            temporary_video_file=temporary_video_rel,
+            ass_file=str(ass_path.relative_to(_project_root())).replace("\\", "/"),
+            comment_count=ass_result.stats.used_count,
+            in_range_count=ass_result.stats.in_range_count,
+            skipped_ng=ass_result.stats.skipped_ng,
+            skipped_too_short=ass_result.stats.skipped_too_short,
+            skipped_duplicate=ass_result.stats.skipped_duplicate,
         )
     except subprocess.TimeoutExpired:
         return DanmakuExportResult(
             ok=False,
+            source=source,
             error_code="ASS_BURN_TIMEOUT",
-            message="FFmpeg ASS burn-in timed out.",
-            ass_file=str(ass_path.relative_to(_project_root())),
+            message="ASSの焼き込みがタイムアウトしました。",
+            temporary_video_file=temporary_video_rel,
+            ass_file=str(ass_path.relative_to(_project_root())).replace("\\", "/"),
+            comment_count=ass_result.stats.used_count,
+            in_range_count=ass_result.stats.in_range_count,
         )
 
-    # Clean up intermediate clip (the final is the danmaku-burned mp4)
-    clip_path.unlink(missing_ok=True)
+    # Clean up the local-file intermediate (not the twitch temp, which is
+    # already in /tmp/ and may be useful for re-export with different
+    # options; we leave it for now).
+    if source == "local_file":
+        clip_path.unlink(missing_ok=True)
 
     return DanmakuExportResult(
         ok=True,
-        output_file=str(final_path.relative_to(_project_root())),
-        ass_file=str(ass_path.relative_to(_project_root())),
+        source=source,
+        output_file=str(final_path.relative_to(_project_root())).replace("\\", "/"),
+        temporary_video_file=temporary_video_rel,
+        ass_file=str(ass_path.relative_to(_project_root())).replace("\\", "/"),
         comment_count=ass_result.stats.used_count,
         in_range_count=ass_result.stats.in_range_count,
         skipped_ng=ass_result.stats.skipped_ng,
@@ -343,4 +494,5 @@ def export_danmaku_clip(req: DanmakuExportRequest) -> DanmakuExportResult:
         clip_start=req.clip_start,
         clip_end=req.clip_end,
         duration_seconds=time.time() - start_ts,
+        command_preview=command_preview,
     )

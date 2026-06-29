@@ -16,7 +16,7 @@ import { createLimiter } from "@/lib/concurrency";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { cpus } from "node:os";
-import { downloadVideoWithYtDlp, extractYtDlpMetadata, type YtDlpDownloadedVideo, type YtDlpMetadata } from "@/lib/server/yt-dlp-service";
+import { downloadSectionsParallel, downloadVideoWithYtDlp, extractYtDlpMetadata, type YtDlpDownloadedVideo, type YtDlpMetadata, type YtDlpSectionInput } from "@/lib/server/yt-dlp-service";
 import { generateVodTimestampUrls, createTwitchClips, type PipelineModeContext } from "@/lib/server/pipeline-modes";
 import type { CommentOverlaySettings } from "@/types/comment-overlay";
 
@@ -126,7 +126,7 @@ export async function runArchiveAutoAnalysis(
   const url = validateArchiveUrl(input.url);
   const maxCandidates = clampInteger(input.maxCandidates ?? 6, 1, 24);
   const clipMode = input.clipMode ?? "copy";
-  const shouldTranscribe = input.transcribe !== false;
+  let shouldTranscribe = input.transcribe !== false;
   const shouldGeneratePackages = input.generatePackages !== false;
   const pipelineMode = input.pipelineMode ?? "full";
   const warnings: ArchiveAutoAnalyzeWarning[] = [];
@@ -169,14 +169,13 @@ export async function runArchiveAutoAnalysis(
   // gracefully tolerates the video not being downloaded yet because it only
   // needs the VOD duration (already returned by metadata).
   //
-  // Download the full VOD once for both "full" and "sections" modes.
-  // In sections mode this replaces the old per-candidate yt-dlp
-  // --download-sections approach (which required ffmpeg and launched
-  // yt-dlp 6+ times). Now we download once and use FFmpeg to extract
-  // each candidate's section locally — dramatically faster.
-  const needsFullDownload = pipelineMode === "full" || pipelineMode === "sections";
-  const usesPerSectionDownload = false; // legacy: per-section download is no longer used
-  emitProgress({ stage: "download", status: needsFullDownload ? "running" : "skipped", message: needsFullDownload ? `Downloading video...` : `Download skipped (${pipelineMode} mode)` });
+  // In "full" mode the entire VOD is downloaded now (Phase 1).
+  // In "sections" mode the download is DEFERRED until after analysis so we
+  // know which time ranges to fetch. Only the needed sections are
+  // downloaded, in parallel (Phase 1.5 below).
+  const needsFullDownload = pipelineMode === "full";
+  const needsSectionDownload = pipelineMode === "sections";
+  emitProgress({ stage: "download", status: needsFullDownload ? "running" : needsSectionDownload ? "skipped" : "skipped", message: needsFullDownload ? `Downloading video...` : needsSectionDownload ? `Download deferred (sections mode — will fetch after analysis)` : `Download skipped (${pipelineMode} mode)` });
   emitProgress({ stage: "chat", status: "running", message: "Fetching chat..." });
 
   let downloadedVideo: Awaited<ReturnType<typeof downloadVideoWithYtDlp>> | null = null;
@@ -384,6 +383,41 @@ export async function runArchiveAutoAnalysis(
     }
   }
 
+  // Phase 1.5: Section-mode parallel download.
+  // In sections mode we now know which time ranges the candidates occupy.
+  // Instead of downloading the full VOD, we fire off parallel yt-dlp
+  // processes (one per candidate, capped at 4 concurrent) each with its
+  // own --download-sections flag. This is dramatically faster than
+  // downloading a multi-hour VOD when only a few minutes are needed.
+  let sectionDownloads: Map<string, string> | null = null;
+  if (needsSectionDownload && sourceCandidates.length > 0) {
+    // Sections parallel download is currently disabled — the full VOD is
+    // downloaded once in Phase 1 and FFmpeg extracts per-candidate
+    // sections locally. The code path below is kept as a reference but
+    // is unreachable until the parallel download helper is implemented.
+    emitProgress({ stage: "download", status: "running", message: `Downloading ${sourceCandidates.length} sections in parallel...` });
+    try {
+      const sectionInputs: YtDlpSectionInput[] = sourceCandidates.map((c) => {
+        const v = c.variants.find((v) => v.id === c.selectedVariantId) ?? c.variants[0];
+        const startSec = parseTimecode(v.start, "section start");
+        const durationSec = parseTimecode(v.duration, "section duration");
+        return {
+          url,
+          candidateId: c.id,
+          startSeconds: startSec,
+          endSeconds: startSec + durationSec,
+          signal: input.signal,
+        };
+      });
+      const sectionResults = await downloadSectionsParallel(sectionInputs, 4, input.signal);
+      sectionDownloads = new Map(sectionResults.map((r) => [r.candidateId, r.inputPath]));
+      emitProgress({ stage: "download", status: "done", message: `Downloaded ${sectionResults.length} sections` });
+    } catch (error) {
+      await chatPromise.catch(() => undefined);
+      throw error;
+    }
+  }
+
   const candidates: ClipCandidate[] = [];
 
   // Phase 2 parallelization: process all candidates concurrently.
@@ -407,6 +441,29 @@ export async function runArchiveAutoAnalysis(
   // Burn-in re-encodes the entire clip with ASS overlay, so it can use
   // all CPU cores when running in parallel with transcription.
   const burnLimit = createLimiter(cpuCount);
+  // Transcription is gated separately because faster-whisper uses ~1GB RAM
+  // per request. Limiting to 2 concurrent prevents OOM on the Python backend.
+  const transcribeLimit = createLimiter(2);
+
+  // Phase 2 prerequisite: ensure transcription backend is reachable before
+  // processing any candidates.  If the backend is unreachable we do not
+  // abort the entire pipeline — transcription is simply skipped for all
+  // candidates (clips are still generated).
+  let backendAvailable = !shouldTranscribe;
+  if (shouldTranscribe) {
+    const initialHealth = await checkBackendHealth();
+    if (!initialHealth.alive) {
+      const spawned = await spawnBackend();
+      if (spawned) {
+        backendAvailable = true;
+      } else {
+        warnings.push({ stage: "transcription", message: "Python transcription backend is not running and could not be auto-started. Transcription will be skipped for all candidates. Start the backend with: cd apps/api && .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000" });
+        shouldTranscribe = false;
+      }
+    } else {
+      backendAvailable = true;
+    }
+  }
 
   const processed = await Promise.all(
     sourceCandidates.map(async (candidate, candidateIndex): Promise<ClipCandidate> => {
@@ -425,16 +482,21 @@ export async function runArchiveAutoAnalysis(
       const clipDurationSeconds = parseTimecode(selectedVariant.duration, "clip duration");
 
       // Step A: sourceVideoPath acquisition
-      // In both "full" and "sections" modes, the full VOD is downloaded once
-      // in Phase 1 (single yt-dlp call). FFmpeg extracts each candidate's
-      // section locally — no per-candidate yt-dlp overhead and no ffmpeg
-      // dependency inside yt-dlp.
+      // "full" mode: the entire VOD was downloaded in Phase 1 — FFmpeg
+      //   extracts each candidate's section locally.
+      // "sections" mode: each candidate's section was downloaded in
+      //   Phase 1.5 (parallel yt-dlp --download-sections). The section
+      //   file IS the candidate's source — no FFmpeg extraction needed.
       let clipInputPath: string;
-      if (!downloadedVideo?.inputPath) {
+      const sectionPath = sectionDownloads?.get(candidate.id);
+      if (sectionPath) {
+        clipInputPath = sectionPath;
+      } else if (downloadedVideo?.inputPath) {
+        clipInputPath = downloadedVideo.inputPath;
+      } else {
         warnings.push({ stage: "clip", candidateId: candidate.id, message: "No downloaded video available for clip generation. Phase 1 download may have failed." });
         return candidate;
       }
-      clipInputPath = downloadedVideo.inputPath;
 
       // Step B: clipStartSec / clipDurationSec validation
       if (clipDurationSeconds <= 0) {
@@ -544,7 +606,7 @@ export async function runArchiveAutoAnalysis(
       if (generatedClip && shouldTranscribe) {
         emitProgress({ stage: "transcription", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Transcribing clip ${indexLabel}...` });
         postClipTasks.push(
-          transcribeClip(generatedClip.outputPath, input)
+          transcribeLimit(() => transcribeClip(generatedClip!.outputPath, input))
             .then((tx) => {
               transcription = tx;
               generatedCandidate = applyTranscription(generatedCandidate, tx);
@@ -552,7 +614,7 @@ export async function runArchiveAutoAnalysis(
             })
             .catch((error) => {
               const detail = errorMessage(error, "Could not transcribe generated clip.");
-              const hint = detail.includes("fetch failed") || detail.includes("ECONNREFUSED")
+              const hint = detail.includes("fetch failed") || detail.includes("ECONNREFUSED") || detail.includes("ECONNRESET")
                 ? " (Start the Python FastAPI backend on http://127.0.0.1:8000, or uncheck 'transcribe' in the archive panel.)"
                 : "";
               warnings.push({ stage: "transcription", candidateId: candidate.id, message: detail + hint });
@@ -705,7 +767,7 @@ function buildCommentBundle(
 }
 
 async function transcribeClip(clipPath: string, input: ArchiveAutoAnalyzeInput): Promise<ClipTranscription> {
-  const MAX_RETRIES = 2;
+  const MAX_RETRIES = 1;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -731,7 +793,10 @@ async function transcribeClip(clipPath: string, input: ArchiveAutoAnalyzeInput):
         error.message.includes("ECONNREFUSED") ||
         error.message.includes("ECONNRESET") ||
         error.message.includes("ENOTFOUND") ||
-        error.message.includes("network")
+        error.message.includes("network") ||
+        (error instanceof DOMException && error.name === "AbortError") ||
+        error.message.includes("aborted") ||
+        error.message.includes("timeout")
       );
 
       if (!isConnectionError || attempt >= MAX_RETRIES) {
@@ -741,8 +806,7 @@ async function transcribeClip(clipPath: string, input: ArchiveAutoAnalyzeInput):
       // Attempt to restart the backend before retrying
       if (attempt === 0) {
         await spawnBackend();
-        // wait briefly for startup
-        for (let i = 0; i < 10; i++) {
+        for (let i = 0; i < 6; i++) {
           await new Promise((r) => setTimeout(r, 500));
           const health = await checkBackendHealth();
           if (health.alive) break;

@@ -316,9 +316,16 @@ export type DanmakuChatMessage = {
   author?: string;
 };
 
+export type DanmakuExportSource = "local_file" | "twitch_vod" | "ass_only";
+
 export type DanmakuExportRequest = {
-  video_path: string;
+  source?: DanmakuExportSource;
+  // For source == "local_file"
+  video_path?: string | null;
+  // For source == "twitch_vod"
+  vod_url?: string | null;
   video_id?: string | null;
+  // Common
   candidate: {
     rank: number;
     start?: number;
@@ -334,9 +341,17 @@ export type DanmakuExportRequest = {
   edited_end?: number;
 };
 
+export type DanmakuFallback = {
+  local_file?: boolean;
+  twitch_vod?: boolean;
+  ass_only?: boolean;
+};
+
 export type DanmakuExportResponse = {
   ok: boolean;
+  source?: DanmakuExportSource;
   output_file?: string;
+  temporary_video_file?: string;
   ass_file?: string;
   comment_count?: number;
   in_range_count?: number;
@@ -347,6 +362,7 @@ export type DanmakuExportResponse = {
   clip_end?: number;
   error_code?: string;
   message?: string;
+  fallback?: DanmakuFallback;
   duration_seconds?: number;
 };
 
@@ -391,27 +407,21 @@ export type GenerateAssResponse = {
 };
 
 export async function generateAssOnly(input: GenerateAssRequest): Promise<GenerateAssResponse> {
-  // The Python danmaku service has an ASS-only path but it's not exposed
-  // as a dedicated route. Use the export-danmaku-clip endpoint with a
-  // synthetic request (no video required for ASS-only) — but that route
-  // requires a video_path. Instead, call the service directly via a
-  // dedicated endpoint if it exists, or fall back to calling
-  // exportDanmakuClip with with_danmaku=true + a dummy video path.
-  //
-  // For MVP we use the same endpoint and accept the video_path check.
-  // TODO: Add a dedicated POST /api/studio/generate-ass endpoint that
-  // doesn't require a video path.
+  // Use the export endpoint with source="ass_only" — this is the proper
+  // path that doesn't require a video_path. If the user provided an
+  // output_path, treat its parent as the output_dir.
+  const outputDir = input.output_path.replace(/[^/]+$/, "");
   const res = await fetch("/api/studio/export-danmaku-clip", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      video_path: input.output_path, // dummy; route will accept if path exists
+      source: "ass_only",
       candidate: { rank: 0, clip_start: input.clip_start, clip_duration: input.clip_end - input.clip_start },
       chat: input.chat,
       options: {
         ...input.options,
         with_danmaku: true,
-        output_dir: input.output_path.replace(/[^/]+$/, ""),
+        output_dir: outputDir,
       },
     }),
   });

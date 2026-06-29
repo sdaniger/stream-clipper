@@ -16,6 +16,7 @@ import { createReadStream, existsSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { getMediaRoot, getMediaPaths } from "@/lib/server/media-service";
+import { fetchTwitchRange } from "@/lib/server/twitch-range-fetcher";
 
 const execFileAsync = promisify(execFile);
 
@@ -64,8 +65,16 @@ export type DanmakuGenerateResult = {
   stats: DanmakuStats;
 };
 
+export type DanmakuExportSource = "local_file" | "twitch_vod" | "ass_only";
+
 export type DanmakuExportRequest = {
-  video_path: string;
+  source?: DanmakuExportSource;
+  // For source == "local_file"
+  video_path?: string | null;
+  // For source == "twitch_vod"
+  vod_url?: string | null;
+  video_id?: string | null;
+  // Common
   chat: NormalizedChatMessage[];
   clip_start: number;
   clip_end: number;
@@ -77,7 +86,9 @@ export type DanmakuExportRequest = {
 
 export type DanmakuExportResult = {
   ok: boolean;
+  source?: DanmakuExportSource;
   output_file?: string;
+  temporary_video_file?: string;
   ass_file?: string;
   comment_count?: number;
   in_range_count?: number;
@@ -88,6 +99,7 @@ export type DanmakuExportResult = {
   clip_end?: number;
   error_code?: string;
   message?: string;
+  fallback?: { local_file?: boolean; twitch_vod?: boolean; ass_only?: boolean };
   command_preview?: string;
   duration_seconds?: number;
 };
@@ -441,6 +453,7 @@ function resolveVideoPath(videoPath: string): string {
 function buildOutputPaths(
   outputDir: string,
   withDanmaku: boolean,
+  source: DanmakuExportSource = "local_file",
 ): { finalPath: string; clipPath: string; assPath: string; baseName: string } {
   const paths = getMediaPaths();
   const base = paths.mediaRoot;
@@ -450,7 +463,8 @@ function buildOutputPaths(
   }
   const ts = new Date().toISOString().replaceAll(":", "-").replace(/\.\d{3}Z$/, "Z");
   const suffix = withDanmaku ? "_danmaku" : "";
-  const baseName = `clip_${ts}${suffix}`;
+  const srcTag = source === "twitch_vod" ? "_vod" : source === "ass_only" ? "_ass" : "";
+  const baseName = `clip${srcTag}_${ts}${suffix}`;
   const finalPath = path.join(outDir, `${baseName}.mp4`);
   const clipPath = path.join(outDir, `${baseName}.pre.mp4`);
   const assPath = path.join(outDir, `${baseName}.ass`);
@@ -554,52 +568,162 @@ async function ffmpegBurnAss(
 
 export async function exportDanmakuClip(req: DanmakuExportRequest): Promise<DanmakuExportResult> {
   const start = Date.now();
+  const source: DanmakuExportSource = req.source ?? (req.vod_url ? "twitch_vod" : "local_file");
+  const withDanmaku = req.with_danmaku !== false;
+
+  // Validate range up front
+  if (req.clip_end <= req.clip_start) {
+    return {
+      ok: false,
+      source,
+      error_code: "INVALID_RANGE",
+      message: `clip_end (${req.clip_end}) must be greater than clip_start (${req.clip_start})`,
+    };
+  }
+
   try {
-    // 1. Resolve video path
-    const videoAbs = resolveVideoPath(req.video_path);
-    if (!existsSync(videoAbs)) {
-      return {
-        ok: false,
-        error_code: "LOCAL_VIDEO_REQUIRED",
-        message: `弾幕付きmp4出力にはローカル動画ファイルが必要です (path: ${req.video_path})`,
-      };
+    // ── ASS-only path: skip video entirely ───────────────────────────────
+    if (source === "ass_only" || !withDanmaku) {
+      if (source === "ass_only" || (source === "twitch_vod" && !withDanmaku)) {
+        // Just generate the ASS file.
+        const opts = normalizeOptions(req.options);
+        const generated = generateDanmakuAss({
+          chat: req.chat,
+          clip_start: req.clip_start,
+          clip_end: req.clip_end,
+          options: opts,
+        });
+        const assContent = (generated as any)._assContent as string;
+        const { assPath, finalPath } = buildOutputPaths(
+          req.output_dir ?? "output",
+          withDanmaku,
+          source,
+        );
+        await mkdir(path.dirname(assPath), { recursive: true });
+        await writeFile(assPath, assContent, "utf8");
+
+        if (withDanmaku) {
+          return {
+            ok: true,
+            source,
+            output_file: undefined,
+            ass_file: toRelativeIfPossible(assPath),
+            comment_count: generated.stats.used_count,
+            in_range_count: generated.stats.in_range_count,
+            skipped_ng: generated.stats.skipped_ng,
+            skipped_too_short: generated.stats.skipped_too_short,
+            skipped_duplicate: generated.stats.skipped_duplicate,
+            clip_start: req.clip_start,
+            clip_end: req.clip_end,
+            duration_seconds: (Date.now() - start) / 1000,
+          };
+        }
+        // withDanmaku=false: we still need a video for the final. Fall
+        // through to the normal pipeline below — but for ass_only this
+        // is an error state.
+      }
+      if (source === "ass_only") {
+        return {
+          ok: false,
+          source,
+          error_code: "ASS_ONLY_NO_VIDEO",
+          message: "ASS-only mode で弾幕なし出力はできません。",
+        };
+      }
     }
 
-    if (req.clip_end <= req.clip_start) {
-      return {
-        ok: false,
-        error_code: "INVALID_RANGE",
-        message: `clip_end (${req.clip_end}) must be greater than clip_start (${req.clip_start})`,
-      };
-    }
-
-    // 2. Build paths
+    // ── Build output paths once ────────────────────────────────────────
     const { finalPath, clipPath, assPath } = buildOutputPaths(
       req.output_dir ?? "output",
-      req.with_danmaku !== false,
+      withDanmaku,
+      source,
     );
     await mkdir(path.dirname(finalPath), { recursive: true });
 
-    // 3. Extract clip (stage 1)
-    try {
-      await ffmpegExtractClip(videoAbs, clipPath, req.clip_start, req.clip_end, req.fast ?? false);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "Unknown FFmpeg error";
-      return {
-        ok: false,
-        error_code: "CLIP_EXTRACT_FAILED",
-        message: `クリップ抽出に失敗しました: ${msg}`,
-      };
+    // ── Resolve the source video ────────────────────────────────────────
+    let videoInputPath: string;
+    let temporaryVideoFile: string | undefined;
+
+    if (source === "twitch_vod") {
+      if (!req.vod_url) {
+        return {
+          ok: false,
+          source,
+          error_code: "VOD_URL_REQUIRED",
+          message: "Twitch VOD URLが必要です。",
+        };
+      }
+      const fetchResult = await fetchTwitchRange({
+        vod_url: req.vod_url,
+        video_id: req.video_id ?? null,
+        start_seconds: req.clip_start,
+        end_seconds: req.clip_end,
+        output_dir: "output/tmp",
+      });
+      if (!fetchResult.ok) {
+        return {
+          ok: false,
+          source,
+          error_code: fetchResult.error_code || "TWITCH_VOD_RANGE_FETCH_FAILED",
+          message: fetchResult.message || "Twitch VODから選択範囲を取得できませんでした。",
+          fallback: { local_file: true, twitch_vod: false, ass_only: true },
+        };
+      }
+      videoInputPath = fetchResult.absolute_path!;
+      temporaryVideoFile = fetchResult.output_path;
+      // The fetched file IS the full range; no further clip extraction.
+    } else {
+      if (!req.video_path) {
+        return {
+          ok: false,
+          source,
+          error_code: "LOCAL_VIDEO_REQUIRED",
+          message: "ローカル動画ファイルが必要です。",
+        };
+      }
+      videoInputPath = resolveVideoPath(req.video_path);
+      if (!existsSync(videoInputPath)) {
+        return {
+          ok: false,
+          source,
+          error_code: "LOCAL_VIDEO_NOT_FOUND",
+          message: `ローカル動画ファイルが見つかりません: ${req.video_path}`,
+          fallback: { local_file: false, twitch_vod: true, ass_only: true },
+        };
+      }
     }
 
-    // 4. If danmaku disabled, just rename the clip as the final
-    if (req.with_danmaku === false) {
-      // Move clip → final
-      await writeFile(finalPath, await import("node:fs").then((fs) => fs.promises.readFile(clipPath)));
-      await unlink(clipPath).catch(() => {});
+    // ── If danmaku disabled, just produce the video clip ──────────────
+    if (!withDanmaku) {
+      if (source === "twitch_vod") {
+        // The temp file IS the clip — copy it to the final path.
+        await writeFile(finalPath, await import("node:fs").then((fs) => fs.promises.readFile(videoInputPath)));
+      } else {
+        try {
+          await ffmpegExtractClip(
+            videoInputPath,
+            clipPath,
+            req.clip_start,
+            req.clip_end,
+            req.fast ?? false,
+          );
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : "Unknown FFmpeg error";
+          return {
+            ok: false,
+            source,
+            error_code: "CLIP_EXTRACT_FAILED",
+            message: `クリップ抽出に失敗しました: ${msg}`,
+          };
+        }
+        await writeFile(finalPath, await import("node:fs").then((fs) => fs.promises.readFile(clipPath)));
+        await unlink(clipPath).catch(() => {});
+      }
       return {
         ok: true,
+        source,
         output_file: toRelativeIfPossible(finalPath),
+        temporary_video_file: temporaryVideoFile,
         comment_count: 0,
         in_range_count: 0,
         clip_start: req.clip_start,
@@ -608,7 +732,7 @@ export async function exportDanmakuClip(req: DanmakuExportRequest): Promise<Danm
       };
     }
 
-    // 5. Generate ASS (stage 2)
+    // ── Generate ASS ───────────────────────────────────────────────────
     const opts = normalizeOptions(req.options);
     const generated = generateDanmakuAss({
       chat: req.chat,
@@ -619,15 +743,43 @@ export async function exportDanmakuClip(req: DanmakuExportRequest): Promise<Danm
     const assContent = (generated as any)._assContent as string;
     await writeFile(assPath, assContent, "utf8");
 
-    // 6. Burn ASS into clip (stage 3)
+    // ── Burn ASS into the source video ────────────────────────────────
+    let burnInput = videoInputPath;
+    if (source === "local_file") {
+      // For local_file: extract a sub-clip first, then burn ASS into it.
+      try {
+        await ffmpegExtractClip(
+          videoInputPath,
+          clipPath,
+          req.clip_start,
+          req.clip_end,
+          req.fast ?? false,
+        );
+        burnInput = clipPath;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : "Unknown FFmpeg error";
+        return {
+          ok: false,
+          source,
+          error_code: "CLIP_EXTRACT_FAILED",
+          message: `クリップ抽出に失敗しました: ${msg}`,
+          ass_file: toRelativeIfPossible(assPath),
+        };
+      }
+    }
+    // For twitch_vod: burnInput is the already-fetched temp file (the
+    // full range), so we just burn into it.
+
     try {
-      await ffmpegBurnAss(clipPath, assPath, finalPath);
+      await ffmpegBurnAss(burnInput, assPath, finalPath);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Unknown FFmpeg error";
       return {
         ok: false,
+        source,
         error_code: "ASS_BURN_FAILED",
         message: `弾幕の焼き込みに失敗しました: ${msg}`,
+        temporary_video_file: temporaryVideoFile,
         ass_file: toRelativeIfPossible(assPath),
         comment_count: generated.stats.used_count,
         in_range_count: generated.stats.in_range_count,
@@ -637,15 +789,16 @@ export async function exportDanmakuClip(req: DanmakuExportRequest): Promise<Danm
       };
     }
 
-    // 7. Cleanup intermediate clip
-    await unlink(clipPath).catch(() => {});
-
-    // 8. Get final size
-    const finalStat = await stat(finalPath).catch(() => null);
+    // Cleanup intermediate clip (only for local_file)
+    if (source === "local_file") {
+      await unlink(clipPath).catch(() => {});
+    }
 
     return {
       ok: true,
+      source,
       output_file: toRelativeIfPossible(finalPath),
+      temporary_video_file: temporaryVideoFile,
       ass_file: toRelativeIfPossible(assPath),
       comment_count: generated.stats.used_count,
       in_range_count: generated.stats.in_range_count,
@@ -659,6 +812,7 @@ export async function exportDanmakuClip(req: DanmakuExportRequest): Promise<Danm
   } catch (e) {
     return {
       ok: false,
+      source,
       error_code: "INTERNAL_ERROR",
       message: e instanceof Error ? e.message : "Unknown internal error",
     };
