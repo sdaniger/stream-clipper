@@ -11,8 +11,9 @@ import type { ClipCandidate, ClipTranscription, GeneratedClipReference, Transcri
 import { burnCommentsIntoClip, generateClip, generateExportPackage, getMediaRoot, parseTimecode, writeCommentAssets } from "@/lib/server/media-service";
 import { proxyJsonRequest } from "@/lib/server/api-proxy";
 import { checkBackendHealth, spawnBackend } from "@/lib/server/backend-manager";
-import { fetchChatWithChatDownloader, defaultChatLimitForDuration, type FetchChatDownloaderResult } from "@/lib/server/chat-downloader-service";
+import { fetchChatWithChatDownloaderWithRetry, defaultChatLimitForDuration, getCachedChat, setCachedChat, type FetchChatDownloaderResult } from "@/lib/server/chat-downloader-service";
 import { createLimiter } from "@/lib/concurrency";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { cpus } from "node:os";
 import { downloadVideoWithYtDlp, extractYtDlpMetadata, type YtDlpDownloadedVideo, type YtDlpMetadata } from "@/lib/server/yt-dlp-service";
@@ -167,13 +168,33 @@ export async function runArchiveAutoAnalysis(
   // max(download, chat) instead of download + chat. The chat fetch
   // gracefully tolerates the video not being downloaded yet because it only
   // needs the VOD duration (already returned by metadata).
-  const needsFullDownload = pipelineMode === "full";
+  const needsFullDownload = pipelineMode === "full" || pipelineMode === "sections";
   emitProgress({ stage: "download", status: needsFullDownload ? "running" : "skipped", message: needsFullDownload ? `Downloading video...` : `Download skipped (${pipelineMode} mode)` });
   emitProgress({ stage: "chat", status: "running", message: "Fetching chat..." });
 
   let downloadedVideo: Awaited<ReturnType<typeof downloadVideoWithYtDlp>> | null = null;
   let fetchedChat!: FetchChatDownloaderResult;
+  // Check cache (in-memory LRU first, then filesystem) before fetching
+  const videoId = metadata.id ?? url.replace(/[^a-zA-Z0-9]+/g, "_").slice(0, 60);
+
+  const cachedChatMessages = await getCachedChat(videoId);
+
   const chatPromise = (async () => {
+    if (cachedChatMessages && cachedChatMessages.length > 0) {
+      emitProgress({ stage: "chat", status: "done", message: `Loaded ${cachedChatMessages.length.toLocaleString()} messages from cache` });
+      return {
+        ok: true as const,
+        result: {
+          source: "chat_downloader" as const,
+          url,
+          normalizedMessages: cachedChatMessages,
+          normalizedPath: "",
+          rawPath: "",
+          commandPreview: "cached",
+          fetchedAt: new Date().toISOString()
+        } satisfies FetchChatDownloaderResult
+      };
+    }
     try {
       const result = await fetchChatWithChatDownloaderWithRetry({
         url,
@@ -184,6 +205,8 @@ export async function runArchiveAutoAnalysis(
           emitProgress({ stage: "chat", status: "running", message: `Fetching chat... ${count.toLocaleString()} / ${maxChatMsgsLabel} messages` });
         }
       });
+      // Save to cache (in-memory LRU + filesystem compact JSON)
+      setCachedChat(videoId, result.normalizedMessages).catch(() => {});
       emitProgress({ stage: "chat", status: "done", message: `Fetched ${result.normalizedMessages.length.toLocaleString()} messages` });
       return { ok: true as const, result };
     } catch (error) {
@@ -233,6 +256,10 @@ export async function runArchiveAutoAnalysis(
       fetchedAt: new Date().toISOString()
     };
   }
+
+  // Expose fetched/cached chat messages to candidate processing for ASS
+  // generation. If chat fetch failed, this will be an empty array.
+  const cachedComments: ChatLogEntry[] = fetchedChat.normalizedMessages;
 
   // Filter chat messages to the selected time range (if specified).
   const filteredChat = hasTimeRange
@@ -369,10 +396,7 @@ export async function runArchiveAutoAnalysis(
   //      complete (needs transcription outputs + comment bundle).
   const candidateCount = sourceCandidates.length;
   const cpuCount = cpus().length;
-  // Re-encode: concurrency = cores / 2. Copy mode can use more, but
-  // we keep a conservative cap to avoid I/O thrash on HDDs.
   const clipLimit = createLimiter(cpuCount);
-  const transcribeLimit = createLimiter(4);
   const burnLimit = createLimiter(2);
 
   const processed = await Promise.all(
@@ -386,56 +410,36 @@ export async function runArchiveAutoAnalysis(
         return candidate;
       }
 
-      // Outer safety net: any unhandled error in one candidate must NOT
-      // crash the entire pipeline. If something slips past the inner
-      // try/catch blocks, this catch logs it and returns the original
-      // candidate so other candidates still get processed.
       try {
 
-      // Stage 1: clip generation (concurrency-limited)
-      const clipStartTime = Date.now();
-      emitProgress({ stage: "clip", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Generating clip for candidate ${indexLabel}...` });
+      const clipStartSeconds = parseTimecode(selectedVariant.start, "clip start");
+      const clipDurationSeconds = parseTimecode(selectedVariant.duration, "clip duration");
+
+      // Step A: sourceVideoPath existence check
+      // In both "full" and "sections" mode, the full VOD is downloaded once
+      // in Phase 1, then ffmpeg extracts each candidate's section. This avoids
+      // launching yt-dlp once per candidate (6+ calls) and removes the ffmpeg
+      // dependency that yt-dlp's --download-sections requires.
+      let clipInputPath: string;
+      if (!downloadedVideo?.inputPath) {
+        warnings.push({ stage: "clip", candidateId: candidate.id, message: "No downloaded video available for clip generation. Phase 1 download may have failed." });
+        return candidate;
+      }
+      clipInputPath = downloadedVideo.inputPath;
+
+      // Step B: clipStartSec / clipDurationSec validation
+      if (clipDurationSeconds <= 0) {
+        warnings.push({ stage: "clip", candidateId: candidate.id, message: `Invalid clip duration: ${selectedVariant.duration} (${clipDurationSeconds}s)` });
+        return candidate;
+      }
+
+      // Step C: Generate no-comment mp4
       let generatedClip: GeneratedClipReference | undefined;
-      let generatedCandidate = candidate;
-      let sectionInputPath: string | undefined;
+      let generatedCandidate: ClipCandidate = { ...candidate, sourceVideoPath: clipInputPath };
+
+      emitProgress({ stage: "clip", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Generating clip for candidate ${indexLabel}...` });
+      const clipStartTime = Date.now();
       try {
-        let clipInputPath: string;
-
-        // In sections mode, download just this section instead of using the full VOD.
-        if (pipelineMode === "sections") {
-          const { parseTimecodeToSeconds } = await import("@/lib/server/pipeline-modes");
-          const startSeconds = Math.max(0, parseTimecodeToSeconds(selectedVariant.start) - 3);
-          const endSeconds = startSeconds + parseTimecodeToSeconds(selectedVariant.duration) + 5;
-          const { downloadSectionWithYtDlp } = await import("@/lib/server/yt-dlp-service");
-          emitProgress({ stage: "clip", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Downloading section for ${indexLabel}...` });
-          const section = await downloadSectionWithYtDlp({
-            url,
-            startSeconds,
-            endSeconds,
-            candidateId: candidate.id,
-            onProgress: (p) => {
-              emitProgress({
-                stage: "clip",
-                status: "running",
-                candidateId: candidate.id,
-                candidateIndex: candidateIndex + 1,
-                candidateTotal: candidateCount,
-                message: `Downloading section for ${indexLabel} — ${p.percent.toFixed(1)}% at ${p.speed}`,
-                subProgress: p.percent,
-              });
-            },
-            signal: input.signal,
-          });
-          clipInputPath = section.inputPath;
-          sectionInputPath = section.inputPath;
-        } else {
-          clipInputPath = downloadedVideo!.inputPath;
-        }
-
-        // Store the source video path so the candidate can be re-clipped later
-        // from the LocalVideoPanel without re-downloading the entire VOD.
-        generatedCandidate = { ...generatedCandidate, sourceVideoPath: clipInputPath };
-
         generatedClip = await clipLimit(() => generateClip({
           inputPath: clipInputPath,
           candidateId: candidate.id,
@@ -453,91 +457,47 @@ export async function runArchiveAutoAnalysis(
           }
         }));
         generatedCandidate = { ...generatedCandidate, generatedClip };
-        // Fire-and-forget cleanup of the downloaded section file.
-        if (sectionInputPath) {
-          import("node:fs/promises").then(({ unlink }) =>
-            unlink(path.resolve(getMediaRoot(), sectionInputPath!)).catch(() => undefined)
-          );
-        }
         const totalElapsed = Math.round((Date.now() - clipStartTime) / 1000);
         emitProgress({ stage: "clip", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Clip generated in ${totalElapsed}s` });
       } catch (error) {
-        const clipError = errorMessage(error, "Could not generate FFmpeg clip.") + " (Transcription and comments will be skipped for this candidate)";
+        const detail = errorMessage(error, "Could not generate FFmpeg clip.");
+        const clipError = [
+          `Clip generation failed for candidate ${candidate.id}:`,
+          `  sourceUrl: ${url}`,
+          `  sourceVideoPath: ${clipInputPath}`,
+          `  variant: ${selectedVariant.start} + ${selectedVariant.duration}`,
+          `  error: ${detail}`,
+          `  (Transcription and comments will be skipped for this candidate)`
+        ].join("\n");
         warnings.push({ stage: "clip", candidateId: candidate.id, message: clipError });
         emitProgress({ stage: "clip", status: "error", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: errorMessage(error, "Clip generation failed") });
       }
 
-      // Stages 2+3 run IN PARALLEL: transcription and comments are
-      // independent — transcription hits the FastAPI backend, comments
-      // are local CPU + file I/O from already-downloaded chat data.
-      let transcription: ClipTranscription | undefined;
+      // Step D: Comment JSON check + ASS generation (optional)
+      // Comments are optional — if unavailable, we skip the ASS overlay
+      // and produce a clean clip without danmaku.
+      let commentsAssStr: string | undefined;
+      let commentsJsonStr: string | undefined;
+      let commentBundle: ReturnType<typeof createCommentExportBundle> | undefined;
 
-      // Build the precomputed clip window values (shared by both branches)
-      const clipStartSeconds = parseTimecode(selectedVariant.start, "clip start");
-      const clipDurationSeconds = parseTimecode(selectedVariant.duration, "clip duration");
-
-      // Pre-build the comment bundle ONCE — it's shared by comment assets
-      // and the export package. This avoids computing the same window filter,
-      // overlay generation, and export bundle 2-3x per candidate.
-      const commentBundle = buildCommentBundle(
-        generatedCandidate,
-        selectedVariant.duration,
-        fetchedChat.normalizedMessages,
-        clipStartSeconds,
-        clipStartSeconds + clipDurationSeconds,
-        input.commentSettings
-      );
-      const commentsJsonStr = generateCommentsJson(commentBundle);
-      const commentsAssStr = generateScrollingCommentsAss(commentBundle);
-
-      if (generatedClip) {
-        const tasks: Promise<unknown>[] = [];
-
-        // Task A: transcription (if enabled, concurrency-limited)
-        if (shouldTranscribe) {
-          emitProgress({ stage: "transcription", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Transcribing clip ${indexLabel}...` });
-          tasks.push(
-            transcribeLimit(() => transcribeClip(generatedClip!.outputPath, input))
-              .then((tx) => {
-                transcription = tx;
-                generatedCandidate = applyTranscription(generatedCandidate, tx);
-                emitProgress({ stage: "transcription", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Transcribed ${tx.segments.length} segments` });
-              })
-              .catch((error) => {
-                const detail = errorMessage(error, "Could not transcribe generated clip.");
-                const hint = detail.includes("fetch failed") || detail.includes("ECONNREFUSED")
-                  ? " (Start the Python FastAPI backend on http://127.0.0.1:8000, or uncheck 'transcribe' in the archive panel.)"
-                  : "";
-                warnings.push({ stage: "transcription", candidateId: candidate.id, message: detail + hint });
-                emitProgress({ stage: "transcription", status: "error", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: errorMessage(error, "Transcription failed") });
-              })
+      if (generatedClip && cachedComments && cachedComments.length > 0) {
+        try {
+          commentBundle = buildCommentBundle(
+            generatedCandidate,
+            selectedVariant.duration,
+            cachedComments,
+            clipStartSeconds,
+            clipStartSeconds + clipDurationSeconds,
+            input.commentSettings
           );
-        } else {
-          emitProgress({ stage: "transcription", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: "Transcription skipped (disabled in panel)" });
+          commentsJsonStr = generateCommentsJson(commentBundle);
+          commentsAssStr = generateScrollingCommentsAss(commentBundle);
+        } catch (error) {
+          warnings.push({ stage: "comments", candidateId: candidate.id, message: `Comment ASS generation failed: ${errorMessage(error, "Unknown error")}. Continuing without comments.` });
         }
-
-        // Task B: comment assets (writes pre-computed bundle to disk, parallel with transcription)
-        emitProgress({ stage: "comments", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Writing comment assets for ${indexLabel}...` });
-        tasks.push(
-          (async () => {
-            try {
-              const commentAssets = await generateCandidateCommentAssets(generatedCandidate, commentBundle);
-              generatedCandidate = { ...generatedCandidate, commentAssets, commentOverlayItems: commentBundle.comments as ClipCandidate["commentOverlayItems"] };
-              emitProgress({ stage: "comments", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Comment assets generated` });
-            } catch (error) {
-              warnings.push({ stage: "comments", candidateId: candidate.id, message: errorMessage(error, "Could not generate comment assets.") });
-              emitProgress({ stage: "comments", status: "error", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: errorMessage(error, "Comment asset generation failed") });
-            }
-          })()
-        );
-
-        await Promise.all(tasks);
       }
 
-      // Stage 3.5: comment burn-in (runs after both transcription + comments
-      // complete). The ASS content is already computed above — pass it directly
-      // to avoid a redundant file write. Errors are non-fatal: the clean clip
-      // is still usable. Controlled by the burnComments option (default: true).
+      // Step E: Comment burn-in (only if ASS was generated)
       let commentBurnedClip = generatedCandidate.commentBurnedClip;
       if (input.burnComments !== false && generatedClip && commentsAssStr && !commentBurnedClip) {
         emitProgress({ stage: "burn", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Burning comments into clip ${indexLabel}...` });
@@ -547,7 +507,7 @@ export async function runArchiveAutoAnalysis(
             clipPath: generatedClip!.outputPath,
             candidateId: candidate.id,
             variantId: selectedVariant.id,
-            assContent: commentsAssStr,
+            assContent: commentsAssStr!,
             encoder: input.encoder,
           }));
           generatedCandidate = { ...generatedCandidate, commentBurnedClip };
@@ -560,7 +520,39 @@ export async function runArchiveAutoAnalysis(
         }
       }
 
-      // Stage 4: export package (reuses pre-computed JSON/ASS strings)
+      // Transcription (parallel, if enabled)
+      let transcription: ClipTranscription | undefined;
+      if (generatedClip && shouldTranscribe) {
+        emitProgress({ stage: "transcription", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Transcribing clip ${indexLabel}...` });
+        try {
+          transcription = await transcribeClip(generatedClip.outputPath, input);
+          generatedCandidate = applyTranscription(generatedCandidate, transcription);
+          emitProgress({ stage: "transcription", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Transcribed ${transcription.segments.length} segments` });
+        } catch (error) {
+          const detail = errorMessage(error, "Could not transcribe generated clip.");
+          const hint = detail.includes("fetch failed") || detail.includes("ECONNREFUSED")
+            ? " (Start the Python FastAPI backend on http://127.0.0.1:8000, or uncheck 'transcribe' in the archive panel.)"
+            : "";
+          warnings.push({ stage: "transcription", candidateId: candidate.id, message: detail + hint });
+          emitProgress({ stage: "transcription", status: "error", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: errorMessage(error, "Transcription failed") });
+        }
+      } else if (generatedClip) {
+        emitProgress({ stage: "transcription", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: "Transcription skipped (disabled in panel)" });
+      }
+
+      // Comment assets (writes to disk for export package)
+      if (generatedClip && commentBundle) {
+        try {
+          const commentAssets = await generateCandidateCommentAssets(generatedCandidate, commentBundle);
+          generatedCandidate = { ...generatedCandidate, commentAssets, commentOverlayItems: commentBundle.comments as ClipCandidate["commentOverlayItems"] };
+          emitProgress({ stage: "comments", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Comment assets generated` });
+        } catch (error) {
+          warnings.push({ stage: "comments", candidateId: candidate.id, message: errorMessage(error, "Could not generate comment assets.") });
+          emitProgress({ stage: "comments", status: "error", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: errorMessage(error, "Comment asset generation failed") });
+        }
+      }
+
+      // Export package
       if (shouldGeneratePackages && generatedClip) {
         emitProgress({ stage: "package", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Generating editor package for ${indexLabel}...` });
         try {
@@ -571,8 +563,8 @@ export async function runArchiveAutoAnalysis(
             transcription,
             commentsJson: commentsJsonStr,
             commentsAss: commentsAssStr,
-            commentJsonFileName: commentBundle.files.jsonFileName,
-            commentAssFileName: commentBundle.files.assFileName
+            commentJsonFileName: commentBundle?.files.jsonFileName,
+            commentAssFileName: commentBundle?.files.assFileName
           });
           generatedCandidate = { ...generatedCandidate, exportPackage };
           emitProgress({ stage: "package", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Package generated` });
@@ -585,9 +577,6 @@ export async function runArchiveAutoAnalysis(
       return generatedCandidate;
 
       } catch (error) {
-        // Safety net: any unexpected error in this candidate (e.g. from
-        // parseTimecode, buildCommentBundle, or code between try blocks)
-        // is caught here so other candidates still get processed.
         const msg = errorMessage(error, "Unexpected candidate processing error");
         warnings.push({ stage: "clip", candidateId: candidate.id, message: msg });
         emitProgress({ stage: "clip", status: "error", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: errorMessage(error, "Candidate processing failed") });
@@ -844,29 +833,4 @@ function errorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
 }
 
-/**
- * Fetch chat with a single automatic retry on transient network errors
- * (fetch failed, ECONNRESET, ETIMEDOUT, etc.). Aborts and user-thrown
- * errors propagate immediately without retry.
- */
-async function fetchChatWithChatDownloaderWithRetry(
-  input: Parameters<typeof fetchChatWithChatDownloader>[0],
-  maxAttempts = 2
-): Promise<FetchChatDownloaderResult> {
-  const RETRYABLE = /(fetch failed|ECONNRESET|ETIMEDOUT|socket hang up|ENETUNREACH)/i;
-  let lastError: unknown;
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      return await fetchChatWithChatDownloader(input);
-    } catch (error) {
-      lastError = error;
-      if (error instanceof DOMException && error.name === "AbortError") throw error;
-      if (input.signal?.aborted) throw error;
-      const message = error instanceof Error ? error.message : String(error);
-      if (attempt >= maxAttempts || !RETRYABLE.test(message)) throw error;
-      // Backoff before retry
-      await new Promise((r) => setTimeout(r, 1500 * attempt));
-    }
-  }
-  throw lastError;
-}
+

@@ -1,5 +1,7 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdir, readFile, writeFile, unlink } from "node:fs/promises";
+import { mkdir, readFile, writeFile, stat, readdir, unlink } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -91,6 +93,143 @@ type RawChatDownloaderMessage = {
   };
 };
 
+// ─── LRU In-Memory Cache ─────────────────────────────────────────────────────
+
+type CacheEntry = {
+  messages: ChatLogEntry[];
+  fetchedAt: number; // Date.now()
+  accessCount: number;
+};
+
+const CACHE_MAX_ENTRIES = 10;
+const CACHE_MAX_TOTAL_BYTES = 100 * 1024 * 1024; // 100MB
+const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+class ChatLruCache {
+  private store = new Map<string, CacheEntry>();
+
+  get(videoId: string): ChatLogEntry[] | null {
+    const entry = this.store.get(videoId);
+    if (!entry) return null;
+    if (Date.now() - entry.fetchedAt > CACHE_TTL_MS) {
+      this.store.delete(videoId);
+      return null;
+    }
+    entry.accessCount++;
+    // Move to end (most recently used)
+    this.store.delete(videoId);
+    this.store.set(videoId, entry);
+    return entry.messages;
+  }
+
+  set(videoId: string, messages: ChatLogEntry[]): void {
+    // Evict LRU entries if over capacity
+    while (this.store.size >= CACHE_MAX_ENTRIES) {
+      const firstKey = this.store.keys().next().value;
+      if (firstKey !== undefined) this.store.delete(firstKey);
+    }
+
+    this.store.set(videoId, {
+      messages,
+      fetchedAt: Date.now(),
+      accessCount: 1,
+    });
+
+    // Enforce total memory cap (approximate: 1KB per message)
+    let estimatedBytes = this.store.size * messages.length * 1024;
+    while (estimatedBytes > CACHE_MAX_TOTAL_BYTES && this.store.size > 1) {
+      const firstKey = this.store.keys().next().value;
+      if (firstKey !== undefined) {
+        const removed = this.store.get(firstKey);
+        estimatedBytes -= (removed?.messages.length ?? 0) * 1024;
+        this.store.delete(firstKey);
+      } else break;
+    }
+  }
+
+  has(videoId: string): boolean {
+    return this.get(videoId) !== null;
+  }
+
+  delete(videoId: string): void {
+    this.store.delete(videoId);
+  }
+}
+
+const chatCache = new ChatLruCache();
+
+/**
+ * Get cached messages from in-memory LRU cache.
+ * Falls back to filesystem cache.
+ */
+export async function getCachedChat(videoId: string): Promise<ChatLogEntry[] | null> {
+  // 1. Check in-memory LRU
+  const memCached = chatCache.get(videoId);
+  if (memCached) return memCached;
+
+  // 2. Check filesystem cache
+  try {
+    const mediaPaths = getMediaPaths();
+    const cacheDir = path.join(mediaPaths.mediaRoot, "cache", "comments");
+    const cacheFilePath = path.join(cacheDir, `${videoId}.rechat.json`);
+    const fileStat = await stat(cacheFilePath);
+
+    // TTL check: 7 days
+    if (Date.now() - fileStat.mtimeMs > CACHE_TTL_MS) {
+      try { await unlink(cacheFilePath); } catch {}
+      return null;
+    }
+
+    const content = await readFile(cacheFilePath, "utf8");
+    const messages: ChatLogEntry[] = JSON.parse(content);
+    if (messages.length > 0) {
+      chatCache.set(videoId, messages);
+      return messages;
+    }
+  } catch {}
+  return null;
+}
+
+/**
+ * Save messages to both in-memory LRU and filesystem cache.
+ */
+export async function setCachedChat(videoId: string, messages: ChatLogEntry[]): Promise<void> {
+  // 1. Save to in-memory LRU
+  chatCache.set(videoId, messages);
+
+  // 2. Save to filesystem (compact JSON for speed and size)
+  try {
+    const mediaPaths = getMediaPaths();
+    const cacheDir = path.join(mediaPaths.mediaRoot, "cache", "comments");
+    await mkdir(cacheDir, { recursive: true });
+    const cacheFilePath = path.join(cacheDir, `${videoId}.rechat.json`);
+    await writeFile(cacheFilePath, JSON.stringify(messages), "utf8");
+  } catch {}
+}
+
+/**
+ * Evict expired cache entries on startup.
+ */
+export async function evictExpiredCache(): Promise<void> {
+  try {
+    const mediaPaths = getMediaPaths();
+    const cacheDir = path.join(mediaPaths.mediaRoot, "cache", "comments");
+    const files = await readdir(cacheDir);
+    for (const file of files) {
+      if (!file.endsWith(".rechat.json")) continue;
+      const filePath = path.join(cacheDir, file);
+      try {
+        const fileStat = await stat(filePath);
+        if (Date.now() - fileStat.mtimeMs > CACHE_TTL_MS || fileStat.size > CACHE_MAX_TOTAL_BYTES / 5) {
+          await unlink(filePath).catch(() => {});
+        }
+      } catch {}
+    }
+  } catch {}
+}
+
+// ─── Main Fetch Functions ────────────────────────────────────────────────────
+
 export async function fetchChatWithChatDownloader(input: FetchChatDownloaderInput): Promise<FetchChatDownloaderResult> {
   const url = input.url.trim();
   if (!url) {
@@ -114,13 +253,10 @@ export async function fetchChatWithChatDownloader(input: FetchChatDownloaderInpu
     : buildChatDownloaderScript(url, maxMessages);
 
   const pythonPath = isTwitch ? "python3" : await resolveChatDownloaderPython();
-  const { stdout, stderr } = await spawnPythonWithProgress(pythonScript, maxMessages, input.onProgress, pythonPath, input.signal);
+  const { stdout, stderr, rawJsonlPath } = await spawnPythonWithStreaming(pythonScript, maxMessages, input.onProgress, pythonPath, input.signal);
 
-  const rawMessages = parseJsonLines(stdout, url);
-  const normalizedMessages = rawMessages
-    .map((message, index) => normalizeChatDownloaderMessage(message, index))
-    .filter((message): message is ChatLogEntry => Boolean(message))
-    .sort((a, b) => a.timestamp_seconds - b.timestamp_seconds);
+  // Streaming parse: process JSONL line by line as they arrive
+  const normalizedMessages = await parseStreamingJsonl(rawJsonlPath, url);
 
   if (normalizedMessages.length === 0) {
     const stderrHint = stderr.trim() ? ` Stderr: ${stderr.trim().slice(0, 500)}` : "";
@@ -130,14 +266,14 @@ export async function fetchChatWithChatDownloader(input: FetchChatDownloaderInpu
   const paths = getMediaPaths();
   const timestamp = new Date().toISOString().replaceAll(":", "-").replace(/\.\d{3}Z$/, "Z");
   const baseName = `chat_downloader_${timestamp}`;
-  const rawFileName = `${baseName}.jsonl`;
   const normalizedFileName = `${baseName}.normalized.json`;
-  const rawPath = path.join("output", "chat_logs", rawFileName).replaceAll(path.sep, "/");
   const normalizedPath = path.join("output", "chat_logs", normalizedFileName).replaceAll(path.sep, "/");
+  const rawPath = path.join("output", "chat_logs", `${baseName}.jsonl`).replaceAll(path.sep, "/");
 
   await mkdir(paths.outputChatLogsDir, { recursive: true });
-  await writeFile(path.join(paths.outputChatLogsDir, rawFileName), stdout, "utf8");
-  await writeFile(path.join(paths.outputChatLogsDir, normalizedFileName), JSON.stringify(normalizedMessages, null, 2) + "\n", "utf8");
+  // Write raw JSONL (already exists from streaming, just keep reference)
+  // Write normalized as compact JSON (much faster to write + smaller)
+  await writeFile(path.join(paths.outputChatLogsDir, normalizedFileName), JSON.stringify(normalizedMessages), "utf8");
 
   return {
     source: isTwitch ? "future_platform_api" : "chat_downloader",
@@ -148,6 +284,58 @@ export async function fetchChatWithChatDownloader(input: FetchChatDownloaderInpu
     commandPreview: isTwitch ? "Python GQL (std-lib)" : `python3 -c "from chat_downloader ..."`,
     fetchedAt: new Date().toISOString()
   };
+}
+
+// ─── Streaming JSONL Parser ──────────────────────────────────────────────────
+
+/**
+ * Parse JSONL file line-by-line instead of loading all into memory.
+ * Normalizes and filters as messages arrive.
+ */
+async function parseStreamingJsonl(filePath: string, sourceUrl: string): Promise<ChatLogEntry[]> {
+  const results: ChatLogEntry[] = [];
+  let index = 0;
+
+  try {
+    const stream = createReadStream(filePath, { encoding: "utf8" });
+    const rl = createInterface({ input: stream, crlfDelay: Infinity });
+
+    for await (const line of rl) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        index++;
+        continue;
+      }
+
+      if (!parsed || typeof parsed !== "object") {
+        index++;
+        continue;
+      }
+
+      const record = parsed as Record<string, unknown>;
+
+      if (record.message_type === "data" || record.message_type === undefined) {
+        if (record.message !== undefined || record.author !== undefined) {
+          const normalized = normalizeChatDownloaderMessage(record as unknown as RawChatDownloaderMessage, index);
+          if (normalized) {
+            results.push(normalized);
+          }
+        }
+      }
+      index++;
+    }
+  } catch {
+    // File read error — return what we have
+  }
+
+  // Sort by timestamp (required for analysis)
+  results.sort((a, b) => a.timestamp_seconds - b.timestamp_seconds);
+  return results;
 }
 
 function buildChatDownloaderScript(url: string, maxMessages: number): string {
@@ -169,6 +357,8 @@ function buildChatDownloaderScript(url: string, maxMessages: number): string {
 function buildTwitchScript(url: string, maxMessages: number, durationSeconds?: number | null): string {
   const safeUrl = JSON.stringify(url);
   const duration = Math.max(1, Math.round(durationSeconds ?? 0));
+  // Dynamic thread count: 4 for short VODs, up to 16 for long ones
+  const dynamicThreads = Math.max(4, Math.min(16, Math.ceil(duration / 300)));
   return (
 `import json, re, sys, time as _time, os, urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -179,6 +369,7 @@ CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 HASH_COMMENTS = "b70a3591ff0f4e0313d126c6a1502d79a1c02baebb288227c582044aa76adf6a"
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
 DURATION = ${duration}
+THREAD_COUNT = ${dynamicThreads}
 
 def extract_vod_id(url):
     m = re.search(r'/videos?/(\\d+)', url)
@@ -250,9 +441,6 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
     segment_count = max(1, min(max_messages // 200, 100))
     comments_per_segment = max(1, max_messages // segment_count)
 
-    # Per-segment worker: fetches comments from one time offset using
-    # urllib.request.urlopen (fully thread-safe, no shared state).
-    # Returns list of (json_line, timestamp, comment_id, error_flag).
     def fetch_segment(seg_offset, seg_limit, deadline):
         results = []
         seen = set()
@@ -306,7 +494,6 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
                 page_offset = int(max_os) + 3
         return results, False
 
-    # Shared state for cross-thread deduplication and ordering
     seen_lock = Lock()
     print_lock = Lock()
     total_lock = Lock()
@@ -316,7 +503,7 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
 
     futures = {}
     fatal_error = False
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=THREAD_COUNT) as executor:
         for seg in range(segment_count):
             seg_offset = int(seg * duration / segment_count)
             futures[executor.submit(
@@ -355,14 +542,27 @@ fetch_chat(extract_vod_id(${safeUrl}), ${maxMessages})`
   );
 }
 
- async function spawnPythonWithProgress(
+/**
+ * Spawn Python and write stdout to a temporary JSONL file as it streams,
+ * then return the file path for streaming parse. This avoids accumulating
+ * all stdout in a JS string before processing.
+ */
+async function spawnPythonWithStreaming(
   script: string,
   maxMessages: number,
   onProgress?: (count: number) => void,
   pythonPath?: string,
-  signal?: AbortSignal
-): Promise<{ stdout: string; stderr: string }> {
+  signal?: AbortSignal,
+): Promise<{ stdout: string; stderr: string; rawJsonlPath: string }> {
   const py = pythonPath ?? await resolveChatDownloaderPython();
+  const paths = getMediaPaths();
+  const timestamp = new Date().toISOString().replaceAll(":", "-").replace(/\.\d{3}Z$/, "Z");
+  const rawFileName = `chat_stream_${timestamp}.jsonl`;
+  const rawFilePath = path.join(paths.outputChatLogsDir, rawFileName);
+  const rawRelativePath = rawFilePath;
+
+  await mkdir(paths.outputChatLogsDir, { recursive: true });
+
   return new Promise((resolve, reject) => {
     const child = spawn(py, ["-u", "-c", script], {
       timeout: PYTHON_TIMEOUT,
@@ -370,15 +570,18 @@ fetch_chat(extract_vod_id(${safeUrl}), ${maxMessages})`
       stdio: ["ignore", "pipe", "pipe"]
     });
 
-    let stdout = "";
     let stderr = "";
     let timedOut = false;
     let aborted = false;
     let lineCount = 0;
 
+    // Stream stdout directly to file instead of accumulating in memory
+    const writeStream = require("node:fs").createWriteStream(rawFilePath, { encoding: "utf8" });
+
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGTERM");
+      writeStream.end();
       reject(new Error(`chat-downloader (Python) timed out after ${Math.round(PYTHON_TIMEOUT / 60_000)} minutes.`));
     }, PYTHON_TIMEOUT);
 
@@ -386,6 +589,7 @@ fetch_chat(extract_vod_id(${safeUrl}), ${maxMessages})`
       if (aborted) return;
       aborted = true;
       child.kill("SIGTERM");
+      writeStream.end();
       reject(new DOMException("Chat download was cancelled.", "AbortError"));
     };
     if (signal) {
@@ -402,8 +606,9 @@ fetch_chat(extract_vod_id(${safeUrl}), ${maxMessages})`
     };
 
     child.stdout?.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
+      writeStream.write(chunk);
       if (!onProgress) return;
+      // Count newlines in this chunk for progress reporting
       const text = chunk.toString();
       for (let i = 0; i < text.length; i++) {
         if (text[i] === "\n") lineCount++;
@@ -421,17 +626,26 @@ fetch_chat(extract_vod_id(${safeUrl}), ${maxMessages})`
 
     child.on("close", (code) => {
       cleanup();
-      if (aborted || timedOut) return;
-      if (code === 0 || (code === null && stdout.trim().length > 0)) {
-        resolve({ stdout, stderr });
-      } else {
-        const detail = stderr.trim().slice(-1000) || `exit code ${code}`;
-        reject(new Error(`chat-downloader failed: ${detail}`));
-      }
+      writeStream.end(() => {
+        if (aborted || timedOut) return;
+        if (code === 0 || (code === null)) {
+          // Read back the raw stdout as string for legacy compatibility
+          try {
+            const rawStdout = require("node:fs").readFileSync(rawFilePath, "utf8");
+            resolve({ stdout: rawStdout, stderr, rawJsonlPath: rawRelativePath });
+          } catch {
+            resolve({ stdout: "", stderr, rawJsonlPath: rawRelativePath });
+          }
+        } else {
+          const detail = stderr.trim().slice(-1000) || `exit code ${code}`;
+          reject(new Error(`chat-downloader failed: ${detail}`));
+        }
+      });
     });
 
     child.on("error", (err) => {
       cleanup();
+      writeStream.end();
       if (aborted) return;
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         reject(new Error(
@@ -442,36 +656,6 @@ fetch_chat(extract_vod_id(${safeUrl}), ${maxMessages})`
       }
     });
   });
-}
-
-function parseJsonLines(stdout: string, sourceUrl: string): RawChatDownloaderMessage[] {
-  const results: RawChatDownloaderMessage[] = [];
-  const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      continue;
-    }
-
-    if (!parsed || typeof parsed !== "object") {
-      continue;
-    }
-
-    const record = parsed as Record<string, unknown>;
-
-    if (record.message_type === "data" || record.message_type === undefined) {
-      if (record.message !== undefined || record.author !== undefined) {
-        results.push(record as unknown as RawChatDownloaderMessage);
-      }
-    }
-  }
-
-  return results;
 }
 
 function normalizeChatDownloaderMessage(message: RawChatDownloaderMessage, index: number): ChatLogEntry | null {
@@ -599,5 +783,3 @@ export async function fetchChatWithChatDownloaderWithRetry(
   }
   throw lastError;
 }
-
-
