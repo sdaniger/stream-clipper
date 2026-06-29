@@ -158,6 +158,10 @@ export default function DanmakuPanel({
   // Last result summaries
   const lastRange = lastResult?.range_comment_count;
   const lastBurned = lastResult?.burned_comment_count;
+  const lastSkippedNg = lastResult?.skipped_ng ?? 0;
+  const lastSkippedShort = lastResult?.skipped_too_short ?? 0;
+  const lastSkippedDup = lastResult?.skipped_duplicate ?? 0;
+  const hasSkipped = (lastSkippedNg + lastSkippedShort + lastSkippedDup) > 0;
 
   return (
     <div className="glass-panel rounded-lg p-3">
@@ -485,6 +489,13 @@ export default function DanmakuPanel({
             <div className="text-slate-300 font-mono mb-1">
               範囲内 <span className="text-slate-100 font-semibold">{lastRange}</span> 件 · 焼き込み <span className={`font-semibold ${lastRange === lastBurned ? "text-emerald-300" : "text-amber-300"}`}>{lastBurned}</span> 件
               {lastRange === lastBurned ? " (全コメント)" : " (間引きあり)"}
+            </div>
+          )}
+          {hasSkipped && (
+            <div className="text-slate-500 font-mono text-[9px] mb-1">
+              {lastSkippedNg > 0 && <span>NG {lastSkippedNg} </span>}
+              {lastSkippedShort > 0 && <span>短 {lastSkippedShort} </span>}
+              {lastSkippedDup > 0 && <span>重複 {lastSkippedDup}</span>}
             </div>
           )}
           {lastResult.ffmpeg_preset && lastResult.ffmpeg_crf && (

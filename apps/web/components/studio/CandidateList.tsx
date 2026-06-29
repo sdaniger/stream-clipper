@@ -28,6 +28,11 @@ export default function CandidateList({
   onExportCandidate,
 }: Props) {
   const { t } = useI18n();
+  // Max score across all candidates, used to scale the score bar.
+  const maxScore = candidates.reduce(
+    (m, c) => (typeof c.score === "number" && c.score > m ? c.score : m),
+    0,
+  );
   return (
     <div className="glass-panel rounded-lg p-3 flex flex-col flex-1 min-h-0">
       <div className="flex justify-between items-center mb-1.5 gap-2 flex-wrap">
@@ -54,6 +59,7 @@ export default function CandidateList({
               isExported={exportedCandidateIds.has(id)}
               isDanmakuExported={danmakuExportedIds.has(id)}
               isExporting={exportingCandidateId === id}
+              maxScore={maxScore}
               canExport={canExport}
               onSelect={() => onSelectCandidate(c)}
               onEdit={() => onEditCandidate(c)}

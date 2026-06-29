@@ -21,6 +21,8 @@ interface Props {
   isExported: boolean;
   isDanmakuExported: boolean;
   canExport: boolean;
+  /** Max score across all candidates, used to scale the score bar. */
+  maxScore?: number;
   onSelect: () => void;
   onEdit: () => void;
   onExport: () => void;
@@ -33,6 +35,7 @@ export default function CandidateCard({
   isExported,
   isDanmakuExported,
   canExport,
+  maxScore,
   onSelect,
   onEdit,
   onExport,
@@ -64,6 +67,19 @@ export default function CandidateCard({
           <span className="text-[9px] text-emerald-400 font-semibold px-1 py-0.5 rounded bg-emerald-500/10 ml-auto">✓ {t("studio.exportedBadge")}</span>
         )}
       </div>
+
+      {/* Score bar (visual encoding of score magnitude) */}
+      {typeof c.score === "number" && (
+        <div className="h-1 w-full bg-slate-800/60 rounded mb-1.5 overflow-hidden">
+          <div
+            className="h-full bg-gradient-to-r from-amber-600 to-amber-300"
+            style={{
+              width: `${Math.min(100, (c.score / Math.max(maxScore ?? c.score, 1)) * 100)}%`,
+            }}
+            title={`score ${c.score}`}
+          />
+        </div>
+      )}
 
       {/* Row 2: time range */}
       <div className="text-[11px] text-slate-200 font-mono font-semibold mb-0.5">
