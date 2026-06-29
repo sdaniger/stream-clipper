@@ -1,6 +1,5 @@
 import { execFile, spawn } from "node:child_process";
 import { access, copyFile, mkdir, stat, unlink, writeFile } from "node:fs/promises";
-import { cpus } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { ClipCandidate, ClipCandidateVariant, ClipTranscription, CommentAssetReference, CommentBurnedClipReference, GeneratedClipReference, ThumbnailCandidateReference } from "@/lib/mock-candidates";
@@ -461,12 +460,11 @@ export async function burnCommentsIntoClip(input: BurnCommentsIntoClipInput): Pr
 
   const audioFilter = normalizeAudio ? "loudnorm=I=-16:TP=-1.5:LRA=11" : null;
 
-  // Cap libx264 threads so a 1080p burn doesn't starve the dev server.
-  // The default is to use all cores, but with concurrent burn + transcribe
-  // + chat fetch happening, leaving one core free keeps the UI responsive
-  // and the SSE stream alive (prevents the 60s client timeout that was
-  // killing the burn mid-encode and leaving a partial output file).
-  const ffmpegThreads = Math.max(1, (cpus().length || 4) - 1).toString();
+  // For NVENC, cap to 2 CPU decode threads — the GPU does the heavy
+  // lifting and burning more cores here just causes context switches
+  // between concurrent jobs (download, transcribe, other burns).
+  // For libx264, leave the default (all cores).
+  const ffmpegThreads = isNvenc ? "2" : "0";
 
   const args = [
     "-hide_banner",
