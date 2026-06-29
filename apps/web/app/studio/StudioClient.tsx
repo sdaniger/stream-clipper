@@ -2,7 +2,16 @@
 import React, { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { extractVideoId, getCandidateSeekTime, type HighlightCandidate } from "@/lib/twitch-time";
 import type { TimelineRow } from "@/lib/studio-api";
-import { createStudioClip, batchCreateStudioClips } from "@/lib/studio-api";
+import {
+  createStudioClip,
+  batchCreateStudioClips,
+  exportDanmakuClip,
+  generateAssOnly,
+  type DanmakuChatMessage,
+  type DanmakuDensity,
+  type DanmakuExportOptions,
+  type DanmakuExportResponse,
+} from "@/lib/studio-api";
 import TwitchVodPlayer, { type TwitchVodPlayerHandle } from "@/components/studio/TwitchVodPlayer";
 import LocalVideoPlayer, { type LocalVideoPlayerHandle } from "@/components/studio/LocalVideoPlayer";
 import CandidateList from "@/components/studio/CandidateList";
@@ -12,9 +21,11 @@ import AdvancedSettings from "@/components/studio/AdvancedSettings";
 import ClipActionPanel from "@/components/studio/ClipActionPanel";
 import TimelineGraph from "@/components/studio/TimelineGraph";
 import ExportStatusPanel from "@/components/studio/ExportStatusPanel";
+import DanmakuPanel from "@/components/studio/DanmakuPanel";
 
 type StudioMode = "twitch" | "local";
 type ExportStatus = "idle" | "exporting" | "exported" | "error";
+type DanmakuExportKind = "with" | "without" | "ass" | null;
 type LogLevel = "user" | "info" | "warn" | "error";
 type LogEntry = { level: LogLevel; message: string };
 
@@ -36,6 +47,7 @@ interface SseResult {
   summary: Record<string, unknown> | null;
   error?: string;
   video_exists?: boolean;
+  normalized_chat?: DanmakuChatMessage[];
   diagnostic?: {
     fetched_chat_count: number;
     normalized_chat_count: number;
@@ -134,6 +146,22 @@ export default function StudioClient() {
   const [exportingId, setExportingId] = useState<string | number | null>(null);
   const [exportStatus, setExportStatus] = useState<ExportStatus>("idle");
   const [batchExportStatus, setBatchExportStatus] = useState<ExportStatus>("idle");
+
+  // Danmaku export state
+  const [normalizedChat, setNormalizedChat] = useState<DanmakuChatMessage[]>([]);
+  const [danmakuExporting, setDanmakuExporting] = useState<DanmakuExportKind>(null);
+  const [danmakuLastResult, setDanmakuLastResult] = useState<DanmakuExportResponse | null>(null);
+  // Danmaku form state
+  const [danmakuDensity, setDanmakuDensity] = useState<DanmakuDensity>("medium");
+  const [danmakuMaxComments, setDanmakuMaxComments] = useState(120);
+  const [danmakuFontSize, setDanmakuFontSize] = useState(32);
+  const [danmakuCommentDuration, setDanmakuCommentDuration] = useState(4.0);
+  const [danmakuOpacity, setDanmakuOpacity] = useState(0.9);
+  const [danmakuNgWords, setDanmakuNgWords] = useState("");
+  const [danmakuMinMessageLength, setDanmakuMinMessageLength] = useState(1);
+  const [danmakuDeduplicate, setDanmakuDeduplicate] = useState(true);
+  // Danmaku export track (which candidates have been danmaku-exported)
+  const [danmakuExportedIds, setDanmakuExportedIds] = useState<Set<string | number>>(new Set());
 
   // Player refs
   const localPlayerRef = useRef<LocalVideoPlayerHandle>(null);
@@ -238,6 +266,21 @@ export default function StudioClient() {
           } else if (event.type === "result") {
             setVodTitle(event.title);
             setDiagnostic(event.diagnostic ?? null);
+            // Capture normalized chat for later danmaku export. The server
+            // sends the full chat array (already normalized) using the
+            // {timestamp_seconds, author_name, message} format.
+            const rawChat = (event as any).normalized_chat;
+            if (Array.isArray(rawChat)) {
+              const chatForDanmaku: DanmakuChatMessage[] = rawChat.map((m: any) => ({
+                timestamp: Number(m.timestamp_seconds ?? m.timestamp ?? 0),
+                time_sec: Number(m.timestamp_seconds ?? m.time_sec ?? 0),
+                message: typeof m.message === "string" ? m.message : "",
+                author: typeof m.author_name === "string" ? m.author_name : undefined,
+              }));
+              setNormalizedChat(chatForDanmaku);
+            } else {
+              setNormalizedChat([]);
+            }
             if (event.error) {
               addLog("error", `分析エラー: ${event.error}`);
               setCandidates([]);
@@ -414,6 +457,115 @@ export default function StudioClient() {
       setBatchExportStatus("error");
     }
   }, [canExport, candidates, videoPath, exportedIds, addLog]);
+
+  // ─── Danmaku export functions ───────────────────────────────────────────
+
+  // Filter chat to the candidate's range
+  const getChatInRange = useCallback((c: HighlightCandidate): DanmakuChatMessage[] => {
+    if (normalizedChat.length === 0) return [];
+    const start = getStart(c);
+    const end = getEnd(c);
+    return normalizedChat.filter((m) => m.time_sec >= start && m.time_sec <= end);
+  }, [normalizedChat]);
+
+  // Compute chat in range for the currently selected candidate
+  const chatInRange = useMemo(() => {
+    if (!selectedCandidate) return [];
+    return getChatInRange(selectedCandidate);
+  }, [selectedCandidate, getChatInRange]);
+
+  const handleDanmakuExport = useCallback(async (
+    kind: "with" | "without" | "ass",
+    options: DanmakuExportOptions,
+  ) => {
+    if (!selectedCandidate) {
+      addLog("error", "候補が選択されていません");
+      return;
+    }
+    if (!canExport) {
+      addLog("error", "弾幕付きmp4出力にはローカル動画ファイルが必要です");
+      setErrorMessage("弾幕付きmp4出力にはローカル動画ファイルが必要です");
+      return;
+    }
+    setDanmakuExporting(kind);
+    setDanmakuLastResult(null);
+    setErrorMessage(null);
+    const start = getStart(selectedCandidate);
+    const end = getEnd(selectedCandidate);
+    addLog("user", `候補 #${selectedCandidate.rank} を選択: ${formatTimecode(start)} - ${formatTimecode(end)}`);
+    addLog("user", `範囲内コメントを抽出: ${chatInRange.length}件`);
+
+    try {
+      if (kind === "with") {
+        addLog("info", "弾幕ASSを生成中...");
+        const result = await exportDanmakuClip({
+          video_path: videoPath,
+          candidate: selectedCandidate,
+          chat: chatInRange,
+          options: { ...options, with_danmaku: true },
+        });
+        if (!result.ok) {
+          addLog("error", `弾幕出力失敗: ${result.message ?? "Unknown error"}`);
+          setErrorMessage(result.message ?? "弾幕出力に失敗しました");
+          setDanmakuLastResult(result);
+        } else {
+          addLog("user", `弾幕として使用: ${result.comment_count}件`);
+          addLog("user", `ASS生成完了: ${result.ass_file}`);
+          addLog("info", "FFmpegで弾幕付き動画を書き出し中...");
+          addLog("user", `弾幕付きクリップ出力完了: ${result.output_file}`);
+          setDanmakuLastResult(result);
+          setDanmakuExportedIds((prev) => new Set(prev).add(selectedCandidate.id ?? selectedCandidate.rank));
+        }
+      } else if (kind === "without") {
+        addLog("info", "弾幕なしで範囲のみを切り出し中...");
+        const result = await exportDanmakuClip({
+          video_path: videoPath,
+          candidate: selectedCandidate,
+          chat: [],
+          options: { ...options, with_danmaku: false },
+        });
+        if (!result.ok) {
+          addLog("error", `書き出し失敗: ${result.message ?? "Unknown error"}`);
+          setErrorMessage(result.message ?? "書き出しに失敗しました");
+          setDanmakuLastResult(result);
+        } else {
+          addLog("user", `弾幕なし書き出し完了: ${result.output_file}`);
+          setDanmakuLastResult(result);
+        }
+      } else {
+        // ASS only
+        addLog("info", "ASSファイルを生成中...");
+        const result = await generateAssOnly({
+          chat: chatInRange,
+          clip_start: start,
+          clip_end: end,
+          output_path: `${videoPath.replace(/[^/]+$/, "")}clip_${Date.now()}_${selectedCandidate.rank}.ass`,
+          options,
+        });
+        if (!result.ok) {
+          addLog("error", `ASS生成失敗: ${result.message ?? "Unknown error"}`);
+          setErrorMessage(result.message ?? "ASS生成に失敗しました");
+        } else {
+          addLog("user", `ASS生成完了: ${result.ass_path} (${result.comment_count}件使用)`);
+          setDanmakuLastResult({
+            ok: true,
+            ass_file: result.ass_path,
+            comment_count: result.comment_count,
+            in_range_count: result.in_range_count,
+            skipped_ng: result.skipped_ng,
+            skipped_too_short: result.skipped_too_short,
+            skipped_duplicate: result.skipped_duplicate,
+          });
+        }
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Unknown error";
+      addLog("error", msg);
+      setErrorMessage(msg);
+    } finally {
+      setDanmakuExporting(null);
+    }
+  }, [selectedCandidate, canExport, videoPath, chatInRange, addLog]);
 
   // ─── Action panel handlers ────────────────────────────────────────────────
 
@@ -684,6 +836,37 @@ export default function StudioClient() {
             />
           )}
 
+          {/* Danmaku export panel - only useful when a local video is available */}
+          {selectedCandidate && (
+            <DanmakuPanel
+              candidate={selectedCandidate}
+              chatInRange={chatInRange}
+              hasLocalVideo={canExport}
+              localVideoPath={videoPath}
+              isExporting={danmakuExporting}
+              lastResult={danmakuLastResult}
+              onExportWithDanmaku={(opts) => handleDanmakuExport("with", opts)}
+              onExportWithoutDanmaku={() => handleDanmakuExport("without", { with_danmaku: false })}
+              onExportAssOnly={(opts) => handleDanmakuExport("ass", opts)}
+              density={danmakuDensity}
+              setDensity={setDanmakuDensity}
+              maxComments={danmakuMaxComments}
+              setMaxComments={setDanmakuMaxComments}
+              fontSize={danmakuFontSize}
+              setFontSize={setDanmakuFontSize}
+              commentDuration={danmakuCommentDuration}
+              setCommentDuration={setDanmakuCommentDuration}
+              opacity={danmakuOpacity}
+              setOpacity={setDanmakuOpacity}
+              ngWords={danmakuNgWords}
+              setNgWords={setDanmakuNgWords}
+              minMessageLength={danmakuMinMessageLength}
+              setMinMessageLength={setDanmakuMinMessageLength}
+              deduplicateConsecutive={danmakuDeduplicate}
+              setDeduplicateConsecutive={setDanmakuDeduplicate}
+            />
+          )}
+
           {/* Detailed reasons (collapsible / on-demand) */}
           {selectedCandidate && (
             <CandidateDetails candidate={selectedCandidate} />
@@ -705,6 +888,7 @@ export default function StudioClient() {
             candidates={candidates}
             selectedCandidateId={selectedCandidate?.id ?? selectedCandidate?.rank ?? null}
             exportedCandidateIds={exportedIds}
+            danmakuExportedIds={danmakuExportedIds}
             exportingCandidateId={exportingId}
             canExport={canExport}
             onSelectCandidate={handleSelectCandidate}

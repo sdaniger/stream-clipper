@@ -7,6 +7,7 @@ interface Props {
   candidates: HighlightCandidate[];
   selectedCandidateId: string | number | null;
   exportedCandidateIds: Set<string | number>;
+  danmakuExportedIds: Set<string | number>;
   exportingCandidateId: string | number | null;
   canExport: boolean;
   onSelectCandidate: (candidate: HighlightCandidate) => void;
@@ -18,6 +19,7 @@ export default function CandidateList({
   candidates,
   selectedCandidateId,
   exportedCandidateIds,
+  danmakuExportedIds,
   exportingCandidateId,
   canExport,
   onSelectCandidate,
@@ -26,15 +28,18 @@ export default function CandidateList({
 }: Props) {
   return (
     <div className="glass-panel rounded-lg p-3 flex flex-col flex-1 min-h-0">
-      <div className="flex justify-between items-center mb-1.5">
+      <div className="flex justify-between items-center mb-1.5 gap-2 flex-wrap">
         <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
           Candidates ({candidates.length})
         </span>
-        {exportedCandidateIds.size > 0 && (
-          <span className="text-[10px] text-emerald-400">
-            ✓ {exportedCandidateIds.size} exported
-          </span>
-        )}
+        <div className="flex items-center gap-2 text-[10px]">
+          {danmakuExportedIds.size > 0 && (
+            <span className="text-fuchsia-400">🎬 {danmakuExportedIds.size}</span>
+          )}
+          {exportedCandidateIds.size > 0 && (
+            <span className="text-emerald-400">✓ {exportedCandidateIds.size}</span>
+          )}
+        </div>
       </div>
       <div className="flex-1 overflow-y-auto min-h-0">
         {candidates.length > 0 ? candidates.map((c) => {
@@ -45,6 +50,7 @@ export default function CandidateList({
               candidate={c}
               isSelected={id === selectedCandidateId}
               isExported={exportedCandidateIds.has(id)}
+              isDanmakuExported={danmakuExportedIds.has(id)}
               isExporting={exportingCandidateId === id}
               canExport={canExport}
               onSelect={() => onSelectCandidate(c)}

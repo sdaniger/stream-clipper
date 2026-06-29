@@ -151,6 +151,12 @@ export async function POST(request: NextRequest) {
             timeline: analysisResult.timeline,
             video_exists: videoExists,
             diagnostic: analysisResult.diagnostic,
+            // Include the full chat for danmaku export.
+            normalized_chat: entries.map((m) => ({
+              timestamp_seconds: m.timestamp_seconds,
+              author_name: m.author_name,
+              message: m.message,
+            })),
           });
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : "Unknown error";

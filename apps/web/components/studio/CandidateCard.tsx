@@ -18,6 +18,7 @@ interface Props {
   isSelected: boolean;
   isExporting: boolean;
   isExported: boolean;
+  isDanmakuExported: boolean;
   canExport: boolean;
   onSelect: () => void;
   onEdit: () => void;
@@ -29,6 +30,7 @@ export default function CandidateCard({
   isSelected,
   isExporting,
   isExported,
+  isDanmakuExported,
   canExport,
   onSelect,
   onEdit,
@@ -47,11 +49,14 @@ export default function CandidateCard({
           : "border border-slate-700/60 bg-slate-800/60 hover:border-slate-500"
       }`}
     >
-      {/* Row 1: rank · score · exported badge */}
-      <div className="flex items-center gap-2 mb-1">
+      {/* Row 1: rank · score · exported badges */}
+      <div className="flex items-center gap-2 mb-1 flex-wrap">
         <span className="text-sm font-bold text-cyan-300">#{c.rank}</span>
         {typeof c.score === "number" && (
           <span className="text-[10px] text-amber-400 font-semibold">score {c.score}</span>
+        )}
+        {isDanmakuExported && (
+          <span className="text-[9px] text-fuchsia-400 font-semibold px-1 py-0.5 rounded bg-fuchsia-500/10">🎬 弾幕出力済</span>
         )}
         {isExported && (
           <span className="text-[9px] text-emerald-400 font-semibold px-1 py-0.5 rounded bg-emerald-500/10 ml-auto">✓ 書き出し済み</span>

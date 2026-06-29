@@ -287,3 +287,148 @@ function formatTimecode(seconds: number): string {
   }
   return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
 }
+
+// ---- Studio Danmaku Export ----
+
+export type DanmakuDensity = "low" | "medium" | "high";
+
+export type DanmakuExportOptions = {
+  density?: DanmakuDensity;
+  max_comments?: number;
+  font_size?: number;
+  font_name?: string;
+  comment_duration?: number;
+  opacity?: number;
+  ng_words?: string[];
+  min_message_length?: number;
+  deduplicate_consecutive?: boolean;
+  play_res_x?: number;
+  play_res_y?: number;
+  output_dir?: string;
+  with_danmaku?: boolean;
+  fast?: boolean;
+};
+
+export type DanmakuChatMessage = {
+  timestamp: number;
+  time_sec: number;
+  message: string;
+  author?: string;
+};
+
+export type DanmakuExportRequest = {
+  video_path: string;
+  video_id?: string | null;
+  candidate: {
+    rank: number;
+    start?: number;
+    end?: number;
+    clip_start?: number;
+    clip_duration?: number;
+    peak_time?: number;
+    id?: string | number;
+  };
+  chat: DanmakuChatMessage[];
+  options?: DanmakuExportOptions;
+  edited_start?: number;
+  edited_end?: number;
+};
+
+export type DanmakuExportResponse = {
+  ok: boolean;
+  output_file?: string;
+  ass_file?: string;
+  comment_count?: number;
+  in_range_count?: number;
+  skipped_ng?: number;
+  skipped_too_short?: number;
+  skipped_duplicate?: number;
+  clip_start?: number;
+  clip_end?: number;
+  error_code?: string;
+  message?: string;
+  duration_seconds?: number;
+};
+
+export async function exportDanmakuClip(input: DanmakuExportRequest): Promise<DanmakuExportResponse> {
+  const res = await fetch("/api/studio/export-danmaku-clip", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ message: `HTTP ${res.status}` }));
+    throw new Error(err.message || err.error || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export type GenerateAssRequest = {
+  chat: DanmakuChatMessage[];
+  clip_start: number;
+  clip_end: number;
+  output_path: string;
+  options?: DanmakuExportOptions;
+};
+
+export type GenerateAssResponse = {
+  ok: boolean;
+  ass_path: string;
+  comment_count: number;
+  in_range_count: number;
+  skipped_ng: number;
+  skipped_too_short: number;
+  skipped_duplicate: number;
+  error_code?: string;
+  message?: string;
+  stats?: {
+    in_range_count: number;
+    used_count: number;
+    skipped_ng: number;
+    skipped_too_short: number;
+    skipped_duplicate: number;
+  };
+};
+
+export async function generateAssOnly(input: GenerateAssRequest): Promise<GenerateAssResponse> {
+  // The Python danmaku service has an ASS-only path but it's not exposed
+  // as a dedicated route. Use the export-danmaku-clip endpoint with a
+  // synthetic request (no video required for ASS-only) — but that route
+  // requires a video_path. Instead, call the service directly via a
+  // dedicated endpoint if it exists, or fall back to calling
+  // exportDanmakuClip with with_danmaku=true + a dummy video path.
+  //
+  // For MVP we use the same endpoint and accept the video_path check.
+  // TODO: Add a dedicated POST /api/studio/generate-ass endpoint that
+  // doesn't require a video path.
+  const res = await fetch("/api/studio/export-danmaku-clip", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      video_path: input.output_path, // dummy; route will accept if path exists
+      candidate: { rank: 0, clip_start: input.clip_start, clip_duration: input.clip_end - input.clip_start },
+      chat: input.chat,
+      options: {
+        ...input.options,
+        with_danmaku: true,
+        output_dir: input.output_path.replace(/[^/]+$/, ""),
+      },
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ message: `HTTP ${res.status}` }));
+    throw new Error(err.message || err.error || `HTTP ${res.status}`);
+  }
+  const json = await res.json();
+  return {
+    ok: json.ok,
+    ass_path: json.ass_file ?? "",
+    comment_count: json.comment_count ?? 0,
+    in_range_count: json.in_range_count ?? 0,
+    skipped_ng: json.skipped_ng ?? 0,
+    skipped_too_short: json.skipped_too_short ?? 0,
+    skipped_duplicate: json.skipped_duplicate ?? 0,
+    error_code: json.error_code,
+    message: json.message,
+  };
+}

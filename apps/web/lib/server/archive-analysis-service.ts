@@ -169,13 +169,14 @@ export async function runArchiveAutoAnalysis(
   // gracefully tolerates the video not being downloaded yet because it only
   // needs the VOD duration (already returned by metadata).
   //
-  // Sections mode: skip the full VOD download. We'll download each
-  // candidate's time range on-demand in Phase 2 via yt-dlp --download-sections.
-  // This is dramatically faster for short clips on long VODs (e.g. a 30s
-  // clip from a 4-hour VOD is 0.2% of the file size).
-  const needsFullDownload = pipelineMode === "full";
-  const usesPerSectionDownload = pipelineMode === "sections";
-  emitProgress({ stage: "download", status: needsFullDownload ? "running" : (usesPerSectionDownload ? "skipped" : "skipped"), message: needsFullDownload ? `Downloading video (full)...` : usesPerSectionDownload ? `Sections mode: per-candidate section downloads` : `Download skipped (${pipelineMode} mode)` });
+  // Download the full VOD once for both "full" and "sections" modes.
+  // In sections mode this replaces the old per-candidate yt-dlp
+  // --download-sections approach (which required ffmpeg and launched
+  // yt-dlp 6+ times). Now we download once and use FFmpeg to extract
+  // each candidate's section locally — dramatically faster.
+  const needsFullDownload = pipelineMode === "full" || pipelineMode === "sections";
+  const usesPerSectionDownload = false; // legacy: per-section download is no longer used
+  emitProgress({ stage: "download", status: needsFullDownload ? "running" : "skipped", message: needsFullDownload ? `Downloading video...` : `Download skipped (${pipelineMode} mode)` });
   emitProgress({ stage: "chat", status: "running", message: "Fetching chat..." });
 
   let downloadedVideo: Awaited<ReturnType<typeof downloadVideoWithYtDlp>> | null = null;
@@ -241,8 +242,6 @@ export async function runArchiveAutoAnalysis(
       await chatPromise.catch(() => undefined);
       throw error;
     }
-  } else if (usesPerSectionDownload) {
-    emitProgress({ stage: "download", status: "skipped", message: "Sections mode: full VOD download skipped, will fetch per-candidate sections" });
   } else {
     emitProgress({ stage: "download", status: "skipped", message: `Download skipped (${pipelineMode} mode)` });
   }
@@ -405,10 +404,9 @@ export async function runArchiveAutoAnalysis(
   const candidateCount = sourceCandidates.length;
   const cpuCount = cpus().length;
   const clipLimit = createLimiter(cpuCount);
-  const burnLimit = createLimiter(2);
-  // Limit concurrent section downloads to 2 so we don't slam the Twitch
-  // CDN with too many parallel requests when in sections mode.
-  const sectionLimit = createLimiter(2);
+  // Burn-in re-encodes the entire clip with ASS overlay, so it can use
+  // all CPU cores when running in parallel with transcription.
+  const burnLimit = createLimiter(cpuCount);
 
   const processed = await Promise.all(
     sourceCandidates.map(async (candidate, candidateIndex): Promise<ClipCandidate> => {
@@ -427,47 +425,16 @@ export async function runArchiveAutoAnalysis(
       const clipDurationSeconds = parseTimecode(selectedVariant.duration, "clip duration");
 
       // Step A: sourceVideoPath acquisition
-      // - "full" mode: full VOD was downloaded in Phase 1, use it directly.
-      // - "sections" mode: download only this candidate's time range via
-      //   yt-dlp --download-sections. This is dramatically faster than
-      //   downloading the full VOD when only a few short clips are needed.
-      // - "links" / "clips" modes: shouldn't reach here, but fall back to
-      //   the full VOD if available.
+      // In both "full" and "sections" modes, the full VOD is downloaded once
+      // in Phase 1 (single yt-dlp call). FFmpeg extracts each candidate's
+      // section locally — no per-candidate yt-dlp overhead and no ffmpeg
+      // dependency inside yt-dlp.
       let clipInputPath: string;
-      if (usesPerSectionDownload) {
-        // Per-section download. Limit concurrent downloads to 2 so we
-        // don't slam the Twitch CDN with 6+ parallel requests.
-        const sectionStart = clipStartSeconds;
-        const sectionEnd = clipStartSeconds + clipDurationSeconds;
-        emitProgress({ stage: "clip", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Downloading section ${secondsToClock(sectionStart)}-${secondsToClock(sectionEnd)} for candidate ${indexLabel}...` });
-        try {
-          const sectionDownload = await sectionLimit(() => downloadVideoWithYtDlp({
-            url,
-            format: input.ytDlpFormat,
-            prefetchedMetadata: metadata,
-            timeStartSeconds: sectionStart,
-            timeEndSeconds: sectionEnd,
-            signal: input.signal,
-            onProgress: (p) => {
-              emitProgress({ stage: "clip", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Section ${indexLabel} downloading... ${p.percent.toFixed(1)}% at ${p.speed}, ETA ${p.eta}` });
-            }
-          }));
-          clipInputPath = sectionDownload.inputPath;
-        } catch (err) {
-          const detail = errorMessage(err, "Section download failed");
-          warnings.push({ stage: "clip", candidateId: candidate.id, message: `Section download failed: ${detail}. Falling back to full VOD if available.` });
-          if (downloadedVideo?.inputPath) {
-            clipInputPath = downloadedVideo.inputPath;
-          } else {
-            return candidate;
-          }
-        }
-      } else if (!downloadedVideo?.inputPath) {
+      if (!downloadedVideo?.inputPath) {
         warnings.push({ stage: "clip", candidateId: candidate.id, message: "No downloaded video available for clip generation. Phase 1 download may have failed." });
         return candidate;
-      } else {
-        clipInputPath = downloadedVideo.inputPath;
       }
+      clipInputPath = downloadedVideo.inputPath;
 
       // Step B: clipStartSec / clipDurationSec validation
       if (clipDurationSeconds <= 0) {
@@ -539,48 +506,64 @@ export async function runArchiveAutoAnalysis(
         }
       }
 
-      // Step E: Comment burn-in (only if ASS was generated)
+      // Step E + Transcription: run in parallel.
+      // Both tasks only need the generated clip file and are independent of
+      // each other. Running them concurrently cuts wall-clock time per
+      // candidate from (burn + transcription) to max(burn, transcription).
       let commentBurnedClip = generatedCandidate.commentBurnedClip;
+      let transcription: ClipTranscription | undefined;
+      const postClipTasks: Promise<unknown>[] = [];
+
+      // burn-in task
       if (input.burnComments !== false && generatedClip && commentsAssStr && !commentBurnedClip) {
         emitProgress({ stage: "burn", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Burning comments into clip ${indexLabel}...` });
         const burnStartTime = Date.now();
-        try {
-          commentBurnedClip = await burnLimit(() => burnCommentsIntoClip({
+        postClipTasks.push(
+          burnLimit(() => burnCommentsIntoClip({
             clipPath: generatedClip!.outputPath,
             candidateId: candidate.id,
             variantId: selectedVariant.id,
             assContent: commentsAssStr!,
             encoder: input.encoder,
-          }));
-          generatedCandidate = { ...generatedCandidate, commentBurnedClip };
-          const burnElapsed = Math.round((Date.now() - burnStartTime) / 1000);
-          emitProgress({ stage: "burn", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Comments burned in ${burnElapsed}s` });
-        } catch (error) {
-          const burnErr = errorMessage(error, "Could not burn comments into clip.");
-          warnings.push({ stage: "burn", candidateId: candidate.id, message: burnErr });
-          emitProgress({ stage: "burn", status: "error", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: errorMessage(error, "Comment burn-in failed") });
-        }
+          }))
+            .then((burned) => {
+              commentBurnedClip = burned;
+              generatedCandidate = { ...generatedCandidate, commentBurnedClip: burned };
+              const burnElapsed = Math.round((Date.now() - burnStartTime) / 1000);
+              emitProgress({ stage: "burn", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Comments burned in ${burnElapsed}s` });
+            })
+            .catch((error) => {
+              const burnErr = errorMessage(error, "Could not burn comments into clip.");
+              warnings.push({ stage: "burn", candidateId: candidate.id, message: burnErr });
+              emitProgress({ stage: "burn", status: "error", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: errorMessage(error, "Comment burn-in failed") });
+            })
+        );
       }
 
-      // Transcription (parallel, if enabled)
-      let transcription: ClipTranscription | undefined;
+      // transcription task
       if (generatedClip && shouldTranscribe) {
         emitProgress({ stage: "transcription", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Transcribing clip ${indexLabel}...` });
-        try {
-          transcription = await transcribeClip(generatedClip.outputPath, input);
-          generatedCandidate = applyTranscription(generatedCandidate, transcription);
-          emitProgress({ stage: "transcription", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Transcribed ${transcription.segments.length} segments` });
-        } catch (error) {
-          const detail = errorMessage(error, "Could not transcribe generated clip.");
-          const hint = detail.includes("fetch failed") || detail.includes("ECONNREFUSED")
-            ? " (Start the Python FastAPI backend on http://127.0.0.1:8000, or uncheck 'transcribe' in the archive panel.)"
-            : "";
-          warnings.push({ stage: "transcription", candidateId: candidate.id, message: detail + hint });
-          emitProgress({ stage: "transcription", status: "error", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: errorMessage(error, "Transcription failed") });
-        }
+        postClipTasks.push(
+          transcribeClip(generatedClip.outputPath, input)
+            .then((tx) => {
+              transcription = tx;
+              generatedCandidate = applyTranscription(generatedCandidate, tx);
+              emitProgress({ stage: "transcription", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Transcribed ${tx.segments.length} segments` });
+            })
+            .catch((error) => {
+              const detail = errorMessage(error, "Could not transcribe generated clip.");
+              const hint = detail.includes("fetch failed") || detail.includes("ECONNREFUSED")
+                ? " (Start the Python FastAPI backend on http://127.0.0.1:8000, or uncheck 'transcribe' in the archive panel.)"
+                : "";
+              warnings.push({ stage: "transcription", candidateId: candidate.id, message: detail + hint });
+              emitProgress({ stage: "transcription", status: "error", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: errorMessage(error, "Transcription failed") });
+            })
+        );
       } else if (generatedClip) {
         emitProgress({ stage: "transcription", status: "done", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: "Transcription skipped (disabled in panel)" });
       }
+
+      await Promise.all(postClipTasks);
 
       // Comment assets (writes to disk for export package)
       if (generatedClip && commentBundle) {
