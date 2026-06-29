@@ -34,6 +34,12 @@ type RequestBody = {
     with_danmaku?: boolean;
     fast?: boolean;
     format?: string;
+    all_comments?: boolean;
+    safety_comment_limit?: number | null;
+    preset?: "ultrafast" | "veryfast" | "fast" | "medium" | "slow";
+    crf?: number;
+    reuse_temp_clip?: boolean;
+    reuse_ass?: boolean;
   };
   // Allow the caller to override the clip range (e.g. after "Set from current")
   edited_start?: number;

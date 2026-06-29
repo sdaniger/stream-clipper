@@ -3,6 +3,14 @@ import React from "react";
 import type { HighlightCandidate } from "@/lib/twitch-time";
 import type { DanmakuChatMessage, DanmakuDensity, DanmakuExportOptions, DanmakuExportSource, DanmakuFallback } from "@/lib/studio-api";
 
+export type FfmpegQuality = "high_speed" | "standard" | "high_quality";
+
+const QUALITY_PRESETS: Record<FfmpegQuality, { preset: string; crf: number; label: string }> = {
+  high_speed:    { preset: "ultrafast", crf: 26, label: "高速" },
+  standard:      { preset: "veryfast",  crf: 23, label: "標準" },
+  high_quality:  { preset: "medium",    crf: 20, label: "高品質" },
+};
+
 interface Props {
   candidate: HighlightCandidate;
   chatInRange: DanmakuChatMessage[];
@@ -15,23 +23,29 @@ interface Props {
     output_file?: string;
     temporary_video_file?: string;
     ass_file?: string;
+    range_comment_count?: number;
+    burned_comment_count?: number;
     comment_count?: number;
     in_range_count?: number;
     skipped_ng?: number;
     skipped_too_short?: number;
     skipped_duplicate?: number;
+    skipped_safety_limit?: number;
+    all_comments?: boolean;
+    ffmpeg_preset?: string;
+    ffmpeg_crf?: number;
+    ass_cache_hit?: boolean;
+    temp_video_cache_hit?: boolean;
     fallback?: DanmakuFallback;
   } | null;
   exportSource: DanmakuExportSource;
   setExportSource: (s: DanmakuExportSource) => void;
   onExportWithDanmaku: (options: DanmakuExportOptions) => void;
-  onExportWithoutDanmaku: () => void;
+  onExportWithoutDanmaku: (options: DanmakuExportOptions) => void;
   onExportAssOnly: (options: DanmakuExportOptions) => void;
   // Form state lifted to parent
   density: DanmakuDensity;
   setDensity: (v: DanmakuDensity) => void;
-  maxComments: number;
-  setMaxComments: (v: number) => void;
   fontSize: number;
   setFontSize: (v: number) => void;
   commentDuration: number;
@@ -44,6 +58,8 @@ interface Props {
   setMinMessageLength: (v: number) => void;
   deduplicateConsecutive: boolean;
   setDeduplicateConsecutive: (v: boolean) => void;
+  quality: FfmpegQuality;
+  setQuality: (v: FfmpegQuality) => void;
 }
 
 export default function DanmakuPanel({
@@ -60,8 +76,6 @@ export default function DanmakuPanel({
   onExportAssOnly,
   density,
   setDensity,
-  maxComments,
-  setMaxComments,
   fontSize,
   setFontSize,
   commentDuration,
@@ -74,26 +88,23 @@ export default function DanmakuPanel({
   setMinMessageLength,
   deduplicateConsecutive,
   setDeduplicateConsecutive,
+  quality,
+  setQuality,
 }: Props) {
-  // ── Source availability ──────────────────────────────────────────────
   const twitchAvailable = hasVodUrl;
   const localAvailable = hasLocalVideo;
   const chatAvailable = chatInRange.length > 0;
   const candidateAvailable = !!candidate;
 
-  // Source disabled reasons
   const twitchDisabled = !twitchAvailable;
   const localDisabled = !localAvailable;
-  const assAlwaysAvailable = candidateAvailable; // ass_only needs only a candidate
 
-  // Button enable logic per source
   const enableWithDanmaku =
     (exportSource === "twitch_vod" && twitchAvailable) ||
     (exportSource === "local_file" && localAvailable);
   const enableWithoutDanmaku = enableWithDanmaku;
-  const enableAssOnly = (exportSource === "ass_only" || exportSource === "twitch_vod" || exportSource === "local_file") && candidateAvailable;
+  const enableAssOnly = candidateAvailable;
 
-  // Build disable reason for the current source
   const sourceDisabledReason = (() => {
     if (exportSource === "twitch_vod" && !twitchAvailable) {
       return "Twitch VOD URLが必要です";
@@ -115,16 +126,34 @@ export default function DanmakuPanel({
     return null;
   })();
 
-  const buildOptions = (): DanmakuExportOptions => ({
-    density,
-    max_comments: maxComments,
-    font_size: fontSize,
-    comment_duration: commentDuration,
-    opacity,
-    ng_words: ngWords.split(",").map((s) => s.trim()).filter(Boolean),
-    min_message_length: minMessageLength,
-    deduplicate_consecutive: deduplicateConsecutive,
-  });
+  // Estimate lane count for display
+  const laneCount = Math.max(
+    1,
+    Math.floor((1080 * ({ low: 0.55, medium: 0.75, high: 0.9 }[density])) / Math.max(fontSize + 8, 48))
+  );
+
+  const buildOptions = (): DanmakuExportOptions => {
+    const qp = QUALITY_PRESETS[quality];
+    return {
+      density,
+      font_size: fontSize,
+      comment_duration: commentDuration,
+      opacity,
+      ng_words: ngWords.split(",").map((s) => s.trim()).filter(Boolean),
+      min_message_length: minMessageLength,
+      deduplicate_consecutive: deduplicateConsecutive,
+      all_comments: true,
+      safety_comment_limit: null,
+      preset: qp.preset as any,
+      crf: qp.crf,
+      reuse_temp_clip: true,
+      reuse_ass: false,
+    };
+  };
+
+  // Last result summaries
+  const lastRange = lastResult?.range_comment_count;
+  const lastBurned = lastResult?.burned_comment_count;
 
   return (
     <div className="glass-panel rounded-lg p-3">
@@ -239,32 +268,83 @@ export default function DanmakuPanel({
         </div>
       )}
 
+      {/* 全コメント表示 - new "all comments" mode info */}
+      {exportSource !== "ass_only" && (
+        <div className="mb-2 px-2 py-1.5 bg-cyan-500/10 border border-cyan-500/30 rounded text-[10px] text-cyan-200">
+          ✓ この範囲で流れていたコメントをすべて焼き込みます
+        </div>
+      )}
+
+      {/* Counters */}
+      {exportSource !== "ass_only" && (
+        <div className="grid grid-cols-2 gap-1 mb-2 text-[10px]">
+          <div className="px-2 py-1 rounded bg-slate-800/50">
+            <div className="text-slate-500">範囲内コメント</div>
+            <div className="text-slate-200 font-mono font-semibold">{chatInRange.length} 件</div>
+          </div>
+          <div className="px-2 py-1 rounded bg-slate-800/50">
+            <div className="text-slate-500">焼き込み予定</div>
+            <div className="text-cyan-300 font-mono font-semibold">
+              {chatInRange.length} 件 <span className="text-slate-500 text-[9px]">(全コメント)</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Quality preset radio */}
+      <div className="mb-2">
+        <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-1">品質</div>
+        <div className="grid grid-cols-3 gap-1">
+          {(["high_speed", "standard", "high_quality"] as FfmpegQuality[]).map((q) => {
+            const qp = QUALITY_PRESETS[q];
+            return (
+              <label
+                key={q}
+                className={`flex flex-col items-center gap-0.5 px-1.5 py-1.5 rounded cursor-pointer transition-colors ${
+                  quality === q
+                    ? "bg-cyan-600/30 border border-cyan-500/60"
+                    : "bg-slate-800/40 border border-slate-700/40 hover:bg-slate-700/40"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="quality"
+                  value={q}
+                  checked={quality === q}
+                  onChange={() => setQuality(q)}
+                  className="sr-only"
+                />
+                <span className="text-[11px] font-semibold text-slate-200">{qp.label}</span>
+                <span className="text-[9px] text-slate-500 font-mono">
+                  {qp.preset} crf={qp.crf}
+                </span>
+              </label>
+            );
+          })}
+        </div>
+      </div>
+
       {/* Options grid - only show when danmaku is relevant */}
       {exportSource !== "ass_only" && (
         <>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-2">
             <div className="flex flex-col gap-0.5">
-              <label className="text-[9px] text-slate-500 uppercase">密度</label>
+              <label className="text-[9px] text-slate-500 uppercase">密度 (重なり)</label>
               <select
                 value={density}
                 onChange={(e) => setDensity(e.target.value as DanmakuDensity)}
                 className="bg-slate-950 border border-slate-700 text-slate-200 rounded px-1.5 py-0.5 text-[11px] outline-none focus:border-cyan-500"
               >
-                <option value="low">low (50)</option>
-                <option value="medium">medium (120)</option>
-                <option value="high">high (250)</option>
+                <option value="low">low (見やすさ)</option>
+                <option value="medium">medium (標準)</option>
+                <option value="high">high (多め)</option>
               </select>
             </div>
             <div className="flex flex-col gap-0.5">
-              <label className="text-[9px] text-slate-500 uppercase">最大コメント数</label>
-              <input
-                type="number"
-                value={maxComments}
-                min={1}
-                max={1000}
-                onChange={(e) => setMaxComments(Number(e.target.value) || 120)}
-                className="bg-slate-950 border border-slate-700 text-slate-200 rounded px-1.5 py-0.5 text-[11px] outline-none focus:border-cyan-500"
-              />
+              <label className="text-[9px] text-slate-500 uppercase">表示レーン数</label>
+              <div className="bg-slate-950 border border-slate-700 text-slate-200 rounded px-1.5 py-0.5 text-[11px] font-mono">
+                {laneCount}
+              </div>
             </div>
             <div className="flex flex-col gap-0.5">
               <label className="text-[9px] text-slate-500 uppercase">フォントサイズ</label>
@@ -348,7 +428,7 @@ export default function DanmakuPanel({
           {isExporting === "with" ? "⏳ 出力中..." : "🎬 弾幕付きで出力"}
         </button>
         <button
-          onClick={() => onExportWithoutDanmaku()}
+          onClick={() => onExportWithoutDanmaku(buildOptions())}
           disabled={!enableWithoutDanmaku || !!sourceDisabledReason || isExporting !== null}
           className="px-3 py-2 text-xs font-semibold rounded-md bg-slate-700/60 border border-slate-600 text-slate-200 hover:bg-slate-600/60 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           title={sourceDisabledReason ?? "弾幕なしで範囲のみを切り出し"}
@@ -373,6 +453,24 @@ export default function DanmakuPanel({
               Export source: {lastResult.source}
             </div>
           )}
+          {/* Counters: range vs burned */}
+          {lastRange !== undefined && lastBurned !== undefined && (
+            <div className="text-slate-300 font-mono mb-1">
+              範囲内 <span className="text-slate-100 font-semibold">{lastRange}</span> 件 · 焼き込み <span className={`font-semibold ${lastRange === lastBurned ? "text-emerald-300" : "text-amber-300"}`}>{lastBurned}</span> 件
+              {lastRange === lastBurned ? " (全コメント)" : " (間引きあり)"}
+            </div>
+          )}
+          {lastResult.ffmpeg_preset && lastResult.ffmpeg_crf && (
+            <div className="text-slate-500 font-mono text-[9px]">
+              ffmpeg: {lastResult.ffmpeg_preset} · crf={lastResult.ffmpeg_crf}
+            </div>
+          )}
+          {lastResult.temp_video_cache_hit && (
+            <div className="text-slate-500 text-[9px]">✓ 一時動画キャッシュ使用</div>
+          )}
+          {lastResult.ass_cache_hit && (
+            <div className="text-slate-500 text-[9px]">✓ ASSキャッシュ使用</div>
+          )}
           {lastResult.temporary_video_file && (
             <div className="text-slate-400">
               <span className="font-semibold">一時動画:</span> <code className="text-slate-300">{lastResult.temporary_video_file}</code>
@@ -386,14 +484,6 @@ export default function DanmakuPanel({
           {lastResult.ass_file && (
             <div className="text-emerald-300 mt-0.5">
               <span className="font-semibold">ASS:</span> <code className="text-emerald-200">{lastResult.ass_file}</code>
-            </div>
-          )}
-          {lastResult.comment_count !== undefined && lastResult.in_range_count !== undefined && (
-            <div className="text-slate-400 mt-0.5">
-              使用 {lastResult.comment_count} / 範囲内 {lastResult.in_range_count} 件
-              {lastResult.skipped_ng !== undefined && lastResult.skipped_ng > 0 && ` · NG ${lastResult.skipped_ng}`}
-              {lastResult.skipped_too_short !== undefined && lastResult.skipped_too_short > 0 && ` · 短 ${lastResult.skipped_too_short}`}
-              {lastResult.skipped_duplicate !== undefined && lastResult.skipped_duplicate > 0 && ` · 重複 ${lastResult.skipped_duplicate}`}
             </div>
           )}
         </div>

@@ -22,7 +22,7 @@ import AdvancedSettings from "@/components/studio/AdvancedSettings";
 import ClipActionPanel from "@/components/studio/ClipActionPanel";
 import TimelineGraph from "@/components/studio/TimelineGraph";
 import ExportStatusPanel from "@/components/studio/ExportStatusPanel";
-import DanmakuPanel from "@/components/studio/DanmakuPanel";
+import DanmakuPanel, { type FfmpegQuality } from "@/components/studio/DanmakuPanel";
 
 type StudioMode = "twitch" | "local";
 type ExportStatus = "idle" | "exporting" | "exported" | "error";
@@ -152,15 +152,16 @@ export default function StudioClient() {
   const [normalizedChat, setNormalizedChat] = useState<DanmakuChatMessage[]>([]);
   const [danmakuExporting, setDanmakuExporting] = useState<DanmakuExportKind>(null);
   const [danmakuLastResult, setDanmakuLastResult] = useState<DanmakuExportResponse | null>(null);
-  // Danmaku form state
+  // Danmaku form state (all-comments mode by default — no per-stream cap)
   const [danmakuDensity, setDanmakuDensity] = useState<DanmakuDensity>("medium");
-  const [danmakuMaxComments, setDanmakuMaxComments] = useState(120);
   const [danmakuFontSize, setDanmakuFontSize] = useState(32);
   const [danmakuCommentDuration, setDanmakuCommentDuration] = useState(4.0);
   const [danmakuOpacity, setDanmakuOpacity] = useState(0.9);
   const [danmakuNgWords, setDanmakuNgWords] = useState("");
   const [danmakuMinMessageLength, setDanmakuMinMessageLength] = useState(1);
   const [danmakuDeduplicate, setDanmakuDeduplicate] = useState(true);
+  // Quality preset for FFmpeg encoding
+  const [danmakuQuality, setDanmakuQuality] = useState<"high_speed" | "standard" | "high_quality">("standard");
   // Danmaku export track (which candidates have been danmaku-exported)
   const [danmakuExportedIds, setDanmakuExportedIds] = useState<Set<string | number>>(new Set());
   // Danmaku export source selection
@@ -505,11 +506,9 @@ export default function StudioClient() {
       addLog("error", "候補が選択されていません");
       return;
     }
-    // Validate per-source requirements
     const hasVod = mode === "twitch" && !!videoId;
     const hasLocal = mode === "local" && videoPath.trim().length > 0;
     if (kind !== "ass") {
-      // MP4 export requires either VOD or local file
       if (exportSource === "twitch_vod" && !hasVod) {
         addLog("error", "Twitch VOD sourceの選択にはVOD URLが必要です");
         setErrorMessage("Twitch VOD sourceの選択にはVOD URLが必要です");
@@ -524,8 +523,6 @@ export default function StudioClient() {
         addLog("error", "MP4出力にはTwitch VODまたはlocal_file sourceが必要です");
         return;
       }
-    } else {
-      // ASS only: needs a candidate only
     }
     setDanmakuExporting(kind);
     setDanmakuLastResult(null);
@@ -534,7 +531,7 @@ export default function StudioClient() {
     const end = getEnd(selectedCandidate);
     addLog("user", `Export source: ${exportSource}`);
     addLog("user", `選択範囲: ${formatTimecode(start)} - ${formatTimecode(end)}`);
-    addLog("user", `範囲内コメントを抽出: ${chatInRange.length}件`);
+    addLog("user", `選択範囲内コメント: ${chatInRange.length}件`);
 
     try {
       if (kind === "with") {
@@ -549,13 +546,12 @@ export default function StudioClient() {
           video_id: exportSource === "twitch_vod" ? videoId : null,
           candidate: selectedCandidate,
           chat: chatInRange,
-          options: { ...options, with_danmaku: true },
+          options: { ...options, with_danmaku: true, all_comments: true, safety_comment_limit: null },
         });
         if (!result.ok) {
           addLog("error", `弾幕出力失敗: ${result.message ?? "Unknown error"}`);
           setErrorMessage(result.message ?? "弾幕出力に失敗しました");
           setDanmakuLastResult(result);
-          // If fallback is suggested, log it
           if (result.fallback) {
             const f = result.fallback;
             const opts = [];
@@ -565,13 +561,21 @@ export default function StudioClient() {
             if (opts.length > 0) addLog("warn", `フォールバック可能: ${opts.join(" / ")}`);
           }
         } else {
-          if (result.temporary_video_file) {
-            addLog("user", `一時動画取得: ${result.temporary_video_file}`);
+          if (result.temp_video_cache_hit) {
+            addLog("user", `✓ 範囲動画キャッシュ使用: ${result.temporary_video_file}`);
+          } else if (result.temporary_video_file) {
+            addLog("user", `✓ 一時動画取得: ${result.temporary_video_file}`);
           }
-          addLog("user", `弾幕として使用: ${result.comment_count}件`);
+          if (result.ass_cache_hit) {
+            addLog("user", "✓ ASSキャッシュ使用");
+          }
+          addLog("user", `弾幕として使用: ${result.burned_comment_count ?? result.comment_count}件 (全${chatInRange.length}件中)`);
           addLog("user", `ASS生成完了: ${result.ass_file}`);
           addLog("info", "FFmpegで弾幕付き動画を書き出し中...");
-          addLog("user", `弾幕付きクリップ出力完了: ${result.output_file}`);
+          addLog("user", `✅ 弾幕付きクリップ出力完了: ${result.output_file}`);
+          if (result.ffmpeg_preset && result.ffmpeg_crf) {
+            addLog("info", `ffmpeg: ${result.ffmpeg_preset} crf=${result.ffmpeg_crf}`);
+          }
           setDanmakuLastResult(result);
           setDanmakuExportedIds((prev) => new Set(prev).add(selectedCandidate.id ?? selectedCandidate.rank));
         }
@@ -587,7 +591,7 @@ export default function StudioClient() {
           video_id: exportSource === "twitch_vod" ? videoId : null,
           candidate: selectedCandidate,
           chat: [],
-          options: { ...options, with_danmaku: false },
+          options: { ...options, with_danmaku: false, all_comments: true, safety_comment_limit: null },
         });
         if (!result.ok) {
           addLog("error", `書き出し失敗: ${result.message ?? "Unknown error"}`);
@@ -613,22 +617,25 @@ export default function StudioClient() {
           clip_start: start,
           clip_end: end,
           output_path: `output/clip_${Date.now()}_${selectedCandidate.rank}.ass`,
-          options,
+          options: { ...options, all_comments: true, safety_comment_limit: null },
         });
         if (!result.ok) {
           addLog("error", `ASS生成失敗: ${result.message ?? "Unknown error"}`);
           setErrorMessage(result.message ?? "ASS生成に失敗しました");
         } else {
-          addLog("user", `ASS生成完了: ${result.ass_path} (${result.comment_count}件使用)`);
+          addLog("user", `ASS生成完了: ${result.ass_path} (${result.comment_count}件 / 全${chatInRange.length}件中)`);
           setDanmakuLastResult({
             ok: true,
             source: "ass_only",
             ass_file: result.ass_path,
+            range_comment_count: result.in_range_count,
+            burned_comment_count: result.comment_count,
             comment_count: result.comment_count,
             in_range_count: result.in_range_count,
             skipped_ng: result.skipped_ng,
             skipped_too_short: result.skipped_too_short,
             skipped_duplicate: result.skipped_duplicate,
+            all_comments: true,
           });
         }
       }
@@ -639,7 +646,7 @@ export default function StudioClient() {
     } finally {
       setDanmakuExporting(null);
     }
-  }, [selectedCandidate, canExport, videoPath, chatInRange, addLog]);
+  }, [selectedCandidate, canExport, videoPath, chatInRange, addLog, exportSource, mode, videoId, vodUrl]);
 
   // ─── Action panel handlers ────────────────────────────────────────────────
 
@@ -923,12 +930,10 @@ export default function StudioClient() {
               exportSource={exportSource}
               setExportSource={setExportSource}
               onExportWithDanmaku={(opts) => handleDanmakuExport("with", opts)}
-              onExportWithoutDanmaku={() => handleDanmakuExport("without", { with_danmaku: false })}
+              onExportWithoutDanmaku={(opts) => handleDanmakuExport("without", opts)}
               onExportAssOnly={(opts) => handleDanmakuExport("ass", opts)}
               density={danmakuDensity}
               setDensity={setDanmakuDensity}
-              maxComments={danmakuMaxComments}
-              setMaxComments={setDanmakuMaxComments}
               fontSize={danmakuFontSize}
               setFontSize={setDanmakuFontSize}
               commentDuration={danmakuCommentDuration}
@@ -941,6 +946,8 @@ export default function StudioClient() {
               setMinMessageLength={setDanmakuMinMessageLength}
               deduplicateConsecutive={danmakuDeduplicate}
               setDeduplicateConsecutive={setDanmakuDeduplicate}
+              quality={danmakuQuality}
+              setQuality={setDanmakuQuality}
             />
           )}
 

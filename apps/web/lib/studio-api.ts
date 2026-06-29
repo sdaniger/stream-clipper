@@ -294,7 +294,6 @@ export type DanmakuDensity = "low" | "medium" | "high";
 
 export type DanmakuExportOptions = {
   density?: DanmakuDensity;
-  max_comments?: number;
   font_size?: number;
   font_name?: string;
   comment_duration?: number;
@@ -307,6 +306,13 @@ export type DanmakuExportOptions = {
   output_dir?: string;
   with_danmaku?: boolean;
   fast?: boolean;
+  // New (all-comments mode)
+  all_comments?: boolean;
+  safety_comment_limit?: number | null;
+  preset?: "ultrafast" | "veryfast" | "fast" | "medium" | "slow";
+  crf?: number;
+  reuse_temp_clip?: boolean;
+  reuse_ass?: boolean;
 };
 
 export type DanmakuChatMessage = {
@@ -353,14 +359,25 @@ export type DanmakuExportResponse = {
   output_file?: string;
   temporary_video_file?: string;
   ass_file?: string;
+  // New: every in-range comment is emitted. range_comment_count ==
+  // burned_comment_count unless the user opted into a safety cap.
+  range_comment_count?: number;
+  burned_comment_count?: number;
+  all_comments?: boolean;
+  // Legacy aliases
   comment_count?: number;
   in_range_count?: number;
   skipped_ng?: number;
   skipped_too_short?: number;
   skipped_duplicate?: number;
+  skipped_safety_limit?: number;
   clip_start?: number;
   clip_end?: number;
   error_code?: string;
+  ffmpeg_preset?: string;
+  ffmpeg_crf?: number;
+  ass_cache_hit?: boolean;
+  temp_video_cache_hit?: boolean;
   message?: string;
   fallback?: DanmakuFallback;
   duration_seconds?: number;

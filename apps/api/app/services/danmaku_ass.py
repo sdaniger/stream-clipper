@@ -2,23 +2,27 @@
 Danmaku ASS subtitle generator.
 
 Generates NicoNico-style right-to-left scrolling comment overlays for MP4 export.
-Comments are placed in horizontal lanes (rows) to avoid overlap.
+All comments within the selected time range are emitted as ASS Dialogue lines;
+no per-stream cap is applied. Comments are placed in horizontal lanes (rows)
+to minimise overlap, with a per-lane "next free time" tracking that allows
+overlap when a lane is busy and falls back to overwriting the soonest-freeing
+lane for very dense bursts.
 
 MVP scope:
 - 1920x1080 baseline resolution (overridable via play_res)
 - Right-to-left scrolling using ASS `\\move` override tag
-- Lane assignment via greedy per-row "next free time" tracking
-- Comment density filtering (low / medium / high)
+- Lane assignment via greedy "next free time" tracking (with density
+  controlling lane count and per-comment display time)
+- All comments in the selected range are emitted by default
+- Optional safety_comment_limit for runaway cases (off by default)
 - Basic escape for ASS control characters
 
 Future improvements:
 - Detect video resolution via ffprobe
-- Prioritize comments by keyword hits / chat velocity
 - Support for top/bottom static comments (in addition to scrolling)
 """
 from __future__ import annotations
 
-import html
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,23 +35,18 @@ DEFAULT_PLAY_RES_X = 1920
 DEFAULT_PLAY_RES_Y = 1080
 DEFAULT_FONT_NAME = "Noto Sans CJK JP"
 DEFAULT_FONT_SIZE = 32
-DEFAULT_COMMENT_DURATION = 4.0  # seconds the comment is visible on screen
 DEFAULT_OPACITY = 0.9
 DEFAULT_LINE_HEIGHT = 48  # pixels between comment rows
+DEFAULT_LANE_FRACTION = 0.75  # top 75% of the screen is the danmaku area
 
-# Density presets (max comments to emit)
+# Density presets control lane count and per-comment display time
+# (not the number of comments emitted — all comments are emitted by default)
 DENSITY_PRESETS = {
-    "low": 50,
-    "medium": 120,
-    "high": 250,
+    # name: (lane_fraction, comment_duration)
+    "low":    (0.55, 6.0),    # sparser, longer display
+    "medium": (0.75, 4.0),    # standard
+    "high":   (0.90, 3.0),    # busy stream, faster scroll, more lanes
 }
-
-# Priority keywords (used when filtering/picking top comments)
-PRIORITY_KEYWORDS = (
-    "草", "ｗ", "w", "www", "笑", "爆笑", "腹痛い", "おもろ",
-    "やばい", "やば", "lol", "lmao", "神", "最高", "天才",
-    "きた", "来た", "ｷﾀ", "キタ", "助けて", "たすけて",
-)
 
 
 # ─── Data classes ─────────────────────────────────────────────────────────────
@@ -67,13 +66,14 @@ class DanmakuOptions:
     play_res_y: int = DEFAULT_PLAY_RES_Y
     font_name: str = DEFAULT_FONT_NAME
     font_size: int = DEFAULT_FONT_SIZE
-    comment_duration: float = DEFAULT_COMMENT_DURATION
+    comment_duration: float = 4.0
     opacity: float = DEFAULT_OPACITY
-    max_comments: int = 120
     density: str = "medium"  # "low" | "medium" | "high"
     ng_words: Sequence[str] = field(default_factory=tuple)
-    min_message_length: int = 1  # exclude comments with fewer than this many chars
+    min_message_length: int = 1
     deduplicate_consecutive: bool = True
+    # Optional cap; None means "no cap" (emit every in-range comment).
+    safety_comment_limit: Optional[int] = None
 
 
 @dataclass
@@ -83,6 +83,7 @@ class DanmakuStats:
     skipped_ng: int
     skipped_too_short: int
     skipped_duplicate: int
+    skipped_safety_limit: int = 0
 
 
 @dataclass
@@ -99,10 +100,8 @@ def format_ass_time(seconds: float) -> str:
     hours = int(safe // 3600)
     minutes = int((safe % 3600) // 60)
     secs = safe - (hours * 3600) - (minutes * 60)
-    # ASS uses centiseconds (two digits after the dot)
     centis = int(round((secs - int(secs)) * 100))
     if centis == 100:
-        # Rounding edge case
         centis = 0
         secs += 1
     return f"{hours:d}:{minutes:02d}:{int(secs):02d}.{centis:02d}"
@@ -130,21 +129,22 @@ def contains_ng_word(text: str, ng_words: Iterable[str]) -> bool:
     return False
 
 
-def priority_score(text: str) -> int:
-    """Higher score = more likely to be shown when comments overflow."""
-    score = 0
-    lowered = text.lower()
-    for kw in PRIORITY_KEYWORDS:
-        if kw in lowered:
-            score += 1
-    # Slight preference for moderately long comments
-    length = len(text.strip())
-    if 4 <= length <= 30:
-        score += 1
-    return score
+# ─── Lane assignment ─────────────────────────────────────────────────────────
+
+def _lane_count_for_density(play_res_y: int, font_size: int, density: str) -> int:
+    """Compute the number of horizontal lanes based on density preset and font size."""
+    lane_fraction, _ = DENSITY_PRESETS.get(density, DENSITY_PRESETS["medium"])
+    line_height = max(font_size + 8, DEFAULT_LINE_HEIGHT)
+    usable = int(play_res_y * lane_fraction)
+    return max(1, usable // line_height)
 
 
-# ─── Lane assignment ──────────────────────────────────────────────────────────
+def _lane_y_for(lane: int, play_res_y: int, font_size: int) -> int:
+    line_height = max(font_size + 8, DEFAULT_LINE_HEIGHT)
+    margin_top = int(play_res_y * 0.05)
+    y = margin_top + lane * line_height
+    return min(y, play_res_y - line_height)
+
 
 def assign_lanes(
     comments: List[NormalizedChatMessage],
@@ -153,23 +153,22 @@ def assign_lanes(
     play_res_y: int,
     font_size: int,
     comment_duration: float,
+    density: str = "medium",
 ) -> List[Tuple[NormalizedChatMessage, int]]:
     """
-    Greedy lane assignment.
+    Lane assignment that minimises overlap.
 
-    Returns a list of (comment, lane_index) pairs in input order.
-    Comments are assigned to the lowest lane that is free for the
-    full visibility window of the comment.
+    For each comment (already sorted by timestamp) we look for the lowest
+    lane whose `next_free_at` is <= the comment's rel_start. If all lanes
+    are busy, we overwrite the lane that frees up earliest.
 
-    lane_index ranges 0..num_lanes-1 (top to bottom).
+    Lane count is derived from the density preset's lane_fraction so the
+    total rendered surface scales with the resolution.
     """
-    line_height = max(font_size + 8, DEFAULT_LINE_HEIGHT)
-    # Reserve ~10% top + bottom for safety
-    usable = int(play_res_y * 0.8)
-    num_lanes = max(1, usable // line_height)
+    num_lanes = _lane_count_for_density(play_res_y, font_size, density)
 
-    # next_free_at[lane] = the absolute clip-relative time at which the lane
-    # becomes free again. Initialize all lanes to 0.
+    # next_free_at[lane] = the absolute clip-relative time at which the
+    # lane becomes free again. Initialise all lanes to 0.
     next_free_at = [0.0] * num_lanes
 
     result: List[Tuple[NormalizedChatMessage, int]] = []
@@ -177,10 +176,8 @@ def assign_lanes(
         rel_start = max(0.0, c.time_sec - clip_start)
         rel_end = rel_start + comment_duration
         if rel_start >= (clip_end - clip_start):
-            # Comment is at/past the clip end (shouldn't happen, but guard)
             continue
 
-        # Find the lowest lane that's free at rel_start
         chosen = None
         for lane_idx in range(num_lanes):
             if next_free_at[lane_idx] <= rel_start:
@@ -188,10 +185,17 @@ def assign_lanes(
                 break
 
         if chosen is None:
-            # All lanes are busy at this moment — overwrite the lane that
-            # frees up earliest. This degrades gracefully under heavy load.
-            chosen = next_free_at.index(min(next_free_at))
-            # Re-anchor so the comment still starts at rel_start
+            # All lanes busy — overwrite the soonest-freeing one.
+            min_val = next_free_at[0]
+            min_idx = 0
+            for i in range(1, num_lanes):
+                if next_free_at[i] < min_val:
+                    min_val = next_free_at[i]
+                    min_idx = i
+            chosen = min_idx
+            # Re-anchor so the comment starts at rel_start (overlap is
+            # acceptable for very dense bursts — the alternative is to
+            # drop comments, which we want to avoid).
             next_free_at[chosen] = rel_start + comment_duration
         else:
             next_free_at[chosen] = rel_end
@@ -202,22 +206,21 @@ def assign_lanes(
 
 # ─── ASS text escape ──────────────────────────────────────────────────────────
 
+_ESCAPE_RE = re.compile(r"[\x00-\x1f\x7f]")
+
 def escape_ass_text(text: str, max_length: int = 80) -> str:
     """
     Escape characters that would break ASS parsing.
 
-    - Strip control characters
-    - Replace newlines with spaces
-    - Remove ASS override tag braces to avoid clashes
-    - Truncate overly long messages
+    Note: this only sanitises the *text content*; it never reduces the
+    number of comments emitted. The `max_length` cap is purely cosmetic
+    (to keep on-screen text from wrapping off the right edge).
     """
     cleaned = text.replace("\r", " ").replace("\n", " ")
-    # ASS treats { ... } as override tags. Strip them to keep the text
-    # from being interpreted as a tag. We also escape any literal braces.
+    # ASS treats { ... } as override tags. Strip them so the comment
+    # text is not interpreted as a tag.
     cleaned = cleaned.replace("{", "(").replace("}", ")")
-    # Strip other non-printable / control characters
-    cleaned = re.sub(r"[\x00-\x1f\x7f]", "", cleaned)
-    # Truncate
+    cleaned = _ESCAPE_RE.sub("", cleaned)
     if len(cleaned) > max_length:
         cleaned = cleaned[: max_length - 1] + "…"
     return cleaned.strip()
@@ -227,9 +230,6 @@ def escape_ass_text(text: str, max_length: int = 80) -> str:
 
 def build_ass_header(opts: DanmakuOptions) -> str:
     """Build the [Script Info] / [V4+ Styles] sections of the ASS file."""
-    # ASS uses &HAABBGGRR for colors (alpha-blue-green-red, little-endian).
-    # We pick white text, black outline, semi-transparent black shadow.
-    # Alpha is two hex digits where 00 = opaque, FF = transparent.
     alpha = max(0, min(255, int(round((1.0 - opts.opacity) * 255))))
     primary = f"&H{alpha:02X}FFFFFF"   # white text
     outline = "&H00000000"             # black outline (opaque)
@@ -275,16 +275,8 @@ def build_dialogue_line(
         rel_start = 0.0
     rel_end = rel_start + comment_duration
 
-    # y-coordinate: top of screen is y=0. We want a small top margin so
-    # comments don't bump against the video border.
-    line_height = max(font_size + 8, DEFAULT_LINE_HEIGHT)
-    margin_top = int(play_res_y * 0.05)
-    y = margin_top + lane * line_height
-    # Clamp y so the comment fits
-    y = min(y, play_res_y - line_height)
+    y = _lane_y_for(lane, play_res_y, font_size)
 
-    # x: start at right edge + text width buffer, end off-screen on the left
-    # ASS \\move(x1,y1,x2,y2) — use 1.5x PlayResX to be safe with long text
     x_start = play_res_x + 200
     x_end = -int(play_res_x * 0.5)
 
@@ -307,20 +299,16 @@ def generate_danmaku_ass(
     """
     Generate an ASS file with right-to-left scrolling comments.
 
-    Args:
-        chat_messages: All normalized chat messages (will be filtered by range)
-        clip_start: Absolute start time of the clip in seconds
-        clip_end:   Absolute end time of the clip in seconds
-        output_path: Filesystem path to write the .ass file to
-        options:     DanmakuOptions (defaults are used when None)
-
-    Returns:
-        DanmakuResult with path and filtering stats
+    By default every in-range comment is emitted. To cap the total
+    number of comments (for runaway cases), set
+    `options.safety_comment_limit` to a positive integer.
     """
     opts = options or DanmakuOptions()
-    if opts.density in DENSITY_PRESETS and opts.max_comments == DanmakuOptions().max_comments:
-        # Density preset overrides max_comments if user didn't override
-        opts.max_comments = DENSITY_PRESETS[opts.density]
+    # Resolve density-specific knobs
+    _, density_duration = DENSITY_PRESETS.get(opts.density, DENSITY_PRESETS["medium"])
+    # If the user didn't explicitly set comment_duration, use the density default
+    if opts.comment_duration == DanmakuOptions().comment_duration:
+        opts.comment_duration = density_duration
 
     # ── Step 1: Filter by range ──────────────────────────────────────────────
     in_range: List[NormalizedChatMessage] = []
@@ -330,7 +318,7 @@ def generate_danmaku_ass(
             continue
         in_range.append(msg)
 
-    # ── Step 2: Apply message-level filters ──────────────────────────────────
+    # ── Step 2: Apply message-level filters (never reduce chat scope) ───────
     filtered: List[NormalizedChatMessage] = []
     skipped_ng = 0
     skipped_short = 0
@@ -360,15 +348,30 @@ def generate_danmaku_ass(
     # ── Step 4: Sort by timestamp ────────────────────────────────────────────
     deduped.sort(key=lambda m: m.time_sec)
 
-    # ── Step 5: Cap to max_comments, prioritizing interesting ones ───────────
+    # ── Step 5: Optional safety cap (off by default) ─────────────────────────
+    skipped_safety = 0
     capped = deduped
-    if len(deduped) > opts.max_comments:
+    if opts.safety_comment_limit is not None and len(deduped) > opts.safety_comment_limit:
         # Score-based selection: keep the highest-priority comments, then
-        # spread across the clip so we don't drop the start or end entirely.
-        scored = [(priority_score(m.message), i, m) for i, m in enumerate(deduped)]
-        scored.sort(key=lambda t: (-t[0], t[1]))
-        chosen = sorted(scored[: opts.max_comments], key=lambda t: t[1])
+        # spread them across the clip so the start/end aren't dropped.
+        def _score(m: NormalizedChatMessage, idx: int) -> Tuple[int, int]:
+            score = 0
+            lowered = m.message.lower()
+            for kw in ("草", "www", "笑", "やばい", "神", "最高", "lol", "lmao", "ｗ"):
+                if kw in lowered:
+                    score += 1
+            # Prefer moderately long comments
+            length = len(m.message.strip())
+            if 4 <= length <= 30:
+                score += 1
+            return (-score, idx)
+        scored = sorted(
+            ((_score(m, i), i, m) for i, m in enumerate(deduped)),
+            key=lambda t: t[0],
+        )
+        chosen = sorted(scored[: opts.safety_comment_limit], key=lambda t: t[1])
         capped = [m for _, _, m in chosen]
+        skipped_safety = len(deduped) - len(capped)
 
     # ── Step 6: Assign lanes ─────────────────────────────────────────────────
     lane_pairs = assign_lanes(
@@ -378,9 +381,10 @@ def generate_danmaku_ass(
         play_res_y=opts.play_res_y,
         font_size=opts.font_size,
         comment_duration=opts.comment_duration,
+        density=opts.density,
     )
 
-    # ── Step 7: Build ASS ────────────────────────────────────────────────────
+    # ── Step 7: Build ASS via list-append + join (fast) ─────────────────────
     header = build_ass_header(opts)
     lines: List[str] = [header]
     for comment, lane in lane_pairs:
@@ -410,6 +414,7 @@ def generate_danmaku_ass(
             skipped_ng=skipped_ng,
             skipped_too_short=skipped_short,
             skipped_duplicate=skipped_duplicate,
+            skipped_safety_limit=skipped_safety,
         ),
     )
 
