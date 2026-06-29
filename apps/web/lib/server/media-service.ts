@@ -1,5 +1,6 @@
 import { execFile, spawn } from "node:child_process";
-import { access, copyFile, mkdir, stat, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, stat, unlink, writeFile } from "node:fs/promises";
+import { cpus } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { ClipCandidate, ClipCandidateVariant, ClipTranscription, CommentAssetReference, CommentBurnedClipReference, GeneratedClipReference, ThumbnailCandidateReference } from "@/lib/mock-candidates";
@@ -438,28 +439,43 @@ export async function burnCommentsIntoClip(input: BurnCommentsIntoClipInput): Pr
     throw new Error(ffmpeg.error ?? "ffmpeg is not available on PATH.");
   }
 
-  const { assRelativePath } = await prepareAssFile(input);
+  const { absoluteAssPath, assRelativePath } = await prepareAssFile(input);
   const outputFileName = buildCommentBurnedOutputFileName(input.candidateId, input.variantId);
   const paths = getMediaPaths();
   const outputPath = path.join(paths.outputClipsWithCommentsDir, outputFileName);
   const outputRelativePath = path.join("output", "clips_with_comments", outputFileName).replaceAll(path.sep, "/");
-  const filterRelativePath = toPosixPath(assRelativePath);
+  // Use absolute path for the ass= filter. ffmpeg's libass cannot always
+  // resolve relative paths reliably on Linux even when cwd is set, so
+  // always pass an absolute POSIX path to the filter.
+  const filterAssPath = toPosixPath(absoluteAssPath);
 
   const encoder = input.encoder ?? "libx264";
-  const preset = input.preset ?? "veryfast";
+  // Use a faster libx264 preset for development burn-in. "ultrafast" is
+  // ~5x faster than "veryfast" and still produces a clean overlay; the
+  // slight quality hit is acceptable for a tool that re-encodes already-
+  // compressed HLS content. NVENC gets its own preset family.
+  const preset = input.preset ?? "ultrafast";
   const crf = input.crf ?? 20;
   const normalizeAudio = input.normalizeAudio === true;
   const isNvenc = encoder === "h264_nvenc" || encoder === "hevc_nvenc";
 
   const audioFilter = normalizeAudio ? "loudnorm=I=-16:TP=-1.5:LRA=11" : null;
 
+  // Cap libx264 threads so a 1080p burn doesn't starve the dev server.
+  // The default is to use all cores, but with concurrent burn + transcribe
+  // + chat fetch happening, leaving one core free keeps the UI responsive
+  // and the SSE stream alive (prevents the 60s client timeout that was
+  // killing the burn mid-encode and leaving a partial output file).
+  const ffmpegThreads = Math.max(1, (cpus().length || 4) - 1).toString();
+
   const args = [
     "-hide_banner",
     "-y",
+    "-threads", ffmpegThreads,
     "-i",
     absoluteClipPath,
     "-vf",
-    `ass=${quoteFfmpegFilterValue(filterRelativePath)}`,
+    `ass=${quoteFfmpegFilterValue(filterAssPath)}`,
     ...(audioFilter ? ["-af", audioFilter] : []),
     "-c:v",
     encoder,
@@ -480,6 +496,8 @@ export async function burnCommentsIntoClip(input: BurnCommentsIntoClipInput): Pr
   try {
     await execFileAsync("ffmpeg", args, { cwd: getMediaRoot(), timeout: 20 * 60_000, maxBuffer: 32 * 1024 * 1024 });
   } catch (error) {
+    // Clean up any partial output so the next run starts clean.
+    await unlink(outputPath).catch(() => {});
     throw new Error(`FFmpeg comment burn-in failed: ${formatExecError(error)}`);
   }
 
@@ -1245,7 +1263,7 @@ function parseFrameRate(value: string | undefined) {
   return Math.round((numerator / denominator) * 100) / 100;
 }
 
-function formatSeconds(totalSeconds: number) {
+export function formatSeconds(totalSeconds: number) {
   const roundedSeconds = Math.max(0, Math.round(totalSeconds));
   const hours = Math.floor(roundedSeconds / 3600);
   const minutes = Math.floor((roundedSeconds % 3600) / 60);

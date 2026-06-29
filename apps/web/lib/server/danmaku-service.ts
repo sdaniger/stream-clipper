@@ -110,6 +110,14 @@ export type DanmakuExportResult = {
   all_comments?: boolean;
   clip_start?: number;
   clip_end?: number;
+  /** Hard-burn verification: did we actually burn the ASS into the MP4? */
+  hard_burned?: boolean;
+  /** Filter string actually used by FFmpeg (e.g. "ass"). */
+  ffmpeg_filter?: string;
+  /** Video encoder actually used (e.g. "libx264"). */
+  encoder?: string;
+  /** Path to the temp video that was used as FFmpeg input. */
+  temp_video_path?: string;
   error_code?: string;
   message?: string;
   fallback?: { local_file?: boolean; twitch_vod?: boolean; ass_only?: boolean };
@@ -631,6 +639,10 @@ async function ffmpegBurnAss(
  * seconds, optionally apply an ASS filter, and encode to H.264 — all in
  * one invocation. This avoids the round-trip cost of extracting a
  * pre-clip first.
+ *
+ * The ASS filter is mandatory for hard-burn. If `assPath` is empty the
+ * caller should NOT use this function — they should use
+ * `ffmpegExtractClip` (copy-mode) instead.
  */
 async function ffmpegExtractAndBurnOnePass(
   inputPath: string,
@@ -640,7 +652,7 @@ async function ffmpegExtractAndBurnOnePass(
   assPath: string,
   preset: string = "veryfast",
   crf: number = 23,
-): Promise<void> {
+): Promise<{ hardBurned: boolean; sizeBytes: number }> {
   const duration = Math.max(0.1, clipEnd - clipStart);
   const assFilterValue = assPath
     .replaceAll("\\", "/")
@@ -657,6 +669,13 @@ async function ffmpegExtractAndBurnOnePass(
     outputPath,
   ];
   await runFfmpeg(args, 15 * 60_000);
+  // Verify the output file exists and has a non-zero size
+  const fileStat = await stat(outputPath).catch(() => null);
+  const sizeBytes = fileStat?.size ?? 0;
+  // hard-burned = the file exists AND has size > 0 AND we passed the ass
+  // filter. If the file is empty, FFmpeg must have failed silently.
+  const hardBurned = !!assPath && sizeBytes > 0;
+  return { hardBurned, sizeBytes };
 }
 
 // ─── Caching helpers ─────────────────────────────────────────────────────────
@@ -933,31 +952,21 @@ export async function exportDanmakuClip(req: DanmakuExportRequest): Promise<Danm
     }
 
     // ── Burn ASS into the source video (single-pass when possible) ───
+    let hardBurned = false;
+    let burnSizeBytes = 0;
     try {
-      if (source === "twitch_vod") {
-        // The temp file IS the full range — single-pass.
-        await ffmpegExtractAndBurnOnePass(
-          videoInputPath,
-          finalPath,
-          req.clip_start,
-          req.clip_end,
-          assPath,
-          opts.preset,
-          opts.crf,
-        );
-      } else {
-        // local_file: single-pass extract + burn (skips the pre-clip.mp4
-        // round-trip).
-        await ffmpegExtractAndBurnOnePass(
-          videoInputPath,
-          finalPath,
-          req.clip_start,
-          req.clip_end,
-          assPath,
-          opts.preset,
-          opts.crf,
-        );
-      }
+      const burnInput = videoInputPath; // both sources already have a full-range or full file
+      const result = await ffmpegExtractAndBurnOnePass(
+        burnInput,
+        finalPath,
+        req.clip_start,
+        req.clip_end,
+        assPath,
+        opts.preset,
+        opts.crf,
+      );
+      hardBurned = result.hardBurned;
+      burnSizeBytes = result.sizeBytes;
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Unknown FFmpeg error";
       const isTimeout = e instanceof Error && e.message?.toLowerCase().includes("timeout");
@@ -975,6 +984,24 @@ export async function exportDanmakuClip(req: DanmakuExportRequest): Promise<Danm
         skipped_duplicate: assStats.skipped_duplicate,
         skipped_safety_limit: assStats.skipped_safety_limit,
         all_comments: allCommentsMode,
+        ffmpeg_preset: opts.preset,
+        ffmpeg_crf: opts.crf,
+      };
+    }
+
+    // Verify hard-burn: the output file must exist with non-zero size
+    if (!hardBurned) {
+      return {
+        ok: false,
+        source,
+        error_code: "HARD_BURN_VERIFICATION_FAILED",
+        message: "弾幕のハードエンコードに失敗しました。出力ファイルが生成されていないか、サイズが 0 です。",
+        temporary_video_file: temporaryVideoFile,
+        ass_file: toRelativeIfPossible(assPath),
+        range_comment_count: assStats.in_range_count,
+        burned_comment_count: 0,
+        all_comments: allCommentsMode,
+        hard_burned: false,
         ffmpeg_preset: opts.preset,
         ffmpeg_crf: opts.crf,
       };
@@ -1006,6 +1033,9 @@ export async function exportDanmakuClip(req: DanmakuExportRequest): Promise<Danm
       duration_seconds: (Date.now() - start) / 1000,
       ffmpeg_preset: opts.preset,
       ffmpeg_crf: opts.crf,
+      ffmpeg_filter: "ass",
+      encoder: "libx264",
+      hard_burned: hardBurned,
       command_preview: undefined,
       ass_cache_hit: assCacheHit,
       temp_video_cache_hit: tempVideoCacheHit,

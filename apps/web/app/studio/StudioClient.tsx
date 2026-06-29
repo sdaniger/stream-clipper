@@ -84,6 +84,34 @@ export default function StudioClient() {
   const [danmakuDeduplicate, setDeduplicateConsecutive] = useState(true);
   const [danmakuQuality, setDanmakuQuality] = useState<FfmpegQuality>("standard");
   const [safetyCommentLimit, setSafetyCommentLimit] = useState<number | null>(null);
+
+  // Clip length parameters — derived from clipLengthMode but
+  // overridable from Advanced. Defaults: 45s split as 15s pre / 30s post.
+  const [clipLengthMode, setClipLengthMode] = useState<"short" | "standard" | "long">("standard");
+  const [peakPreContext, setPeakPreContext] = useState<number>(15);
+  const [peakPostContext, setPeakPostContext] = useState<number>(30);
+  const [maxClipDuration, setMaxClipDuration] = useState<number>(90);
+  const [minClipDuration, setMinClipDuration] = useState<number>(35);
+  // When clipLengthMode changes, suggest matching defaults.
+  useEffect(() => {
+    if (clipLengthMode === "short") {
+      setPeakPreContext(10);
+      setPeakPostContext(25);
+      setMaxClipDuration(35);
+      setMinClipDuration(30);
+    } else if (clipLengthMode === "long") {
+      setPeakPreContext(20);
+      setPeakPostContext(60);
+      setMaxClipDuration(90);
+      setMinClipDuration(45);
+    } else {
+      // standard
+      setPeakPreContext(15);
+      setPeakPostContext(30);
+      setMaxClipDuration(60);
+      setMinClipDuration(35);
+    }
+  }, [clipLengthMode]);
   const [outputDir, setOutputDir] = useState<string>(() => {
     if (typeof window === "undefined") return "output/danmaku-clips";
     try {

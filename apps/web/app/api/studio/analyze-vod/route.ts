@@ -24,6 +24,10 @@ export async function POST(request: NextRequest) {
       clip_offset,
       keyword_weight,
       keywords,
+      peak_pre_context,
+      peak_post_context,
+      max_clip_duration,
+      min_clip_duration,
     } = body as {
       vod_url?: string;
       top_n?: number;
@@ -34,6 +38,10 @@ export async function POST(request: NextRequest) {
       clip_offset?: number;
       keyword_weight?: number;
       keywords?: string;
+      peak_pre_context?: number;
+      peak_post_context?: number;
+      max_clip_duration?: number;
+      min_clip_duration?: number;
     };
 
     if (!vod_url) {
@@ -146,8 +154,15 @@ export async function POST(request: NextRequest) {
             minGap: min_gap ?? 45,
             step: sSec,
             keywordWeight: keyword_weight ?? 2.0,
-            clipDuration: clip_duration ?? 30,
-            clipOffset: clip_offset ?? 10,
+            // When client sends explicit clip_duration, keep the legacy
+            // "peak - clipOffset .. +clip_duration" semantics. Otherwise
+            // fall back to peak ± context with the new defaults.
+            clipDuration: clip_duration,
+            clipOffset: clip_offset,
+            peakPreContext: peak_pre_context,
+            peakPostContext: peak_post_context,
+            maxClipDuration: max_clip_duration,
+            minClipDuration: min_clip_duration,
             keywords: parsedKeywords,
           };
 

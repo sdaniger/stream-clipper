@@ -10,13 +10,25 @@ import type { HighlightCandidate, TimelineRow } from "@/lib/studio-api";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
+export type ClipLengthMode = "short" | "standard" | "long";
+
 export type StudioAnalyzeOptions = {
   windowSeconds?: number;
   topN?: number;
   minGap?: number;
   step?: number;
   keywordWeight?: number;
+  /** Total clip duration in seconds (peak ± context). */
   clipDuration?: number;
+  /** Seconds of context BEFORE the peak. */
+  peakPreContext?: number;
+  /** Seconds of context AFTER the peak. */
+  peakPostContext?: number;
+  /** Hard cap on clip duration (will not exceed even if "long" mode). */
+  maxClipDuration?: number;
+  /** Min duration below which a candidate is dropped. */
+  minClipDuration?: number;
+  /** Legacy: distance from peak to start (kept for back-compat). */
   clipOffset?: number;
   keywords?: string[];
 };
@@ -48,7 +60,11 @@ const DEFAULT_WINDOW = 30;
 const DEFAULT_STEP = 10;
 const DEFAULT_TOP_N = 10;
 const DEFAULT_MIN_GAP = 45;
-const DEFAULT_CLIP_DURATION = 30;
+const DEFAULT_CLIP_DURATION = 45;
+const DEFAULT_PEAK_PRE_CONTEXT = 15;
+const DEFAULT_PEAK_POST_CONTEXT = 30;
+const DEFAULT_MAX_CLIP_DURATION = 90;
+const DEFAULT_MIN_CLIP_DURATION = 35;
 const DEFAULT_CLIP_OFFSET = 10;
 
 const REACTION_KEYWORDS = [
@@ -177,7 +193,14 @@ export function generateTopNCandidates(
   const stepSec = options.step ?? DEFAULT_STEP;
   const topN = options.topN ?? DEFAULT_TOP_N;
   const minGap = options.minGap ?? DEFAULT_MIN_GAP;
-  const clipDuration = options.clipDuration ?? DEFAULT_CLIP_DURATION;
+  // Peak ± context based clipping
+  const peakPreContext = options.peakPreContext ?? DEFAULT_PEAK_PRE_CONTEXT;
+  const peakPostContext = options.peakPostContext ?? DEFAULT_PEAK_POST_CONTEXT;
+  const maxClipDuration = options.maxClipDuration ?? DEFAULT_MAX_CLIP_DURATION;
+  const minClipDuration = options.minClipDuration ?? DEFAULT_MIN_CLIP_DURATION;
+  // clipDuration kept for back-compat; if explicitly set, override peak context split
+  const explicitClipDuration = options.clipDuration;
+  // Legacy clipOffset only used when explicitClipDuration is set
   const clipOffset = options.clipOffset ?? DEFAULT_CLIP_OFFSET;
 
   // Sort timeline by score descending
@@ -216,8 +239,41 @@ export function generateTopNCandidates(
     const startTime = item.start;
     const endTime = item.end;
     const peakTime = (startTime + endTime) / 2;
-    const clipStart = Math.max(0, peakTime - clipOffset);
-    const clipEnd = clipStart + clipDuration;
+
+    // Compute clip range around peak.
+    // When explicit clipDuration is provided (legacy), use clipOffset
+    // semantics. Otherwise, derive from peak ± context.
+    let clipStart: number;
+    let clipEnd: number;
+    if (explicitClipDuration != null) {
+      // Back-compat: peak - clipOffset .. peak - clipOffset + clipDuration
+      clipStart = Math.max(0, peakTime - clipOffset);
+      clipEnd = clipStart + explicitClipDuration;
+    } else {
+      clipStart = Math.max(0, peakTime - peakPreContext);
+      clipEnd = peakTime + peakPostContext;
+      // Extend end if the timeline score stays elevated through the
+      // current end-time (i.e. the "excitement" hasn't died down).
+      // Look ahead in the timeline; if the next row has score >= 0.5 *
+      // the peak's score and continues within 2 * windowSec, extend end.
+      const peakScore = item.score;
+      const extendLimit = peakTime + maxClipDuration - peakPreContext;
+      for (const next of timeline) {
+        if (next.start <= peakTime) continue; // skip rows before/equal peak
+        if (next.start > extendLimit) break;
+        if (next.score >= peakScore * 0.5) {
+          clipEnd = Math.max(clipEnd, next.end);
+        }
+      }
+    }
+    // Enforce min duration (extend end if needed to meet min)
+    if (clipEnd - clipStart < minClipDuration) {
+      clipEnd = clipStart + minClipDuration;
+    }
+    // Enforce max duration (clamp end)
+    if (clipEnd - clipStart > maxClipDuration) {
+      clipEnd = clipStart + maxClipDuration;
+    }
 
     // Count unique authors in this window
     const windowEntries = entries.filter(
@@ -244,7 +300,7 @@ export function generateTopNCandidates(
       end: endTime,
       peak_time: peakTime,
       clip_start: clipStart,
-      clip_duration: clipDuration,
+      clip_duration: Math.round(clipEnd - clipStart),
       score: Math.round(item.score),
       chat_count: item.chat_count,
       keyword_hits: item.keyword_hits,

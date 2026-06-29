@@ -43,7 +43,7 @@ function loadChatFromJson(content: string): ChatLogEntry[] {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { video_path, log_path, top_n, window: windowSec, min_gap, keywords, step, keyword_weight, clip_duration, clip_offset } = body as {
+    const { video_path, log_path, top_n, window: windowSec, min_gap, keywords, step, keyword_weight, clip_duration, clip_offset, peak_pre_context, peak_post_context, max_clip_duration, min_clip_duration } = body as {
       video_path?: string;
       log_path?: string;
       top_n?: number;
@@ -54,6 +54,10 @@ export async function POST(request: NextRequest) {
       keyword_weight?: number;
       clip_duration?: number;
       clip_offset?: number;
+      peak_pre_context?: number;
+      peak_post_context?: number;
+      max_clip_duration?: number;
+      min_clip_duration?: number;
     };
 
     if (!log_path) {
@@ -130,8 +134,12 @@ export async function POST(request: NextRequest) {
             minGap: min_gap ?? 45,
             step: sSec,
             keywordWeight: keyword_weight ?? 2.0,
-            clipDuration: clip_duration ?? 30,
+            clipDuration: clip_duration,
             clipOffset: clip_offset ?? 10,
+            peakPreContext: peak_pre_context,
+            peakPostContext: peak_post_context,
+            maxClipDuration: max_clip_duration,
+            minClipDuration: min_clip_duration,
             keywords: parsedKeywords,
           };
 

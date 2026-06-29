@@ -8,7 +8,7 @@ import {
   generateScrollingCommentsAss
 } from "@/lib/comment-overlay";
 import type { ClipCandidate, ClipTranscription, GeneratedClipReference, TranscriptSegment } from "@/lib/mock-candidates";
-import { burnCommentsIntoClip, generateClip, generateExportPackage, getMediaRoot, parseTimecode, writeCommentAssets } from "@/lib/server/media-service";
+import { burnCommentsIntoClip, formatSeconds, generateClip, generateExportPackage, getMediaRoot, parseTimecode, writeCommentAssets } from "@/lib/server/media-service";
 import { proxyJsonRequest } from "@/lib/server/api-proxy";
 import { checkBackendHealth, spawnBackend } from "@/lib/server/backend-manager";
 import { fetchChatWithChatDownloaderWithRetry, defaultChatLimitForDuration, getCachedChat, setCachedChat, type FetchChatDownloaderResult } from "@/lib/server/chat-downloader-service";
@@ -133,7 +133,7 @@ export async function runArchiveAutoAnalysis(
   const emitProgress = (event: ArchiveProgressEvent) => { try { onProgress?.(event); } catch { /* client disconnected */ } };
 
   emitProgress({ stage: "metadata", status: "running", message: "Fetching video metadata via yt-dlp..." });
-  const metadata = await extractYtDlpMetadata({ url });
+  const metadata = await extractYtDlpMetadata({ url, signal: input.signal });
   emitProgress({ stage: "metadata", status: "done", message: `${metadata.title ?? metadata.url}` });
 
   // Compute time range and adaptive window size from metadata.
@@ -497,11 +497,16 @@ export async function runArchiveAutoAnalysis(
       //   Phase 1.5 (parallel yt-dlp --download-sections). The section
       //   file IS the candidate's source — no FFmpeg extraction needed.
       let clipInputPath: string;
+      let clipStartInSource: number;
       const sectionPath = sectionDownloads?.get(candidate.id);
       if (sectionPath) {
+        // Section file was downloaded starting at the variant's start time,
+        // so the candidate's clip starts at offset 0 in the section file.
         clipInputPath = sectionPath;
+        clipStartInSource = 0;
       } else if (downloadedVideo?.inputPath) {
         clipInputPath = downloadedVideo.inputPath;
+        clipStartInSource = clipStartSeconds;
       } else {
         warnings.push({ stage: "clip", candidateId: candidate.id, message: "No downloaded video available for clip generation. Phase 1 download may have failed." });
         return candidate;
@@ -524,7 +529,7 @@ export async function runArchiveAutoAnalysis(
           inputPath: clipInputPath,
           candidateId: candidate.id,
           variantId: selectedVariant.id,
-          start: selectedVariant.start,
+          start: formatSeconds(clipStartInSource),
           duration: selectedVariant.duration,
           mode: clipMode,
           encoder: input.encoder,

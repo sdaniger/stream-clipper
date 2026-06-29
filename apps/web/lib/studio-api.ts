@@ -363,6 +363,14 @@ export type DanmakuExportResponse = {
   // burned_comment_count unless the user opted into a safety cap.
   range_comment_count?: number;
   burned_comment_count?: number;
+  /** Hard-burn verification: did the FFmpeg step actually burn the ASS into the MP4? */
+  hard_burned?: boolean;
+  /** FFmpeg filter actually used (e.g. "ass"). */
+  ffmpeg_filter?: string;
+  /** Video encoder actually used (e.g. "libx264"). */
+  encoder?: string;
+  /** Length of the resulting clip in seconds. */
+  clip_duration?: number;
   all_comments?: boolean;
   // Legacy aliases
   comment_count?: number;
