@@ -21,6 +21,7 @@ import Step2CandidateList from "@/components/studio/Step2CandidateList";
 import Step3ExportPanel, { type ExportStage } from "@/components/studio/Step3ExportPanel";
 import AdvancedSettings, { type ExportSource, type FfmpegQuality } from "@/components/studio/AdvancedSettings";
 import LanguageSwitcher from "@/components/studio/LanguageSwitcher";
+import VideoArea from "@/components/studio/VideoArea";
 
 const QUALITY_TO_FFMPEG: Record<FfmpegQuality, { preset: string; crf: number }> = {
   high_speed: { preset: "ultrafast", crf: 26 },
@@ -100,8 +101,8 @@ export default function StudioClient() {
   }, [outputDir]);
 
   // Player refs
-  const localPlayerRef = useRef<{ getCurrentTime: () => number } | null>(null);
-  const twitchPlayerRef = useRef<{ getCurrentTime: () => number; seekTo: (t: number) => boolean } | null>(null);
+  const localPlayerRef = useRef<import("@/components/studio/LocalVideoPlayer").LocalVideoPlayerHandle | null>(null);
+  const twitchPlayerRef = useRef<import("@/components/studio/TwitchVodPlayer").TwitchVodPlayerHandle | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [playerStartTime, setPlayerStartTime] = useState(0);
   const [playerReloadKey, setPlayerReloadKey] = useState(0);
@@ -314,6 +315,68 @@ export default function StudioClient() {
     setSelectedCandidateId(candidate.id ?? candidate.rank);
     addLog("user", t("studio.logSelectCandidate", { rank: candidate.rank, time: "" }));
   }, [addLog, t]);
+
+  // ===== Player actions (jump / preview / set from current) =====
+  const seekToPlayer = useCallback((timeSeconds: number) => {
+    const clamped = Math.max(0, timeSeconds);
+    setPlayerStartTime(clamped);
+    setCurrentTime(clamped);
+    if (mode === "twitch" && twitchPlayerRef.current?.seekTo) {
+      const ok = twitchPlayerRef.current.seekTo(clamped);
+      if (ok) return;
+    }
+    setPlayerReloadKey((v) => v + 1);
+  }, [mode]);
+
+  const handleJumpStart = useCallback(() => {
+    if (!selectedCandidate) return;
+    seekToPlayer(selectedCandidate.clip_start ?? selectedCandidate.start ?? 0);
+  }, [selectedCandidate, seekToPlayer]);
+
+  const handleJumpPeak = useCallback(() => {
+    if (!selectedCandidate) return;
+    seekToPlayer(selectedCandidate.peak_time ?? ((selectedCandidate.clip_start ?? 0) + (selectedCandidate.clip_duration ?? 30) / 2));
+  }, [selectedCandidate, seekToPlayer]);
+
+  const handleJumpEnd = useCallback(() => {
+    if (!selectedCandidate) return;
+    const start = selectedCandidate.clip_start ?? selectedCandidate.start ?? 0;
+    const dur = selectedCandidate.clip_duration ?? 30;
+    seekToPlayer(Math.max(0, start + dur - 1));
+  }, [selectedCandidate, seekToPlayer]);
+
+  const handlePreviewRange = useCallback(() => {
+    if (!selectedCandidate) return;
+    seekToPlayer(selectedCandidate.clip_start ?? selectedCandidate.start ?? 0);
+    addLog("user", t("studio.logPreview", { time: "" }));
+  }, [selectedCandidate, seekToPlayer, addLog, t]);
+
+  const handleSetStartFromCurrent = useCallback(() => {
+    if (!selectedCandidate) return;
+    const newStart = currentTime;
+    const end = selectedCandidate.end ?? (selectedCandidate.clip_start != null && selectedCandidate.clip_duration != null ? selectedCandidate.clip_start + selectedCandidate.clip_duration : newStart + 30);
+    const updated: HighlightCandidate = {
+      ...selectedCandidate,
+      clip_start: newStart,
+      start: newStart,
+      clip_duration: Math.max(1, end - newStart),
+    };
+    setSelectedCandidate(updated);
+    setCandidates((prev) => prev.map((c) => c.rank === selectedCandidate.rank ? updated : c));
+  }, [selectedCandidate, currentTime]);
+
+  const handleSetEndFromCurrent = useCallback(() => {
+    if (!selectedCandidate) return;
+    const newEnd = currentTime;
+    const start = selectedCandidate.clip_start ?? selectedCandidate.start ?? 0;
+    const updated: HighlightCandidate = {
+      ...selectedCandidate,
+      end: newEnd,
+      clip_duration: Math.max(1, newEnd - start),
+    };
+    setSelectedCandidate(updated);
+    setCandidates((prev) => prev.map((c) => c.rank === selectedCandidate.rank ? updated : c));
+  }, [selectedCandidate, currentTime]);
 
   // ===== Step 3: Export =====
   const qualityToFfmpeg = (q: FfmpegQuality) => QUALITY_TO_FFMPEG[q];
@@ -561,6 +624,34 @@ export default function StudioClient() {
           onLoad={handleLoadVod}
           onAutoAnalyze={handleAnalyze}
         />
+
+        {/* Video preview area: VOD loaded → show player + timeline */}
+        {videoId && (
+          <VideoArea
+            mode={mode}
+            videoId={videoId}
+            videoPath={videoPath}
+            vodTitle={vodTitle}
+            playerStartTime={playerStartTime}
+            playerReloadKey={playerReloadKey}
+            currentTime={currentTime}
+            videoDuration={videoDuration}
+            twitchPlayerRef={twitchPlayerRef}
+            localPlayerRef={localPlayerRef}
+            timeline={timeline}
+            selectedCandidate={selectedCandidate}
+            onTimeUpdate={handleTimeUpdate}
+            onDurationChange={handleDurationChange}
+            onSeek={seekToPlayer}
+            onJumpStart={handleJumpStart}
+            onJumpPeak={handleJumpPeak}
+            onJumpEnd={handleJumpEnd}
+            onPreview={handlePreviewRange}
+            onSetStartFromCurrent={handleSetStartFromCurrent}
+            onSetEndFromCurrent={handleSetEndFromCurrent}
+            onSelectCandidate={handleSelectCandidate}
+          />
+        )}
 
         {/* Step 2: Candidates (only shown when candidates exist) */}
         {candidates.length > 0 && (
