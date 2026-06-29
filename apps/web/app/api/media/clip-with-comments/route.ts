@@ -59,32 +59,67 @@ export async function POST(request: Request) {
     let chatMessages: ChatLogEntry[] = [];
     const videoIdMatch = url.match(/\/videos?\/(\d+)/);
     const videoId = videoIdMatch?.[1] ?? url.replace(/[^a-zA-Z0-9]+/g, "_").slice(0, 60);
-    const cacheFilePath = path.join(getMediaRoot(), "cache", "comments", `${videoId}.rechat.json`);
+    const cacheDir = path.join(getMediaRoot(), "cache", "comments");
+    // Try current key first, then legacy `v` prefix used by an older
+    // version of the pipeline.
+    const cacheCandidates = [
+      path.join(cacheDir, `${videoId}.rechat.json`),
+      path.join(cacheDir, `v${videoId}.rechat.json`),
+    ];
+    const cacheFilePath = cacheCandidates[0];
+    let cacheHit: string | null = null;
+    for (const candidate of cacheCandidates) {
+      try {
+        await readFile(candidate, "utf8");
+        cacheHit = candidate;
+        break;
+      } catch {
+        // try next
+      }
+    }
 
     try {
-      const cacheContent = await readFile(cacheFilePath, "utf8");
-      chatMessages = JSON.parse(cacheContent);
-    } catch {
-      // Cache miss — fetch from Twitch
-      try {
-        const chatResult = await fetchChatWithChatDownloader({
-          url,
-          maxMessages: 50_000,
-          signal: request.signal,
-        });
-        chatMessages = chatResult.normalizedMessages;
-        // Save to cache for future use
-        try {
-          const { mkdir: mkdirFs, writeFile: writeFileFs } = await import("node:fs/promises");
-          const cacheDir = path.join(getMediaRoot(), "cache", "comments");
-          await mkdirFs(cacheDir, { recursive: true });
-          await writeFileFs(cacheFilePath, JSON.stringify(chatMessages, null, 2) + "\n", "utf8");
-        } catch {
-          // Cache write is non-fatal
+      if (cacheHit) {
+        const cacheContent = await readFile(cacheHit, "utf8");
+        chatMessages = JSON.parse(cacheContent);
+        // Migrate legacy `v` prefix to the new key.
+        if (cacheHit !== cacheFilePath) {
+          try {
+            const { writeFile: writeFileFs } = await import("node:fs/promises");
+            await writeFileFs(cacheFilePath, cacheContent, "utf8");
+            const { unlink } = await import("node:fs/promises");
+            await unlink(cacheHit).catch(() => {});
+          } catch {
+            // Best-effort migration
+          }
         }
-      } catch {
-        // Chat fetch failed — continue without comments
+      } else {
+        // Cache miss — fetch from Twitch
+        try {
+          const chatResult = await fetchChatWithChatDownloader({
+            url,
+            maxMessages: 50_000,
+            signal: request.signal,
+          });
+          chatMessages = chatResult.normalizedMessages;
+          // Save to cache for future use
+          try {
+            const { mkdir: mkdirFs, writeFile: writeFileFs } = await import("node:fs/promises");
+            await mkdirFs(cacheDir, { recursive: true });
+            await writeFileFs(cacheFilePath, JSON.stringify(chatMessages, null, 2) + "\n", "utf8");
+            // Also remove any legacy `v` prefix duplicate
+            const legacyPath = path.join(cacheDir, `v${videoId}.rechat.json`);
+            const { unlink } = await import("node:fs/promises");
+            await unlink(legacyPath).catch(() => {});
+          } catch {
+            // Cache write is non-fatal
+          }
+        } catch {
+          // Chat fetch failed — continue without comments
+        }
       }
+    } catch {
+      // Any unexpected failure in cache/chat logic — continue without comments
     }
 
     // 3. Filter chat to the time range and normalize to 0-based

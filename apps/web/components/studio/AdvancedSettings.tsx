@@ -1,5 +1,6 @@
 "use client";
 import React from "react";
+import { useI18n } from "@/lib/i18n";
 
 interface Props {
   isOpen: boolean;
@@ -42,8 +43,16 @@ export default function AdvancedSettings({
   keywordsText,
   setKeywordsText,
 }: Props) {
+  const { t } = useI18n();
   // Human-readable summary
-  const summary = `候補数 ${topN} / 区間幅 ${windowSec}秒 / ステップ ${step}秒 / 最低間隔 ${minGap}秒 / 切り抜き尺 ${clipDuration}秒 / オフセット ${clipOffset}秒`;
+  const summary = t("studio.advancedSummary", {
+    topN,
+    window: windowSec,
+    step,
+    minGap,
+    duration: clipDuration,
+    offset: clipOffset,
+  });
 
   return (
     <div className="bg-slate-900/60 border-b border-slate-700/40">
@@ -52,7 +61,7 @@ export default function AdvancedSettings({
         className="w-full px-5 py-1.5 text-left hover:bg-slate-800/40 flex items-center gap-2 transition-colors"
       >
         <span className="text-[10px] text-slate-500">{isOpen ? "▼" : "▶"}</span>
-        <span className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">詳細設定</span>
+        <span className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">{t("studio.advancedSettings")}</span>
         {!isOpen && (
           <span className="text-[10px] text-slate-500 normal-case tracking-normal truncate">
             {summary}

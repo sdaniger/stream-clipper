@@ -2,6 +2,7 @@
 import React from "react";
 import type { HighlightCandidate } from "@/lib/twitch-time";
 import { secondsToTwitchTime } from "@/lib/twitch-time";
+import { useI18n } from "@/lib/i18n";
 
 type ExportStatus = "idle" | "exporting" | "exported" | "error";
 
@@ -59,12 +60,13 @@ export default function ClipActionPanel({
   const endTime = getEnd(c);
   const peakTime = c.peak_time ?? (startTime + endTime) / 2;
   const duration = endTime - startTime;
+  const { t } = useI18n();
 
   const inRange = currentTime >= startTime && currentTime <= endTime;
   const canSetFromCurrent = isPlayerAvailable && !inRange;
 
   const exportDisabledReason = !hasLocalVideo
-    ? "MP4書き出しにはローカル動画ファイルが必要です"
+    ? t("studio.errorNoLocalFile")
     : null;
 
   return (
@@ -72,7 +74,7 @@ export default function ClipActionPanel({
       {/* Header: rank + score + status */}
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2">
-          <span className="text-base font-bold text-violet-300">候補 #{c.rank}</span>
+          <span className="text-base font-bold text-violet-300">{t("studio.rank", { rank: c.rank })}</span>
           {typeof c.score === "number" && (
             <span className="text-[10px] text-amber-400 font-semibold px-1.5 py-0.5 rounded bg-amber-500/10">
               score {c.score}
@@ -80,31 +82,31 @@ export default function ClipActionPanel({
           )}
           {c.output_file && (
             <span className="text-[10px] text-emerald-400 font-semibold px-1.5 py-0.5 rounded bg-emerald-500/10">
-              ✓ 書き出し済み
+              ✓ {t("studio.exportedBadge")}
             </span>
           )}
         </div>
         <div className="text-[10px] text-slate-500 font-mono">
-          現在: {fmtClock(currentTime)}
+          {t("studio.now", { time: fmtClock(currentTime) })}
         </div>
       </div>
 
       {/* Time range summary */}
       <div className="grid grid-cols-4 gap-1 mb-3 text-center bg-slate-900/40 rounded p-2">
         <div>
-          <div className="text-[9px] text-slate-500 uppercase">開始</div>
+          <div className="text-[9px] text-slate-500 uppercase">{t("studio.positionStart")}</div>
           <div className="text-[12px] text-slate-200 font-mono font-semibold">{secondsToTwitchTime(startTime)}</div>
         </div>
         <div>
-          <div className="text-[9px] text-amber-400 uppercase">ピーク</div>
+          <div className="text-[9px] text-amber-400 uppercase">{t("studio.positionPeak")}</div>
           <div className="text-[12px] text-amber-300 font-mono font-semibold">{secondsToTwitchTime(peakTime)}</div>
         </div>
         <div>
-          <div className="text-[9px] text-slate-500 uppercase">終了</div>
+          <div className="text-[9px] text-slate-500 uppercase">{t("studio.positionEnd")}</div>
           <div className="text-[12px] text-slate-200 font-mono font-semibold">{secondsToTwitchTime(endTime)}</div>
         </div>
         <div>
-          <div className="text-[9px] text-slate-500 uppercase">尺</div>
+          <div className="text-[9px] text-slate-500 uppercase">{t("studio.positionDuration")}</div>
           <div className="text-[12px] text-slate-200 font-mono font-semibold">{fmtClock(duration)}</div>
         </div>
       </div>
@@ -115,7 +117,7 @@ export default function ClipActionPanel({
         disabled={!isPlayerAvailable}
         className="w-full mb-2 px-4 py-2.5 text-sm font-bold rounded-md bg-gradient-to-r from-violet-600 to-fuchsia-600 text-white shadow-lg shadow-violet-500/30 hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none transition-all"
       >
-        ▶ この区間をプレビュー
+        ▶ {t("studio.previewRange")}
       </button>
 
       {/* SECONDARY ACTION: Export This Clip */}
@@ -123,14 +125,14 @@ export default function ClipActionPanel({
         onClick={onExportThisClip}
         disabled={!!exportDisabledReason || singleExportStatus === "exporting"}
         className="w-full mb-2 px-4 py-2 text-sm font-semibold rounded-md bg-emerald-600/40 border border-emerald-500/60 text-emerald-100 hover:bg-emerald-500/50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-        title={exportDisabledReason ?? "この候補をMP4で書き出す"}
+        title={exportDisabledReason ?? "MP4 export"}
       >
         {singleExportStatus === "exporting" ? (
-          <span>⏳ 書き出し中...</span>
+          <span>⏳ {t("studio.btnExporting")}</span>
         ) : singleExportStatus === "exported" ? (
-          <span>📥 この候補を書き出し（再書き出し）</span>
+          <span>📥 {t("studio.writeRankShort")}</span>
         ) : (
-          <span>📥 このクリップを書き出す</span>
+          <span>📥 {t("studio.writeRankShort")}</span>
         )}
       </button>
 
@@ -143,51 +145,51 @@ export default function ClipActionPanel({
 
       {/* Auxiliary controls - small */}
       <div className="border-t border-slate-700/50 pt-2 mt-1">
-        <div className="text-[9px] text-slate-500 uppercase tracking-wide mb-1.5">位置ジャンプ</div>
+        <div className="text-[9px] text-slate-500 uppercase tracking-wide mb-1.5">Jump</div>
         <div className="grid grid-cols-3 gap-1 mb-2">
           <button
             onClick={onJumpStart}
             disabled={!isPlayerAvailable}
             className="px-2 py-1 text-[10px] rounded bg-slate-700/50 border border-slate-600/50 text-slate-300 hover:bg-slate-600/50 disabled:opacity-40 disabled:cursor-not-allowed"
-            title="開始位置にジャンプ"
+            title={t("studio.jumpStart")}
           >
-            ⏮ 開始
+            ⏮ {t("studio.jumpStart")}
           </button>
           <button
             onClick={onJumpPeak}
             disabled={!isPlayerAvailable}
             className="px-2 py-1 text-[10px] rounded bg-amber-600/30 border border-amber-500/50 text-amber-200 hover:bg-amber-500/40 disabled:opacity-40 disabled:cursor-not-allowed"
-            title="ピーク位置にジャンプ"
+            title={t("studio.jumpPeak")}
           >
-            ⭐ ピーク
+            ⭐ {t("studio.jumpPeak")}
           </button>
           <button
             onClick={onJumpEnd}
             disabled={!isPlayerAvailable}
             className="px-2 py-1 text-[10px] rounded bg-slate-700/50 border border-slate-600/50 text-slate-300 hover:bg-slate-600/50 disabled:opacity-40 disabled:cursor-not-allowed"
-            title="終了位置にジャンプ"
+            title={t("studio.jumpEnd")}
           >
-            ⏭ 終了
+            ⏭ {t("studio.jumpEnd")}
           </button>
         </div>
 
-        <div className="text-[9px] text-slate-500 uppercase tracking-wide mb-1.5">現在位置で範囲を調整</div>
+        <div className="text-[9px] text-slate-500 uppercase tracking-wide mb-1.5">Set range from current</div>
         <div className="grid grid-cols-2 gap-1 mb-2">
           <button
             onClick={onSetStartFromCurrent}
             disabled={!canSetFromCurrent}
             className="px-2 py-1 text-[10px] rounded bg-cyan-600/20 border border-cyan-500/40 text-cyan-200 hover:bg-cyan-500/30 disabled:opacity-40 disabled:cursor-not-allowed"
-            title="現在の再生位置を開始位置に設定"
+            title={t("studio.setStartCurrent")}
           >
-            ⊙ 現在位置を開始に設定
+            ⊙ {t("studio.setStartCurrent")}
           </button>
           <button
             onClick={onSetEndFromCurrent}
             disabled={!canSetFromCurrent}
             className="px-2 py-1 text-[10px] rounded bg-cyan-600/20 border border-cyan-500/40 text-cyan-200 hover:bg-cyan-500/30 disabled:opacity-40 disabled:cursor-not-allowed"
-            title="現在の再生位置を終了位置に設定"
+            title={t("studio.setEndCurrent")}
           >
-            現在位置を終了に設定 ⊙
+            {t("studio.setEndCurrent")} ⊙
           </button>
         </div>
       </div>
@@ -198,16 +200,16 @@ export default function ClipActionPanel({
           onClick={onExportTop5}
           disabled={!!exportDisabledReason || batchExportStatus === "exporting"}
           className="w-full px-3 py-1.5 text-[11px] rounded bg-emerald-600/20 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30 disabled:opacity-40 disabled:cursor-not-allowed"
-          title={exportDisabledReason ?? "上位5件を一括書き出し"}
+          title={exportDisabledReason ?? "Batch export top 5"}
         >
-          {batchExportStatus === "exporting" ? "⏳ 一括書き出し中..." : "📥 Top 5 を一括書き出し"}
+          {batchExportStatus === "exporting" ? `⏳ ${t("studio.btnExporting")}` : "📥 Top 5"}
         </button>
         {!hasLocalVideo && (
           <button
             onClick={onSelectLocalVideo}
             className="w-full mt-1 px-3 py-1 text-[10px] rounded bg-slate-700/40 border border-slate-600/50 text-slate-300 hover:bg-slate-600/40"
           >
-            ローカル動画を指定 →
+            {t("studio.logFallbackLocal")} →
           </button>
         )}
       </div>

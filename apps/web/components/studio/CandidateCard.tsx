@@ -1,6 +1,7 @@
 "use client";
 import React from "react";
 import type { HighlightCandidate } from "@/lib/twitch-time";
+import { useI18n } from "@/lib/i18n";
 
 function fmt(v: number): string {
   const m = Math.floor(v / 60);
@@ -36,6 +37,7 @@ export default function CandidateCard({
   onEdit,
   onExport,
 }: Props) {
+  const { t } = useI18n();
   const startTime = c.clip_start ?? c.start ?? c.peak_time ?? 0;
   const endTime = c.end ?? (c.clip_start != null && c.clip_duration != null ? c.clip_start + c.clip_duration : startTime + 30);
   const duration = endTime - startTime;
@@ -56,10 +58,10 @@ export default function CandidateCard({
           <span className="text-[10px] text-amber-400 font-semibold">score {c.score}</span>
         )}
         {isDanmakuExported && (
-          <span className="text-[9px] text-fuchsia-400 font-semibold px-1 py-0.5 rounded bg-fuchsia-500/10">🎬 弾幕出力済</span>
+          <span className="text-[9px] text-fuchsia-400 font-semibold px-1 py-0.5 rounded bg-fuchsia-500/10">🎬 {t("studio.danmakuExportedBadge")}</span>
         )}
         {isExported && (
-          <span className="text-[9px] text-emerald-400 font-semibold px-1 py-0.5 rounded bg-emerald-500/10 ml-auto">✓ 書き出し済み</span>
+          <span className="text-[9px] text-emerald-400 font-semibold px-1 py-0.5 rounded bg-emerald-500/10 ml-auto">✓ {t("studio.exportedBadge")}</span>
         )}
       </div>
 
@@ -71,7 +73,7 @@ export default function CandidateCard({
       {/* Row 3: chat_count · keyword_hits */}
       <div className="text-[10px] text-slate-500 flex items-center gap-2 mb-0.5">
         {typeof c.chat_count === "number" && (
-          <span>コメント <span className="text-slate-300 font-semibold">{c.chat_count}</span></span>
+          <span>Chat <span className="text-slate-300 font-semibold">{c.chat_count}</span></span>
         )}
         {typeof c.keyword_hits === "number" && (
           <span>KW <span className="text-slate-300 font-semibold">{c.keyword_hits}</span></span>
@@ -92,7 +94,7 @@ export default function CandidateCard({
         </div>
       )}
 
-      {/* Row 5: action buttons - 見る / 調整 / 書き出し */}
+      {/* Row 5: action buttons */}
       <div className="flex gap-1" onClick={(e) => e.stopPropagation()}>
         <button
           onClick={onSelect}
@@ -102,21 +104,21 @@ export default function CandidateCard({
               : "bg-cyan-600/20 border border-cyan-500/40 text-cyan-200 hover:bg-cyan-500/30"
           }`}
         >
-          見る
+          {t("studio.writeRank")}
         </button>
         <button
           onClick={onEdit}
           className="flex-1 px-1.5 py-0.5 text-[10px] rounded bg-slate-600/30 border border-slate-500/40 text-slate-300 hover:bg-slate-500/30 font-semibold"
         >
-          調整
+          {t("studio.editRank")}
         </button>
         <button
           onClick={onExport}
           disabled={!canExport || isExporting}
-          title={!canExport ? "ローカル動画が必要です" : isExported ? "再書き出し" : "書き出し"}
+          title={!canExport ? t("studio.errorNoLocalFile") : isExported ? t("studio.retry") : t("studio.writeRankShort")}
           className="flex-1 px-1.5 py-0.5 text-[10px] rounded bg-emerald-600/20 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30 disabled:opacity-40 disabled:cursor-not-allowed font-semibold"
         >
-          {isExporting ? "⏳" : "書き出し"}
+          {isExporting ? "⏳" : t("studio.writeRankShort")}
         </button>
       </div>
     </div>

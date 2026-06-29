@@ -2,6 +2,7 @@
 import React from "react";
 import type { HighlightCandidate } from "@/lib/twitch-time";
 import CandidateCard from "./CandidateCard";
+import { useI18n } from "@/lib/i18n";
 
 interface Props {
   candidates: HighlightCandidate[];
@@ -26,11 +27,12 @@ export default function CandidateList({
   onEditCandidate,
   onExportCandidate,
 }: Props) {
+  const { t } = useI18n();
   return (
     <div className="glass-panel rounded-lg p-3 flex flex-col flex-1 min-h-0">
       <div className="flex justify-between items-center mb-1.5 gap-2 flex-wrap">
         <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
-          Candidates ({candidates.length})
+          {t("studio.candidatesTitle", { count: candidates.length })}
         </span>
         <div className="flex items-center gap-2 text-[10px]">
           {danmakuExportedIds.size > 0 && (
@@ -60,7 +62,7 @@ export default function CandidateList({
           );
         }) : (
           <div className="flex items-center justify-center h-[100px] text-slate-500 text-xs">
-            No candidates yet — run analysis
+            {t("studio.noCandidatesList")}
           </div>
         )}
       </div>
