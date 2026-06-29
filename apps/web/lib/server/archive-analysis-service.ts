@@ -432,6 +432,10 @@ export async function runArchiveAutoAnalysis(
           clipInputPath = downloadedVideo!.inputPath;
         }
 
+        // Store the source video path so the candidate can be re-clipped later
+        // from the LocalVideoPanel without re-downloading the entire VOD.
+        generatedCandidate = { ...generatedCandidate, sourceVideoPath: clipInputPath };
+
         generatedClip = await clipLimit(() => generateClip({
           inputPath: clipInputPath,
           candidateId: candidate.id,

@@ -575,4 +575,29 @@ function clampInteger(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, Math.round(value)));
 }
 
+/**
+ * Fetch chat with automatic retry on transient network errors.
+ * Abort and user-thrown errors propagate immediately without retry.
+ */
+export async function fetchChatWithChatDownloaderWithRetry(
+  input: FetchChatDownloaderInput,
+  maxAttempts = 2,
+): Promise<FetchChatDownloaderResult> {
+  const RETRYABLE = /(fetch failed|ECONNRESET|ETIMEDOUT|socket hang up|ENETUNREACH)/i;
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await fetchChatWithChatDownloader(input);
+    } catch (error) {
+      lastError = error;
+      if (error instanceof DOMException && error.name === "AbortError") throw error;
+      if (input.signal?.aborted) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      if (attempt >= maxAttempts || !RETRYABLE.test(message)) throw error;
+      await new Promise((r) => setTimeout(r, 1500 * attempt));
+    }
+  }
+  throw lastError;
+}
+
 

@@ -907,7 +907,8 @@ async function assertFileExists(absolutePath: string, label = "Video file") {
       throw error;
     }
 
-    throw new Error(`${label} was not found under MEDIA_ROOT: ${path.basename(absolutePath)}`);
+    const relativePath = path.relative(getMediaRoot(), absolutePath);
+    throw new Error(`${label} was not found: ${relativePath}. Place the video file under MEDIA_ROOT or update the input path.`);
   }
 }
 

@@ -152,6 +152,8 @@ export type ClipCandidate = {
   archiveTitle: string;
   /** Source VOD URL (set at pipeline import time) */
   sourceUrl?: string;
+  /** Relative path to the source video file under MEDIA_ROOT (e.g. "input/downloads/video.mp4"). */
+  sourceVideoPath?: string;
   detectedAt: string;
   duration: string;
   confidence: number;

@@ -110,6 +110,7 @@
     "downloadingVideo": "動画ダウンロード中...",
     "downloadAndRegister": "動画をダウンロードして登録",
     "inputPath": "MEDIA_ROOT相対の入力パス",
+    "selectAvailableVideo": "利用可能な動画を選択...",
     "checkFfmpeg": "FFmpeg確認",
     "checking": "確認中...",
     "checkWhisper": "Whisper確認",

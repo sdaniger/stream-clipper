@@ -1,97 +1,16 @@
 import { NextRequest } from "next/server";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { analyzeChatEntries, type ChatLogEntry } from "@/lib/chat-analysis";
+import { type ChatLogEntry } from "@/lib/chat-analysis";
 import type { HighlightCandidate, TimelineRow } from "@/lib/studio-api";
+import {
+  buildStudioTimeline,
+  generateTopNCandidates,
+  type StudioAnalyzeOptions,
+} from "@/lib/studio-analysis";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-function clockToSeconds(clock: string): number {
-  const parts = clock.split(":").map(Number);
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  if (parts.length === 2) return parts[0] * 60 + parts[1];
-  return parts[0] || 0;
-}
-
-function buildTimeline(entries: ChatLogEntry[], windowSec: number): TimelineRow[] {
-  const buckets = new Map<number, { chat: number; kw: number; keywords: Set<string> }>();
-  const reactions = ["www", "草", "爆笑", "笑", "w", "lol", "lmao", "kusa",
-    "すごい", "すげ", "やばい", "やば", "神", "最高", "天才", "上手い",
-    "きた", "来た", "ｷﾀ", "キタ", "は？", "何", "え？", "なに",
-    "助けて", "たすけて", "死", "わろ", "ワロ",
-  ];
-
-  for (const entry of entries) {
-    const idx = Math.floor(entry.timestamp_seconds / windowSec);
-    if (!buckets.has(idx)) buckets.set(idx, { chat: 0, kw: 0, keywords: new Set() });
-    const b = buckets.get(idx)!;
-    b.chat++;
-    const msg = entry.message.toLowerCase();
-    for (const r of reactions) {
-      if (msg.includes(r)) { b.kw++; b.keywords.add(r); }
-    }
-  }
-
-  const minIdx = Math.min(...buckets.keys());
-  const maxIdx = Math.max(...buckets.keys());
-  const result: TimelineRow[] = [];
-
-  for (let i = minIdx; i <= maxIdx; i++) {
-    const b = buckets.get(i) ?? { chat: 0, kw: 0, keywords: new Set() };
-    result.push({
-      start: i * windowSec,
-      end: (i + 1) * windowSec,
-      score: b.chat + b.kw * 2,
-      chat_count: b.chat,
-      keyword_hits: b.kw,
-      matched_keywords: [...b.keywords],
-    });
-  }
-
-  return result;
-}
-
-function clipCandidateToHighlight(
-  c: any,
-  index: number,
-  timeline: TimelineRow[],
-  topN: number,
-  minGap: number,
-): HighlightCandidate {
-  const clipStart = clockToSeconds(c.detectedAt ?? "0");
-  const duration = clockToSeconds(c.duration ?? "30");
-  const peakFromTitle = (() => {
-    const m = c.title?.match(/(\d+):(\d+)(?::(\d+))?/);
-    if (!m) return clipStart + duration / 2;
-    return (parseInt(m[1]) * 60 + parseInt(m[2] ?? "0")) * (m[3] ? 1 : 1) + (m[3] ? parseInt(m[3]) : 0);
-  })();
-  const highlightStart = clipStart;
-  const highlightEnd = clipStart + duration;
-
-  const matchedRows = timeline.filter(
-    (r) => r.start >= highlightStart && r.end <= highlightEnd,
-  );
-  const totalScore = matchedRows.reduce((s, r) => s + r.score, 0);
-  const totalChat = matchedRows.reduce((s, r) => s + r.chat_count, 0);
-  const totalKw = matchedRows.reduce((s, r) => s + r.keyword_hits, 0);
-  const allKws = [...new Set(matchedRows.flatMap((r) => r.matched_keywords))];
-
-  return {
-    rank: index + 1,
-    start: highlightStart,
-    end: highlightEnd,
-    peak_time: peakFromTitle,
-    score: Math.round(c.confidence ?? totalScore),
-    chat_count: c.chat?.messages ?? totalChat,
-    keyword_hits: totalKw,
-    matched_keywords: allKws,
-    reasons: c.whyDetected ?? [],
-    clip_start: clipStart,
-    clip_duration: duration,
-    output_file: null,
-  };
-}
 
 function normalizeEntry(item: any): ChatLogEntry {
   if (item.timestamp_seconds != null && item.author_name != null) {
@@ -124,13 +43,17 @@ function loadChatFromJson(content: string): ChatLogEntry[] {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { video_path, log_path, top_n, window: windowSec, min_gap, keywords } = body as {
+    const { video_path, log_path, top_n, window: windowSec, min_gap, keywords, step, keyword_weight, clip_duration, clip_offset } = body as {
       video_path?: string;
       log_path?: string;
       top_n?: number;
       window?: number;
       min_gap?: number;
       keywords?: string;
+      step?: number;
+      keyword_weight?: number;
+      clip_duration?: number;
+      clip_offset?: number;
     };
 
     if (!log_path) {
@@ -192,38 +115,42 @@ export async function POST(request: NextRequest) {
           }
 
           const wSec = windowSec ?? 30;
+          const sSec = step ?? 10;
           const title = video_path ? path.basename(video_path) : "Local Video";
 
           send({ type: "progress", stage: "analyze", message: "候補生成中...", progress: 50 });
-          const analysis = analyzeChatEntries(entries, `local-${Date.now()}`, {
+
+          const parsedKeywords = keywords
+            ? keywords.split(",").map((k) => k.trim()).filter(Boolean)
+            : [];
+
+          const analyzeOptions: StudioAnalyzeOptions = {
             windowSeconds: wSec,
+            topN: top_n ?? 10,
             minGap: min_gap ?? 45,
-          });
+            step: sSec,
+            keywordWeight: keyword_weight ?? 2.0,
+            clipDuration: clip_duration ?? 30,
+            clipOffset: clip_offset ?? 10,
+            keywords: parsedKeywords,
+          };
+
+          const timeline = buildStudioTimeline(entries, wSec, sSec, parsedKeywords, analyzeOptions.keywordWeight ?? 2.0);
+          const analysisResult = generateTopNCandidates(timeline, entries, analyzeOptions);
 
           send({ type: "progress", stage: "timeline", message: "タイムライン構築中...", progress: 75 });
-          const timeline = buildTimeline(entries, wSec);
 
-          const candidates: HighlightCandidate[] = (analysis.candidates ?? [])
-            .map((c: any, i: number) => clipCandidateToHighlight(c, i, timeline, top_n ?? 10, min_gap ?? 45))
-            .slice(0, top_n ?? 10);
-
-          send({ type: "progress", stage: "done", message: `分析完了: ${candidates.length} 件の候補`, progress: 100 });
+          send({ type: "progress", stage: "done", message: `分析完了: ${analysisResult.candidates.length} 件の候補`, progress: 100 });
           send({
             type: "result",
             video_id: null,
             title,
             duration_seconds: null,
             message_count: entries.length,
-            candidates,
-            timeline,
+            candidates: analysisResult.candidates,
+            timeline: analysisResult.timeline,
             video_exists: videoExists,
-            summary: {
-              inputMessages: analysis.summary.inputMessages,
-              analyzedMessages: analysis.summary.analyzedMessages,
-              candidateCount: analysis.summary.candidateCount,
-              baselinePerMinute: analysis.summary.baselinePerMinute,
-              peakPerMinute: analysis.summary.peakPerMinute,
-            },
+            diagnostic: analysisResult.diagnostic,
           });
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : "Unknown error";

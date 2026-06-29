@@ -28,6 +28,20 @@ interface SseResult {
   summary: Record<string, unknown> | null;
   error?: string;
   video_exists?: boolean;
+  diagnostic?: {
+    fetched_chat_count: number;
+    normalized_chat_count: number;
+    timeline_count: number;
+    raw_candidate_count: number;
+    candidates_after_threshold: number;
+    candidates_after_min_gap: number;
+    final_candidate_count: number;
+    top_n: number;
+    window: number;
+    step: number;
+    threshold: number;
+    min_gap: number;
+  };
 }
 
 interface SseError {
@@ -48,6 +62,10 @@ export default function StudioClient() {
   const [topN, setTopN] = useState(10);
   const [minGap, setMinGap] = useState(45);
   const [keywordsText, setKeywordsText] = useState("");
+  const [step, setStep] = useState(10);
+  const [clipDuration, setClipDuration] = useState(30);
+  const [clipOffset, setClipOffset] = useState(10);
+  const [keywordWeight, setKeywordWeight] = useState(2.0);
 
   const [videoId, setVideoId] = useState<string | null>(null);
   const [vodTitle, setVodTitle] = useState<string | null>(null);
@@ -61,6 +79,8 @@ export default function StudioClient() {
   const [progressLabel, setProgressLabel] = useState("");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [logs, setLogs] = useState<string[]>(["Ready"]);
+  const [diagnostic, setDiagnostic] = useState<SseResult["diagnostic"] | null>(null);
+  const [abortController, setAbortController] = useState<AbortController | null>(null);
 
   const addLog = useCallback((msg: string) => {
     setLogs((prev) => [...prev.slice(-99), `[${new Date().toLocaleTimeString()}] ${msg}`]);
@@ -101,6 +121,17 @@ export default function StudioClient() {
     addLog(`VOD loaded: v${id}`);
   }, [vodUrl, addLog]);
 
+  const handleCancel = useCallback(() => {
+    if (abortController) {
+      abortController.abort();
+      setAbortController(null);
+      setIsAnalyzing(false);
+      setProgress(0);
+      setProgressLabel("");
+      addLog("分析をキャンセルしました");
+    }
+  }, [abortController, addLog]);
+
   const readStream = useCallback(async (res: Response) => {
     const reader = res.body!.getReader();
     const decoder = new TextDecoder();
@@ -124,6 +155,7 @@ export default function StudioClient() {
             addLog(event.message);
           } else if (event.type === "result") {
             setVodTitle(event.title);
+            setDiagnostic(event.diagnostic ?? null);
             if (event.error) {
               addLog(`エラー: ${event.error}`);
               setCandidates([]);
@@ -161,6 +193,8 @@ export default function StudioClient() {
       if (!logPath.trim()) { setErrorMessage("チャットログファイルのパスを入力してください"); return; }
     }
 
+    const controller = new AbortController();
+    setAbortController(controller);
     setIsAnalyzing(true);
     setProgress(0);
     setProgressLabel("");
@@ -168,18 +202,41 @@ export default function StudioClient() {
     setCandidates([]);
     setTimeline([]);
     setSelectedCandidate(null);
+    setDiagnostic(null);
     addLog("分析を開始...");
 
     try {
       const endpoint = mode === "twitch" ? "/api/studio/analyze-vod" : "/api/studio/analyze-local";
       const body = mode === "twitch"
-        ? { vod_url: vodUrl, top_n: topN, window: windowSec, min_gap: minGap, keywords: keywordsText.trim() || undefined }
-        : { video_path: videoPath, log_path: logPath, top_n: topN, window: windowSec, min_gap: minGap, keywords: keywordsText.trim() || undefined };
+        ? {
+            vod_url: vodUrl,
+            top_n: topN,
+            window: windowSec,
+            min_gap: minGap,
+            step,
+            clip_duration: clipDuration,
+            clip_offset: clipOffset,
+            keyword_weight: keywordWeight,
+            keywords: keywordsText.trim() || undefined,
+          }
+        : {
+            video_path: videoPath,
+            log_path: logPath,
+            top_n: topN,
+            window: windowSec,
+            min_gap: minGap,
+            step,
+            clip_duration: clipDuration,
+            clip_offset: clipOffset,
+            keyword_weight: keywordWeight,
+            keywords: keywordsText.trim() || undefined,
+          };
 
       const res = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
+        signal: controller.signal,
       });
 
       if (!res.ok) {
@@ -189,15 +246,22 @@ export default function StudioClient() {
 
       await readStream(res);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "分析に失敗しました";
-      setErrorMessage(msg);
-      addLog(`エラー: ${msg}`);
+      if (e instanceof DOMException && e.name === "AbortError") {
+        addLog("分析がキャンセルされました");
+      } else {
+        const msg = e instanceof Error ? e.message : "分析に失敗しました";
+        setErrorMessage(msg);
+        addLog(`エラー: ${msg}`);
+      }
     } finally {
       setIsAnalyzing(false);
       setProgress(0);
       setProgressLabel("");
+      setAbortController(null);
     }
-  }, [mode, videoId, vodUrl, videoPath, logPath, topN, windowSec, minGap, keywordsText, readStream, addLog]);
+  }, [mode, videoId, vodUrl, videoPath, logPath, topN, windowSec, minGap, keywordsText, step, clipDuration, clipOffset, keywordWeight, readStream, addLog]);
+
+  const maxScore = timeline.length > 0 ? Math.max(...timeline.map(t => t.score)) : 1;
 
   return (
     <div className="min-h-screen flex flex-col bg-[#050816]">
@@ -244,7 +308,8 @@ export default function StudioClient() {
           </div>
         )}
 
-        <div className="flex gap-1.5 items-end">
+        {/* Analysis Parameters */}
+        <div className="flex gap-1.5 items-end flex-wrap">
           <div className="flex flex-col gap-px w-14">
             <label className="text-[10px] text-slate-500 uppercase tracking-wide">Window</label>
             <input type="number" value={windowSec} min={10} step={5}
@@ -252,8 +317,14 @@ export default function StudioClient() {
               className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500" />
           </div>
           <div className="flex flex-col gap-px w-12">
+            <label className="text-[10px] text-slate-500 uppercase tracking-wide">Step</label>
+            <input type="number" value={step} min={5} step={5}
+              onChange={(e) => setStep(Number(e.target.value) || 10)}
+              className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500" />
+          </div>
+          <div className="flex flex-col gap-px w-12">
             <label className="text-[10px] text-slate-500 uppercase tracking-wide">Top N</label>
-            <input type="number" value={topN} min={1} step={1}
+            <input type="number" value={topN} min={1} max={50} step={1}
               onChange={(e) => setTopN(Number(e.target.value) || 10)}
               className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500" />
           </div>
@@ -261,6 +332,24 @@ export default function StudioClient() {
             <label className="text-[10px] text-slate-500 uppercase tracking-wide">Min gap</label>
             <input type="number" value={minGap} min={0} step={5}
               onChange={(e) => setMinGap(Number(e.target.value) || 45)}
+              className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500" />
+          </div>
+          <div className="flex flex-col gap-px w-12">
+            <label className="text-[10px] text-slate-500 uppercase tracking-wide">Clip</label>
+            <input type="number" value={clipDuration} min={10} max={120} step={5}
+              onChange={(e) => setClipDuration(Number(e.target.value) || 30)}
+              className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500" />
+          </div>
+          <div className="flex flex-col gap-px w-12">
+            <label className="text-[10px] text-slate-500 uppercase tracking-wide">Offset</label>
+            <input type="number" value={clipOffset} min={0} max={60} step={5}
+              onChange={(e) => setClipOffset(Number(e.target.value) || 10)}
+              className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500" />
+          </div>
+          <div className="flex flex-col gap-px w-14">
+            <label className="text-[10px] text-slate-500 uppercase tracking-wide">KW Wt</label>
+            <input type="number" value={keywordWeight} min={0.5} max={5.0} step={0.5}
+              onChange={(e) => setKeywordWeight(Number(e.target.value) || 2.0)}
               className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500" />
           </div>
           <div className="flex flex-col gap-px w-32">
@@ -272,10 +361,17 @@ export default function StudioClient() {
         </div>
 
         <div className="flex gap-1.5 ml-auto">
-          <button onClick={handleAnalyze} disabled={isAnalyzing || (mode === "twitch" && !videoId)}
-            className="px-3 py-1.5 text-xs rounded bg-violet-600 text-white hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed">
-            {isAnalyzing ? "⏳ Analyzing..." : "🔍 Analyze"}
-          </button>
+          {isAnalyzing ? (
+            <button onClick={handleCancel}
+              className="px-3 py-1.5 text-xs rounded bg-red-600 text-white hover:brightness-110">
+              キャンセル
+            </button>
+          ) : (
+            <button onClick={handleAnalyze}
+              className="px-3 py-1.5 text-xs rounded bg-violet-600 text-white hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed">
+              分析開始
+            </button>
+          )}
         </div>
       </header>
 
@@ -306,8 +402,14 @@ export default function StudioClient() {
 
       {/* Title bar */}
       {vodTitle && (
-        <div className="bg-slate-800/50 border-b border-slate-700/30 px-5 py-1 text-xs text-slate-400">
-          {vodTitle} · {candidates.length} candidates · {timeline.length} timeline buckets
+        <div className="bg-slate-800/50 border-b border-slate-700/30 px-5 py-1 text-xs text-slate-400 flex justify-between items-center">
+          <span>{vodTitle} · {candidates.length} candidates · {timeline.length} timeline buckets</span>
+          {diagnostic && (
+            <span className="text-slate-500">
+              {diagnostic.fetched_chat_count} chat → {diagnostic.final_candidate_count} candidates
+              (threshold={diagnostic.threshold}, min_gap={diagnostic.min_gap}s)
+            </span>
+          )}
         </div>
       )}
 
@@ -326,6 +428,43 @@ export default function StudioClient() {
             </div>
           )}
 
+          {/* Timeline Graph */}
+          {timeline.length > 0 && (
+            <div className="glass-panel rounded-lg p-3">
+              <h3 className="text-xs text-slate-400 mb-2">タイムライン</h3>
+              <div className="flex items-end gap-px h-16">
+                {timeline.map((t, i) => {
+                  const height = (t.score / maxScore) * 100;
+                  const isSelected = selectedCandidate &&
+                    selectedCandidate.start !== undefined &&
+                    selectedCandidate.end !== undefined &&
+                    t.start >= selectedCandidate.start &&
+                    t.end <= selectedCandidate.end;
+                  return (
+                    <div
+                      key={i}
+                      className="flex-1 min-w-1 rounded-t cursor-pointer transition-colors hover:bg-cyan-400"
+                      style={{
+                        height: `${Math.max(2, height)}%`,
+                        backgroundColor: isSelected ? "#22d3ee" : `rgb(139, 92, 246, ${0.3 + (t.score / maxScore) * 0.7})`,
+                      }}
+                      title={`${Math.floor(t.start / 60)}:${String(Math.floor(t.start % 60)).padStart(2, '0')} - Score: ${t.score.toFixed(1)} | Chat: ${t.chat_count} | KW: ${t.keyword_hits}`}
+                      onClick={() => {
+                        const peakTime = (t.start + t.end) / 2;
+                        setPlayerStartTime(peakTime);
+                        setPlayerReloadKey((v) => v + 1);
+                      }}
+                    />
+                  );
+                })}
+              </div>
+              <div className="flex justify-between text-[9px] text-slate-600 mt-1">
+                <span>0:00</span>
+                <span>{timeline.length > 0 ? `${Math.floor(timeline[timeline.length - 1].end / 60)}:00` : '0:00'}</span>
+              </div>
+            </div>
+          )}
+
           <CandidateDetails candidate={selectedCandidate} />
 
           {candidates.length > 0 && mode === "twitch" && (
@@ -336,6 +475,23 @@ export default function StudioClient() {
         </div>
 
         <div className="flex-[2] flex flex-col min-w-[280px] max-w-[400px]">
+          {/* Diagnostic Panel */}
+          {diagnostic && (
+            <div className="glass-panel rounded-lg p-3 mb-2">
+              <h3 className="text-xs text-slate-400 mb-2">分析診断</h3>
+              <div className="grid grid-cols-2 gap-1 text-[10px] text-slate-500">
+                <div>取得チャット: <span className="text-slate-300">{diagnostic.fetched_chat_count.toLocaleString()}</span></div>
+                <div>タイムライン: <span className="text-slate-300">{diagnostic.timeline_count}</span></div>
+                <div>生候補数: <span className="text-slate-300">{diagnostic.raw_candidate_count}</span></div>
+                <div>しきい値: <span className="text-slate-300">{diagnostic.threshold}</span></div>
+                <div>しきい値通過: <span className="text-slate-300">{diagnostic.candidates_after_threshold}</span></div>
+                <div>間引き後: <span className="text-slate-300">{diagnostic.candidates_after_min_gap}</span></div>
+                <div>最終候補: <span className="text-slate-300 font-medium text-violet-300">{diagnostic.final_candidate_count}</span></div>
+                <div>ウィンドウ: <span className="text-slate-300">{diagnostic.window}s</span></div>
+              </div>
+            </div>
+          )}
+
           <CandidateList
             candidates={candidates}
             selectedCandidateId={selectedCandidate?.id ?? selectedCandidate?.rank ?? null}

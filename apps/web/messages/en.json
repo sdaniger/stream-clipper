@@ -110,6 +110,7 @@
     "downloadingVideo": "Downloading video...",
     "downloadAndRegister": "Download and register video",
     "inputPath": "Input path relative to MEDIA_ROOT",
+    "selectAvailableVideo": "Select available video...",
     "checkFfmpeg": "Check FFmpeg",
     "checking": "Checking...",
     "checkWhisper": "Check Whisper",
