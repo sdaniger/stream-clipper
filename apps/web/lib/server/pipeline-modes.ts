@@ -1,8 +1,6 @@
 import type { ClipCandidate, TwitchClipReference } from "@/lib/mock-candidates";
 import type { YtDlpMetadata } from "@/lib/server/yt-dlp-service";
-import { downloadSectionWithYtDlp } from "@/lib/server/yt-dlp-service";
 import { createHelixClip, extractVodIdFromUrl, buildVodTimestampUrl, type HelixClipResult } from "@/lib/server/twitch-helix-service";
-import { createLimiter } from "@/lib/concurrency";
 import type { ArchiveProgressEvent } from "@/lib/server/archive-analysis-service";
 
 export type PipelineModeContext = {
@@ -94,50 +92,4 @@ export async function createTwitchClips(
   return results;
 }
 
-export async function downloadSections(
-  ctx: PipelineModeContext,
-  paddingBefore: number = 5,
-  paddingAfter: number = 5,
-): Promise<Map<string, string>> {
-  const paths = new Map<string, string>();
-  const limiter = createLimiter(2);
-  const total = ctx.candidates.length;
 
-  const tasks = ctx.candidates.map((c, i) => limiter(async () => {
-    const variant = c.variants.find((v) => v.id === c.selectedVariantId) ?? c.variants[0];
-    if (!variant) return;
-
-    const startSeconds = Math.max(0, parseTimecodeToSeconds(variant.start) - paddingBefore);
-    const endSeconds = parseTimecodeToSeconds(variant.start) + parseTimecodeToSeconds(variant.duration) + paddingAfter;
-
-    ctx.emitProgress({
-      stage: "download",
-      status: "running",
-      message: `Downloading section ${i + 1}/${total} (${variant.start} - ${variant.end})...`,
-      candidateId: c.id,
-      candidateIndex: i + 1,
-      candidateTotal: total,
-    });
-
-    try {
-      const result = await downloadSectionWithYtDlp({
-        url: ctx.url,
-        startSeconds,
-        endSeconds,
-        candidateId: c.id,
-        signal: ctx.signal,
-      });
-      paths.set(c.id, result.inputPath);
-    } catch (err) {
-      ctx.emitProgress({
-        stage: "download",
-        status: "error",
-        message: `Section download failed for candidate ${i + 1}: ${err instanceof Error ? err.message : "Unknown error"}`,
-        candidateId: c.id,
-      });
-    }
-  }));
-
-  await Promise.all(tasks);
-  return paths;
-}

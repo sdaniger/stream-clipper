@@ -98,3 +98,4 @@ Rules:
 - Never use a fixed `sleep 20`.
 - Poll `http://localhost:3000` and continue as soon as it responds.
 - If the app does not respond, inspect `/tmp/next-dev.log`.
+GItでコミットとpushをする

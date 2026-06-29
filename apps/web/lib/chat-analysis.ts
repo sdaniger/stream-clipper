@@ -165,13 +165,13 @@ export function analyzeChatEntries(
   const peakPerMinute = Math.round(Math.max(...counts) * (60 / windowSec));
 
   const sortedCounts = [...counts].sort((a, b) => a - b);
-  const p85Index = Math.floor(sortedCounts.length * 0.85);
-  const volumeThreshold = Math.max(4, sortedCounts[p85Index] ?? 0);
+  const p70Index = Math.floor(sortedCounts.length * 0.70);
+  const volumeThreshold = Math.max(3, sortedCounts[p70Index] ?? 0);
   const sortedSignals = buckets
     .map((bucket) => bucket.signalScore)
     .sort((a, b) => a - b);
-  const p85SignalIndex = Math.floor(sortedSignals.length * 0.85);
-  const reactionThreshold = Math.max(10, sortedSignals[p85SignalIndex] ?? 0);
+  const p70SignalIndex = Math.floor(sortedSignals.length * 0.70);
+  const reactionThreshold = Math.max(5, sortedSignals[p70SignalIndex] ?? 0);
 
   const highlightedBuckets = buckets.filter((bucket) => {
     const hasVolumeSpike = bucket.entries.length >= volumeThreshold;
@@ -182,8 +182,8 @@ export function analyzeChatEntries(
   if (process.env.NODE_ENV !== "test" && typeof console !== "undefined") {
     console.log(
       `[chat-analysis] buckets=${buckets.length} messages=${normalizedEntries.length} ` +
-        `p85=${sortedCounts[p85Index]} volumeThreshold=${volumeThreshold} ` +
-        `p85Signal=${sortedSignals[p85SignalIndex]} reactionThreshold=${reactionThreshold} ` +
+        `p70=${sortedCounts[p70Index]} volumeThreshold=${volumeThreshold} ` +
+        `p70Signal=${sortedSignals[p70SignalIndex]} reactionThreshold=${reactionThreshold} ` +
         `highlighted=${highlightedBuckets.length} windowSec=${windowSec}`
     );
   }

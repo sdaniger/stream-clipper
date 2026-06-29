@@ -1,7 +1,7 @@
 import React, { useState, useRef, useCallback, useEffect } from "react";
 import {
   analyzeHighlights, createClip, batchCreateClips, createShort,
-  transcribeAudio, listOutputFiles,
+  transcribeAudio, listOutputFiles, fetchTwitchChat,
   type HighlightCandidate, type AnalyzeResponse, type OutputFileEntry,
 } from "./api";
 import VideoPreview from "./components/VideoPreview";
@@ -14,6 +14,7 @@ export default function App() {
   // ---- Input state ----
   const [videoPath, setVideoPath] = useState("");
   const [logPath, setLogPath] = useState("");
+  const [vodUrl, setVodUrl] = useState("");
   const [windowSec, setWindowSec] = useState(30);
   const [topN, setTopN] = useState(10);
   const [minGap, setMinGap] = useState(45);
@@ -42,7 +43,7 @@ export default function App() {
   const [outputFiles, setOutputFiles] = useState<OutputFileEntry[]>([]);
   const [outputPath, setOutputPath] = useState("");
 
-  const [logs, setLogs] = useState<string[]>(["Ready — select video and chat log to start"]);
+  const [logs, setLogs] = useState<string[]>(["Ready — provide video path + chat log (or VOD URL) to start"]);
 
   const videoRef = useRef<HTMLVideoElement>(null);
 
@@ -57,7 +58,9 @@ export default function App() {
   // ---- Analysis ----
   const handleAnalyze = useCallback(async () => {
     if (!videoPath.trim()) { setError("Video path is required"); return; }
-    if (!logPath.trim()) { setError("Chat log path is required"); return; }
+
+    const useVodMode = vodUrl.trim().length > 0;
+    if (!useVodMode && !logPath.trim()) { setError("Chat log path or VOD URL is required"); return; }
 
     setError(null);
     setResult(null);
@@ -66,20 +69,33 @@ export default function App() {
     setTranscriptText(null);
     setExportProgress("");
     setIsAnalyzing(true);
-    addLog("Starting analysis...");
+
+    const kwList = keywordsText.split(",").map((s) => s.trim()).filter(Boolean);
+
+    if (useVodMode) {
+      addLog("Fetching chat via shared server API...");
+    } else {
+      addLog("Starting analysis...");
+    }
 
     try {
-      const kwList = keywordsText.split(",").map((s) => s.trim()).filter(Boolean);
-      const res = await analyzeHighlights(videoPath, logPath, {
-        window: windowSec, top: topN, min_gap: minGap,
-        keywords_list: kwList.length > 0 ? kwList : undefined,
-        keyword_weight: 2.0, clip_padding: 5,
-      });
+      const res = await analyzeHighlights(
+        videoPath,
+        useVodMode ? null : logPath,
+        useVodMode ? vodUrl : null,
+        {
+          window: windowSec, top: topN, min_gap: minGap,
+          keywords_list: kwList.length > 0 ? kwList : undefined,
+          keyword_weight: 2.0, clip_padding: 5,
+        }
+      );
       setResult(res);
       addLog(`Analysis complete: ${res.highlights.length} candidates found`);
 
       if (res.highlights.length > 0) {
         selectHighlight(res.highlights[0].rank, res.highlights);
+      } else {
+        addLog("No highlight candidates detected (chat may be too quiet or sparse)");
       }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Analysis failed";
@@ -88,7 +104,7 @@ export default function App() {
     } finally {
       setIsAnalyzing(false);
     }
-  }, [videoPath, logPath, windowSec, topN, minGap, keywordsText, addLog]);
+  }, [videoPath, logPath, vodUrl, windowSec, topN, minGap, keywordsText, addLog]);
 
   // ---- Select highlight ----
   const selectHighlight = useCallback((rank: number, highlights?: HighlightCandidate[]) => {
@@ -339,6 +355,12 @@ export default function App() {
             <label className="field-label">Chat Log</label>
             <input value={logPath} onChange={(e) => setLogPath(e.target.value)}
               placeholder="/path/to/chat.json" className="input input-sm" style={{ width: 240 }} />
+          </div>
+          <span className="field-label" style={{ alignSelf: "center", opacity: 0.6 }}>or</span>
+          <div className="header-field">
+            <label className="field-label">VOD URL</label>
+            <input value={vodUrl} onChange={(e) => setVodUrl(e.target.value)}
+              placeholder="https://twitch.tv/videos/123456789" className="input input-sm" style={{ width: 280 }} />
           </div>
         </div>
 

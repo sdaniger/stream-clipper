@@ -10,6 +10,7 @@ import {
 import type { ClipCandidate, ClipTranscription, GeneratedClipReference, TranscriptSegment } from "@/lib/mock-candidates";
 import { burnCommentsIntoClip, generateClip, generateExportPackage, getMediaRoot, parseTimecode, writeCommentAssets } from "@/lib/server/media-service";
 import { proxyJsonRequest } from "@/lib/server/api-proxy";
+import { checkBackendHealth, spawnBackend } from "@/lib/server/backend-manager";
 import { fetchChatWithChatDownloader, defaultChatLimitForDuration, type FetchChatDownloaderResult } from "@/lib/server/chat-downloader-service";
 import { createLimiter } from "@/lib/concurrency";
 import path from "node:path";
@@ -27,6 +28,7 @@ export type ArchiveProgressEvent = {
   candidateId?: string;
   candidateIndex?: number;
   candidateTotal?: number;
+  subProgress?: number;
 };
 
 export type ArchiveAutoAnalyzeInput = {
@@ -369,7 +371,7 @@ export async function runArchiveAutoAnalysis(
   const cpuCount = cpus().length;
   // Re-encode: concurrency = cores / 2. Copy mode can use more, but
   // we keep a conservative cap to avoid I/O thrash on HDDs.
-  const clipLimit = createLimiter(Math.max(1, Math.floor(cpuCount / 2)));
+  const clipLimit = createLimiter(cpuCount);
   const transcribeLimit = createLimiter(4);
   const burnLimit = createLimiter(2);
 
@@ -402,8 +404,8 @@ export async function runArchiveAutoAnalysis(
         // In sections mode, download just this section instead of using the full VOD.
         if (pipelineMode === "sections") {
           const { parseTimecodeToSeconds } = await import("@/lib/server/pipeline-modes");
-          const startSeconds = Math.max(0, parseTimecodeToSeconds(selectedVariant.start) - 5);
-          const endSeconds = startSeconds + parseTimecodeToSeconds(selectedVariant.duration) + 10;
+          const startSeconds = Math.max(0, parseTimecodeToSeconds(selectedVariant.start) - 3);
+          const endSeconds = startSeconds + parseTimecodeToSeconds(selectedVariant.duration) + 5;
           const { downloadSectionWithYtDlp } = await import("@/lib/server/yt-dlp-service");
           emitProgress({ stage: "clip", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Downloading section for ${indexLabel}...` });
           const section = await downloadSectionWithYtDlp({
@@ -411,6 +413,17 @@ export async function runArchiveAutoAnalysis(
             startSeconds,
             endSeconds,
             candidateId: candidate.id,
+            onProgress: (p) => {
+              emitProgress({
+                stage: "clip",
+                status: "running",
+                candidateId: candidate.id,
+                candidateIndex: candidateIndex + 1,
+                candidateTotal: candidateCount,
+                message: `Downloading section for ${indexLabel} — ${p.percent.toFixed(1)}% at ${p.speed}`,
+                subProgress: p.percent,
+              });
+            },
             signal: input.signal,
           });
           clipInputPath = section.inputPath;
@@ -674,22 +687,53 @@ function buildCommentBundle(
 }
 
 async function transcribeClip(clipPath: string, input: ArchiveAutoAnalyzeInput): Promise<ClipTranscription> {
-  const { response, payload } = await proxyJsonRequest("/api/transcription/transcribe", {
-    method: "POST",
-    body: JSON.stringify({
-      clip_path: clipPath,
-      model: input.transcriptionModel?.trim() || undefined,
-      language: input.transcriptionLanguage?.trim() || undefined
-    }),
-    timeoutMs: 5 * 60 * 1000,
-    signal: input.signal
-  });
+  const MAX_RETRIES = 2;
 
-  if (!response.ok) {
-    throw new Error(readProxyError(payload, `Transcription backend returned ${response.status}.`));
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const { response, payload } = await proxyJsonRequest("/api/transcription/transcribe", {
+        method: "POST",
+        body: JSON.stringify({
+          clip_path: clipPath,
+          model: input.transcriptionModel?.trim() || undefined,
+          language: input.transcriptionLanguage?.trim() || undefined
+        }),
+        timeoutMs: 5 * 60 * 1000,
+        signal: input.signal
+      });
+
+      if (!response.ok) {
+        throw new Error(readProxyError(payload, `Transcription backend returned ${response.status}.`));
+      }
+
+      return mapTranscriptionResponse(payload as TranscriptionResponse);
+    } catch (error) {
+      const isConnectionError = error instanceof Error && (
+        error.message.includes("fetch failed") ||
+        error.message.includes("ECONNREFUSED") ||
+        error.message.includes("ECONNRESET") ||
+        error.message.includes("ENOTFOUND") ||
+        error.message.includes("network")
+      );
+
+      if (!isConnectionError || attempt >= MAX_RETRIES) {
+        throw error;
+      }
+
+      // Attempt to restart the backend before retrying
+      if (attempt === 0) {
+        await spawnBackend();
+        // wait briefly for startup
+        for (let i = 0; i < 10; i++) {
+          await new Promise((r) => setTimeout(r, 500));
+          const health = await checkBackendHealth();
+          if (health.alive) break;
+        }
+      }
+    }
   }
 
-  return mapTranscriptionResponse(payload as TranscriptionResponse);
+  throw new Error("Transcription failed after retries.");
 }
 
 function applyTranscription(candidate: ClipCandidate, transcription: ClipTranscription): ClipCandidate {

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Optional
 
 
@@ -26,9 +26,18 @@ class TimelineRow(BaseModel):
     matched_keywords: List[str]
 
 
+class NormalizedChatMessage(BaseModel):
+    timestamp: float = Field(..., description="VOD time in seconds")
+    time_sec: float = Field(..., description="Same as timestamp for compatibility")
+    message: str = Field(..., description="Chat message text")
+    author: Optional[str] = Field(default=None, description="Author display name")
+
+
 class AnalyzeRequest(BaseModel):
     video_path: str = Field(..., description="Path to the video file")
-    log_path: str = Field(..., description="Path to the chat log file (.json or .csv)")
+    log_path: Optional[str] = Field(default=None, description="Path to the chat log file (.json or .csv). Alternative to chat_data.")
+    chat_data: Optional[List[NormalizedChatMessage]] = Field(default=None, description="Chat messages inline. Alternative to log_path.")
+    vod_url: Optional[str] = Field(default=None, description="Twitch VOD URL (for reference only, chat is fetched via chat_data)")
     window: int = Field(default=30, ge=10, le=600, description="Time bucket window in seconds")
     top: int = Field(default=5, ge=1, le=100, description="Number of top highlights to return")
     min_gap: float = Field(default=30.0, ge=0, description="Minimum gap between peak centers")
@@ -37,6 +46,12 @@ class AnalyzeRequest(BaseModel):
     keyword_weight: float = Field(default=2.0, ge=0, description="Keyword hit weight in score")
     clip_duration: float = Field(default=30.0, ge=5, description="Default clip duration in seconds")
     clip_padding: float = Field(default=5.0, ge=0, description="Seconds of context padding")
+
+    @model_validator(mode="after")
+    def check_path_or_data(self):
+        if not self.log_path and not self.chat_data:
+            raise ValueError("Either 'log_path' or 'chat_data' is required")
+        return self
 
 
 class AnalyzeResponse(BaseModel):

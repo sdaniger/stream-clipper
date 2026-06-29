@@ -136,6 +136,7 @@ export default function Home() {
   const [result, setResult] = useState<PipelineResult | null>(null);
   const [downloadPoints, setDownloadPoints] = useState<Array<{ percent: number; speed: string; ts: number; elapsed: number }>>([]);
   const downloadStartRef = useRef<number>(0);
+  const [backendHealth, setBackendHealth] = useState<"checking" | "alive" | "dead">("checking");
 
   // manual clip
   const [clipUrl, setClipUrl] = usePersistedState("clipUrl", "");
@@ -234,6 +235,23 @@ export default function Home() {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [candidates, expandedId, sortBy, keepFilter, minConfidence, showKeyHelp]);
+
+  // ── backend health check ──
+  useEffect(() => {
+    let cancelled = false;
+    async function check() {
+      try {
+        const res = await fetch("/api/transcription/health");
+        if (cancelled) return;
+        setBackendHealth(res.ok ? "alive" : "dead");
+      } catch {
+        if (!cancelled) setBackendHealth("dead");
+      }
+    }
+    check();
+    const timer = setInterval(check, 15_000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, []);
 
   const effectiveMax = customMax.trim() ? Math.max(1, parseInt(customMax, 10) || maxCandidates) : maxCandidates;
 
@@ -354,7 +372,7 @@ export default function Home() {
           generatePackages: withComments,
           burnComments,
           encoder,
-          clipMode: encoder !== "libx264" ? "reencode" : "copy",
+          clipMode: "copy",
           llmProvider,
           pipelineMode,
           oauthToken: oauthToken || undefined,
@@ -714,6 +732,9 @@ export default function Home() {
             <a href="/studio" className="opacity-50 hover:opacity-100 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 text-xs text-slate-500 transition hover:text-slate-300">
               studio
             </a>
+            <a href="/clips" className="opacity-50 hover:opacity-100 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 text-xs text-slate-500 transition hover:text-slate-300">
+              clips
+            </a>
           </div>
         </header>
 
@@ -750,6 +771,9 @@ export default function Home() {
                 transcribe ? "border-fuchsia-300/40 bg-fuchsia-400/10 text-fuchsia-100" : "border-white/10 text-slate-400")}>
                 <input type="checkbox" checked={transcribe} onChange={(e) => setTranscribe(e.target.checked)} className="h-3.5 w-3.5 accent-fuchsia-300" />
                 {t("main.transcribe")}
+                <span className={cn("inline-block h-2 w-2 rounded-full",
+                  backendHealth === "alive" ? "bg-emerald-400" : backendHealth === "dead" ? "bg-rose-400" : "bg-slate-500 animate-pulse"
+                )} title={backendHealth === "alive" ? "Python backend connected" : backendHealth === "dead" ? "Python backend unreachable" : "Checking..."} />
               </label>
               <label className={cn("flex cursor-pointer items-center gap-2 rounded-xl border px-3 py-1.5 text-sm transition",
                 withComments ? "border-cyan-300/40 bg-cyan-400/10 text-cyan-100" : "border-white/10 text-slate-400")}>

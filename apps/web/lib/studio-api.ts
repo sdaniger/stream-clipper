@@ -176,7 +176,8 @@ export interface StudioAnalyzeResponse {
     candidateCount: number;
     baselinePerMinute: number;
     peakPerMinute: number;
-  };
+  } | null;
+  error?: string;
 }
 
 export async function analyzeStudioVod(input: StudioAnalyzeRequest): Promise<StudioAnalyzeResponse> {

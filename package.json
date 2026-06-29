@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "concurrently --names api,web --prefix-colors blue,green \"npm run dev:api\" \"npm run dev:web\"",
     "dev:web": "npm --workspace apps/web run dev",
-    "dev:api": "bash -c 'cd apps/api && export $(grep -v \"^#\" .env | xargs) && .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload'",
+    "dev:api": "bash -c 'cd apps/api && fuser -k 8000/tcp 2>/dev/null; export $(grep -v \"^#\" .env | xargs); while true; do .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload; sleep 2; done'",
     "build": "npm --workspace apps/web run build",
     "lint": "npm --workspace apps/web run lint",
     "typecheck": "npm --workspace apps/web run typecheck"

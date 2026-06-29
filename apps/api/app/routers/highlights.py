@@ -4,6 +4,8 @@ import asyncio
 import csv
 import io
 import json
+import os
+import tempfile
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
@@ -87,8 +89,23 @@ async def stream_video(path: str, request: Request):
 
 @router.post("/analyze", response_model=AnalyzeResponse)
 async def analyze_highlights(req: AnalyzeRequest):
-    if not Path(req.log_path).exists():
-        raise HTTPException(status_code=404, detail=f"Chat log not found: {req.log_path}")
+    # Resolve log_path from chat_data if provided
+    log_path = req.log_path
+    temp_path: str | None = None
+    if not log_path and req.chat_data:
+        # Save inline chat data to a temp file in the CLI-compatible format
+        cli_entries = [
+            {"timestamp": msg.timestamp, "author": msg.author or "", "message": msg.message}
+            for msg in req.chat_data
+        ]
+        fd, temp_path = tempfile.mkstemp(suffix=".json", prefix="stream-clipper-chat-")
+        os.close(fd)
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(cli_entries, f, ensure_ascii=False)
+        log_path = temp_path
+
+    if not log_path or not Path(log_path).exists():
+        raise HTTPException(status_code=404, detail=f"Chat log not found: {log_path}")
 
     # Support keywords as list
     kw = req.keywords
@@ -99,7 +116,7 @@ async def analyze_highlights(req: AnalyzeRequest):
         highlights, timeline, metadata = await asyncio.to_thread(
             analyze,
             video_path=req.video_path,
-            log_path=req.log_path,
+            log_path=log_path,
             window=req.window,
             top=req.top,
             min_gap=req.min_gap,
@@ -114,6 +131,12 @@ async def analyze_highlights(req: AnalyzeRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
     return AnalyzeResponse(
         highlights=[HighlightCandidate(**h) for h in highlights],

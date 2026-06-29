@@ -417,6 +417,7 @@ export type YtDlpSectionInput = {
   startSeconds: number;
   endSeconds: number;
   candidateId: string;
+  onProgress?: (progress: YtDlpProgressEvent) => void;
   signal?: AbortSignal;
 };
 
@@ -449,7 +450,9 @@ export async function downloadSectionWithYtDlp(input: YtDlpSectionInput): Promis
     url,
   ];
 
-  const stdout = await execYtDlp(args, input.signal);
+  const stdout = input.onProgress
+    ? await spawnYtDlpWithProgress(args, input.onProgress, input.signal)
+    : await execYtDlp(args, input.signal);
   const absolutePath = resolveDownloadedFilePath(stdout, paths.inputDownloadsDir);
   const relativePath = toMediaRelativePath(absolutePath, paths.mediaRoot);
 

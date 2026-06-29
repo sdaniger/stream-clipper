@@ -1,7 +1,6 @@
 import { NextRequest } from "next/server";
-import { extractYtDlpMetadata } from "@/lib/server/yt-dlp-service";
-import { extractVodIdFromUrl } from "@/lib/server/twitch-helix-service";
-import { fetchChatWithChatDownloader } from "@/lib/server/chat-downloader-service";
+import { readFile, stat } from "node:fs/promises";
+import path from "node:path";
 import { analyzeChatEntries, type ChatLogEntry } from "@/lib/chat-analysis";
 import type { HighlightCandidate, TimelineRow } from "@/lib/studio-api";
 
@@ -94,24 +93,48 @@ function clipCandidateToHighlight(
   };
 }
 
+function normalizeEntry(item: any): ChatLogEntry {
+  if (item.timestamp_seconds != null && item.author_name != null) {
+    return {
+      timestamp_seconds: Number(item.timestamp_seconds),
+      author_name: String(item.author_name),
+      message: String(item.message ?? ""),
+    };
+  }
+  const ts = item.timestamp ?? item.time ?? item.time_sec ?? item.createdAt ?? 0;
+  const author = item.author ?? item.user ?? item.username ?? item.name ?? item.author_name ?? "";
+  const message = item.message ?? item.text ?? item.body ?? "";
+  return {
+    timestamp_seconds: Number(ts),
+    author_name: String(author),
+    message: String(message),
+  };
+}
+
+function loadChatFromJson(content: string): ChatLogEntry[] {
+  const parsed = JSON.parse(content);
+  if (!Array.isArray(parsed)) {
+    throw new Error("Chat JSON must be an array");
+  }
+  const entries = parsed.map((item: any) => normalizeEntry(item));
+  entries.sort((a: ChatLogEntry, b: ChatLogEntry) => a.timestamp_seconds - b.timestamp_seconds);
+  return entries;
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { vod_url, top_n, window: windowSec, min_gap, keywords } = body as {
-      vod_url?: string;
+    const { video_path, log_path, top_n, window: windowSec, min_gap, keywords } = body as {
+      video_path?: string;
+      log_path?: string;
       top_n?: number;
       window?: number;
       min_gap?: number;
       keywords?: string;
     };
 
-    if (!vod_url) {
-      return Response.json({ error: "vod_url is required" }, { status: 400 });
-    }
-
-    const videoId = extractVodIdFromUrl(vod_url);
-    if (!videoId) {
-      return Response.json({ error: "Could not extract video ID from URL" }, { status: 400 });
+    if (!log_path) {
+      return Response.json({ error: "log_path is required" }, { status: 400 });
     }
 
     let streamClosed = false;
@@ -129,56 +152,56 @@ export async function POST(request: NextRequest) {
         };
 
         try {
-          send({ type: "progress", stage: "metadata", message: "VOD metadata を取得中...", progress: 5 });
-
-          let meta;
+          send({ type: "progress", stage: "file_read", message: "チャットファイルを読み込み中...", progress: 10 });
+          let fileContent: string;
           try {
-            meta = await extractYtDlpMetadata({ url: vod_url });
-          } catch (metaErr: unknown) {
-            const msg = metaErr instanceof Error ? metaErr.message : "Unknown error";
-            send({ type: "progress", stage: "error", message: `メタデータ取得失敗: ${msg}`, progress: 0 });
-            send({ type: "result", video_id: videoId, title: null, duration_seconds: null, message_count: 0, candidates: [], timeline: [], summary: null, error: `VOD metadata fetch failed: ${msg}` });
+            fileContent = await readFile(log_path, "utf-8");
+          } catch {
+            send({ type: "error", error: `Chat file not found: ${log_path}` });
             streamClosed = true;
             controller.close();
             return;
           }
 
-          const title = meta.title ?? "Unknown VOD";
-          send({ type: "progress", stage: "metadata_done", message: `VOD: ${title}`, progress: 10 });
-
-          send({ type: "progress", stage: "chat_fetch", message: "Twitch チャットを取得中...", progress: 15 });
-
-          let fetched;
+          send({ type: "progress", stage: "parse", message: "チャットを解析中...", progress: 30 });
+          let entries: ChatLogEntry[];
           try {
-            const maxMessages = body.maxMessages ?? 30000;
-            fetched = await fetchChatWithChatDownloader({
-              url: vod_url,
-              maxMessages,
-              onProgress: (count: number) => {
-                send({ type: "progress", stage: "chat_fetch", message: `チャット取得中: ${count} messages`, progress: Math.min(15 + (count / maxMessages) * 55, 70) });
-              },
-            });
-          } catch (chatErr: unknown) {
-            const msg = chatErr instanceof Error ? chatErr.message : "Unknown error";
-            send({ type: "progress", stage: "error", message: `チャット取得失敗: ${msg}`, progress: 0 });
-            send({ type: "result", video_id: videoId, title, duration_seconds: meta.durationSeconds, message_count: 0, candidates: [], timeline: [], summary: null, error: `Chat fetch failed: ${msg}` });
+            entries = loadChatFromJson(fileContent);
+          } catch {
+            send({ type: "error", error: "Failed to parse chat file. Use JSON array format." });
             streamClosed = true;
             controller.close();
             return;
           }
 
-          const messageCount = fetched.normalizedMessages.length;
-          send({ type: "progress", stage: "chat_done", message: `Chat loaded: ${messageCount} messages`, progress: 75 });
+          if (entries.length === 0) {
+            send({ type: "error", error: "Chat file is empty" });
+            streamClosed = true;
+            controller.close();
+            return;
+          }
 
-          send({ type: "progress", stage: "analyze", message: "候補生成中...", progress: 80 });
+          send({ type: "progress", stage: "parse_done", message: `チャット解析完了: ${entries.length} messages`, progress: 40 });
+
+          let videoExists = false;
+          if (video_path) {
+            try {
+              await stat(video_path);
+              videoExists = true;
+            } catch {}
+          }
+
           const wSec = windowSec ?? 30;
-          const analysis = analyzeChatEntries(fetched.normalizedMessages, `studio-${Date.now()}`, {
+          const title = video_path ? path.basename(video_path) : "Local Video";
+
+          send({ type: "progress", stage: "analyze", message: "候補生成中...", progress: 50 });
+          const analysis = analyzeChatEntries(entries, `local-${Date.now()}`, {
             windowSeconds: wSec,
             minGap: min_gap ?? 45,
           });
 
-          send({ type: "progress", stage: "timeline", message: "タイムライン構築中...", progress: 90 });
-          const timeline = buildTimeline(fetched.normalizedMessages, wSec);
+          send({ type: "progress", stage: "timeline", message: "タイムライン構築中...", progress: 75 });
+          const timeline = buildTimeline(entries, wSec);
 
           const candidates: HighlightCandidate[] = (analysis.candidates ?? [])
             .map((c: any, i: number) => clipCandidateToHighlight(c, i, timeline, top_n ?? 10, min_gap ?? 45))
@@ -187,12 +210,13 @@ export async function POST(request: NextRequest) {
           send({ type: "progress", stage: "done", message: `分析完了: ${candidates.length} 件の候補`, progress: 100 });
           send({
             type: "result",
-            video_id: videoId,
+            video_id: null,
             title,
-            duration_seconds: meta.durationSeconds,
-            message_count: messageCount,
+            duration_seconds: null,
+            message_count: entries.length,
             candidates,
             timeline,
+            video_exists: videoExists,
             summary: {
               inputMessages: analysis.summary.inputMessages,
               analyzedMessages: analysis.summary.analyzedMessages,

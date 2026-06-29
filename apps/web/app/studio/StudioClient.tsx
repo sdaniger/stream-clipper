@@ -1,14 +1,49 @@
 "use client";
 import React, { useState, useCallback } from "react";
 import { extractVideoId, getCandidateSeekTime, secondsToTwitchTime, type HighlightCandidate } from "@/lib/twitch-time";
-import { analyzeStudioVod, type TimelineRow } from "@/lib/studio-api";
+import type { TimelineRow } from "@/lib/studio-api";
 import TwitchVodPlayer from "@/components/studio/TwitchVodPlayer";
+import LocalVideoPlayer from "@/components/studio/LocalVideoPlayer";
 import CandidateList from "@/components/studio/CandidateList";
 import CandidateDetails from "@/components/studio/CandidateDetails";
 import LogPanel from "@/components/studio/LogPanel";
 
+type StudioMode = "twitch" | "local";
+
+interface SseProgress {
+  type: "progress";
+  stage: string;
+  message: string;
+  progress: number;
+}
+
+interface SseResult {
+  type: "result";
+  video_id: string | null;
+  title: string | null;
+  duration_seconds: number | null;
+  message_count: number;
+  candidates: HighlightCandidate[];
+  timeline: TimelineRow[];
+  summary: Record<string, unknown> | null;
+  error?: string;
+  video_exists?: boolean;
+}
+
+interface SseError {
+  type: "error";
+  error: string;
+}
+
+type SseEvent = SseProgress | SseResult | SseError;
+
 export default function StudioClient() {
+  const [mode, setMode] = useState<StudioMode>("twitch");
+
   const [vodUrl, setVodUrl] = useState("");
+  const [videoPath, setVideoPath] = useState("");
+  const [logPath, setLogPath] = useState("");
+
   const [windowSec, setWindowSec] = useState(30);
   const [topN, setTopN] = useState(10);
   const [minGap, setMinGap] = useState(45);
@@ -22,6 +57,8 @@ export default function StudioClient() {
   const [playerStartTime, setPlayerStartTime] = useState(0);
   const [playerReloadKey, setPlayerReloadKey] = useState(0);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [progressLabel, setProgressLabel] = useState("");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [logs, setLogs] = useState<string[]>(["Ready"]);
 
@@ -40,8 +77,12 @@ export default function StudioClient() {
     setPlayerStartTime(seekTime);
     setPlayerReloadKey((v) => v + 1);
     setErrorMessage(null);
-    addLog(`候補 #${candidate.rank} に移動: ${secondsToTwitchTime(seekTime)}`);
-  }, [addLog]);
+    if (mode === "twitch") {
+      addLog(`候補 #${candidate.rank} に移動: ${secondsToTwitchTime(seekTime)}`);
+    } else {
+      addLog(`候補 #${candidate.rank} に移動: ${seekTime.toFixed(1)}s`);
+    }
+  }, [addLog, mode]);
 
   const handleLoadVod = useCallback(() => {
     const id = extractVideoId(vodUrl);
@@ -60,16 +101,69 @@ export default function StudioClient() {
     addLog(`VOD loaded: v${id}`);
   }, [vodUrl, addLog]);
 
+  const readStream = useCallback(async (res: Response) => {
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        try {
+          const event: SseEvent = JSON.parse(line.slice(6));
+          if (event.type === "progress") {
+            setProgress(event.progress);
+            setProgressLabel(event.message);
+            addLog(event.message);
+          } else if (event.type === "result") {
+            setVodTitle(event.title);
+            if (event.error) {
+              addLog(`エラー: ${event.error}`);
+              setCandidates([]);
+              setTimeline([]);
+              setErrorMessage(event.error);
+            } else {
+              if (event.candidates.length > 0) {
+                addLog(`候補生成完了: ${event.candidates.length} 件`);
+                setCandidates(event.candidates);
+                setTimeline(event.timeline ?? []);
+                handleSelectCandidate(event.candidates[0]);
+              } else {
+                addLog("チャットから候補を生成できませんでした");
+                setCandidates([]);
+                setTimeline([]);
+              }
+            }
+          } else if (event.type === "error") {
+            setErrorMessage(event.error);
+            addLog(`エラー: ${event.error}`);
+          }
+        } catch {
+          // skip malformed events
+        }
+      }
+    }
+  }, [addLog, handleSelectCandidate]);
+
   const handleAnalyze = useCallback(async () => {
-    if (!videoId) {
-      setErrorMessage("先に Twitch VOD URL を読み込んでください");
-      return;
+    if (mode === "twitch") {
+      if (!videoId) { setErrorMessage("先に Twitch VOD URL を読み込んでください"); return; }
+      if (!vodUrl.trim()) { setErrorMessage("Twitch VOD URL が必要です"); return; }
+    } else {
+      if (!videoPath.trim()) { setErrorMessage("動画ファイルのパスを入力してください"); return; }
+      if (!logPath.trim()) { setErrorMessage("チャットログファイルのパスを入力してください"); return; }
     }
-    if (!vodUrl.trim()) {
-      setErrorMessage("Twitch VOD URL が必要です");
-      return;
-    }
+
     setIsAnalyzing(true);
+    setProgress(0);
+    setProgressLabel("");
     setErrorMessage(null);
     setCandidates([]);
     setTimeline([]);
@@ -77,43 +171,33 @@ export default function StudioClient() {
     addLog("分析を開始...");
 
     try {
-      addLog("VOD metadata を取得中...");
-      const result = await analyzeStudioVod({
-        vod_url: vodUrl,
-        top_n: topN,
-        window: windowSec,
-        min_gap: minGap,
-        keywords: keywordsText.trim() || undefined,
+      const endpoint = mode === "twitch" ? "/api/studio/analyze-vod" : "/api/studio/analyze-local";
+      const body = mode === "twitch"
+        ? { vod_url: vodUrl, top_n: topN, window: windowSec, min_gap: minGap, keywords: keywordsText.trim() || undefined }
+        : { video_path: videoPath, log_path: logPath, top_n: topN, window: windowSec, min_gap: minGap, keywords: keywordsText.trim() || undefined };
+
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
       });
 
-      setVodTitle(result.title);
-      addLog(`VOD metadata fetched: ${result.title ?? "unknown"}`);
-
-      addLog("Twitch チャットを取得中...");
-      const chatMsg = `Chat loaded: ${result.message_count} messages`;
-      addLog(chatMsg);
-
-      if (result.candidates.length > 0) {
-        addLog(`候補生成完了: ${result.candidates.length} 件`);
-        setCandidates(result.candidates);
-        setTimeline(result.timeline ?? []);
-        handleSelectCandidate(result.candidates[0]);
-        addLog("分析完了");
-      } else {
-        addLog("チャットから候補を生成できませんでした（チャット数が少なすぎる可能性があります）");
-        addLog("分析完了 (candidates: 0)");
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+        throw new Error(err.error || `HTTP ${res.status}`);
       }
+
+      await readStream(res);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "分析に失敗しました";
       setErrorMessage(msg);
-      addLog(`分析失敗: ${msg}`);
-      if (msg.includes("fetch") || msg.includes("timeout") || msg.includes("network")) {
-        addLog("チャット取得に失敗しました。VOD が公開されているか確認してください。");
-      }
+      addLog(`エラー: ${msg}`);
     } finally {
       setIsAnalyzing(false);
+      setProgress(0);
+      setProgressLabel("");
     }
-  }, [videoId, vodUrl, topN, windowSec, minGap, keywordsText, handleSelectCandidate, addLog]);
+  }, [mode, videoId, vodUrl, videoPath, logPath, topN, windowSec, minGap, keywordsText, readStream, addLog]);
 
   return (
     <div className="min-h-screen flex flex-col bg-[#050816]">
@@ -121,18 +205,44 @@ export default function StudioClient() {
       <header className="bg-slate-900/80 border-b border-slate-700/50 px-5 py-2.5 flex items-center gap-4 flex-wrap">
         <h1 className="text-lg font-bold text-violet-300 whitespace-nowrap">Stream Clipper Studio</h1>
 
-        <div className="flex gap-2 items-end">
-          <div className="flex flex-col gap-px">
-            <label className="text-[10px] text-slate-500 uppercase tracking-wide">Twitch VOD URL</label>
-            <input value={vodUrl} onChange={(e) => setVodUrl(e.target.value)}
-              placeholder="https://www.twitch.tv/videos/123456789"
-              className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500 w-72" />
-          </div>
-          <button onClick={handleLoadVod} disabled={!vodUrl.trim()}
-            className="px-2.5 py-1.5 text-xs rounded bg-slate-700/60 border border-slate-600 text-slate-300 hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed">
-            Load VOD
-          </button>
+        <div className="flex bg-slate-800 rounded-md p-0.5 border border-slate-700">
+          <button
+            onClick={() => { setMode("twitch"); setVideoId(null); setCandidates([]); setVodTitle(null); }}
+            className={`px-2.5 py-1 text-xs rounded-sm transition-colors ${mode === "twitch" ? "bg-violet-600 text-white" : "text-slate-400 hover:text-slate-200"}`}
+          >Twitch VOD</button>
+          <button
+            onClick={() => { setMode("local"); setVideoId(null); setCandidates([]); setVodTitle(null); }}
+            className={`px-2.5 py-1 text-xs rounded-sm transition-colors ${mode === "local" ? "bg-violet-600 text-white" : "text-slate-400 hover:text-slate-200"}`}
+          >Local File</button>
         </div>
+
+        {mode === "twitch" ? (
+          <div className="flex gap-2 items-end">
+            <div className="flex flex-col gap-px">
+              <label className="text-[10px] text-slate-500 uppercase tracking-wide">Twitch VOD URL</label>
+              <input value={vodUrl} onChange={(e) => setVodUrl(e.target.value)}
+                placeholder="https://www.twitch.tv/videos/123456789"
+                className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500 w-72" />
+            </div>
+            <button onClick={handleLoadVod} disabled={!vodUrl.trim()}
+              className="px-2.5 py-1.5 text-xs rounded bg-slate-700/60 border border-slate-600 text-slate-300 hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed">Load VOD</button>
+          </div>
+        ) : (
+          <div className="flex gap-2 items-end">
+            <div className="flex flex-col gap-px">
+              <label className="text-[10px] text-slate-500 uppercase tracking-wide">Video File</label>
+              <input value={videoPath} onChange={(e) => setVideoPath(e.target.value)}
+                placeholder="/path/to/video.mp4"
+                className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500 w-64" />
+            </div>
+            <div className="flex flex-col gap-px">
+              <label className="text-[10px] text-slate-500 uppercase tracking-wide">Chat Log</label>
+              <input value={logPath} onChange={(e) => setLogPath(e.target.value)}
+                placeholder="/path/to/chat.json"
+                className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500 w-64" />
+            </div>
+          </div>
+        )}
 
         <div className="flex gap-1.5 items-end">
           <div className="flex flex-col gap-px w-14">
@@ -162,12 +272,29 @@ export default function StudioClient() {
         </div>
 
         <div className="flex gap-1.5 ml-auto">
-          <button onClick={handleAnalyze} disabled={isAnalyzing || !videoId}
+          <button onClick={handleAnalyze} disabled={isAnalyzing || (mode === "twitch" && !videoId)}
             className="px-3 py-1.5 text-xs rounded bg-violet-600 text-white hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed">
             {isAnalyzing ? "⏳ Analyzing..." : "🔍 Analyze"}
           </button>
         </div>
       </header>
+
+      {/* Progress bar */}
+      {isAnalyzing && (
+        <div className="bg-slate-900/90 border-b border-slate-700/50 px-5 py-2">
+          <div className="flex items-center gap-3">
+            <div className="flex-1 bg-slate-700 rounded-full h-2 overflow-hidden">
+              <div
+                className="h-full bg-gradient-to-r from-violet-500 to-cyan-400 rounded-full transition-all duration-300 ease-out"
+                style={{ width: `${Math.max(1, progress)}%` }}
+              />
+            </div>
+            <span className="text-xs text-slate-400 min-w-[180px] text-right whitespace-nowrap">
+              {progressLabel || "準備中..."} ({progress}%)
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* Error */}
       {errorMessage && (
@@ -177,40 +304,33 @@ export default function StudioClient() {
         </div>
       )}
 
-      {/* VOD info bar */}
+      {/* Title bar */}
       {vodTitle && (
         <div className="bg-slate-800/50 border-b border-slate-700/30 px-5 py-1 text-xs text-slate-400">
           {vodTitle} · {candidates.length} candidates · {timeline.length} timeline buckets
-          {!vodUrl.match(/\.(mp4|mkv|webm|avi|mov)$/i) && (
-            <span className="ml-3 text-amber-500">(preview via Twitch player)</span>
-          )}
         </div>
       )}
 
-      {/* Main content: player left, candidates right */}
+      {/* Main content */}
       <div className="flex gap-3 px-5 pt-3 flex-1 min-h-0">
         <div className="flex-[3] flex flex-col gap-2.5 min-w-0">
-          {videoId ? (
-            <TwitchVodPlayer
-              videoId={videoId}
-              startTimeSeconds={playerStartTime}
-              reloadKey={playerReloadKey}
-            />
+          {mode === "twitch" && videoId ? (
+            <TwitchVodPlayer videoId={videoId} startTimeSeconds={playerStartTime} reloadKey={playerReloadKey} />
+          ) : mode === "local" && videoPath.trim() ? (
+            <LocalVideoPlayer videoPath={videoPath} startTimeSeconds={playerStartTime} />
           ) : (
             <div className="glass-panel rounded-lg p-3 flex items-center justify-center h-[200px]">
               <div className="text-xs text-slate-500">
-                Enter a Twitch VOD URL above and click &quot;Load VOD&quot;
+                {mode === "twitch" ? 'Enter a Twitch VOD URL above and click "Load VOD"' : "Enter a local video file path above"}
               </div>
             </div>
           )}
 
           <CandidateDetails candidate={selectedCandidate} />
 
-          {/* Export info */}
-          {candidates.length > 0 && (
+          {candidates.length > 0 && mode === "twitch" && (
             <div className="glass-panel rounded-lg p-2 text-[11px] text-slate-500">
-              mp4 書き出しにはローカル動画ファイルが必要です。
-              Twitch VOD プレイヤーはプレビュー専用です。
+              mp4 書き出しにはローカル動画ファイルが必要です。Twitch VOD プレイヤーはプレビュー専用です。
             </div>
           )}
         </div>
@@ -224,7 +344,6 @@ export default function StudioClient() {
         </div>
       </div>
 
-      {/* Footer */}
       <div className="px-5 pb-3 pt-2">
         <LogPanel logs={logs} />
       </div>
