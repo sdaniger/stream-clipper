@@ -198,10 +198,19 @@ export type ClipCandidate = {
   }>;
   /** LLM evaluation results (summary + interestingness). */
   llmEvaluation?: {
+    title?: string;
     summary: string;
-    highlights: string[];
+    keyMoments?: Array<{ label: string; quote: string }>;
+    highlights?: string[];
     interestingness: number;
-    reason: string;
+    viralPotential?: number;
+    contentType?: "funny" | "exciting" | "wholesome" | "dramatic" | "informative" | "skill" | "fail" | "reaction" | "chat_highlight" | "other";
+    targetAudience?: string;
+    audienceReaction?: string;
+    language?: string;
+    reasoning?: string;
+    reason?: string;
+    evaluatedBy?: string;
   };
   /** VOD timestamp link for Twitch VOD (e.g. https://twitch.tv/videos/123?t=1h23m45s) */
   vodTimestampUrl?: string;
