@@ -1,15 +1,39 @@
 "use client";
-import React, { useRef, useEffect, useCallback } from "react";
+import React, { useRef, useEffect, useCallback, forwardRef, useImperativeHandle } from "react";
+
+export interface LocalVideoPlayerHandle {
+  getCurrentTime: () => number;
+  getVideoElement: () => HTMLVideoElement | null;
+}
 
 interface Props {
   videoPath: string;
   startTimeSeconds: number;
   onTimeUpdate?: (time: number) => void;
+  onDurationChange?: (duration: number) => void;
 }
 
-export default function LocalVideoPlayer({ videoPath, startTimeSeconds, onTimeUpdate }: Props) {
+const LocalVideoPlayer = forwardRef<LocalVideoPlayerHandle, Props>(function LocalVideoPlayer(
+  { videoPath, startTimeSeconds, onTimeUpdate, onDurationChange },
+  ref
+) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const prevStartRef = useRef(startTimeSeconds);
+  const onTimeUpdateRef = useRef(onTimeUpdate);
+  const onDurationChangeRef = useRef(onDurationChange);
+
+  // Keep latest callbacks in refs to avoid re-attaching listeners
+  useEffect(() => {
+    onTimeUpdateRef.current = onTimeUpdate;
+  }, [onTimeUpdate]);
+  useEffect(() => {
+    onDurationChangeRef.current = onDurationChange;
+  }, [onDurationChange]);
+
+  useImperativeHandle(ref, () => ({
+    getCurrentTime: () => videoRef.current?.currentTime ?? 0,
+    getVideoElement: () => videoRef.current,
+  }));
 
   useEffect(() => {
     const video = videoRef.current;
@@ -22,10 +46,16 @@ export default function LocalVideoPlayer({ videoPath, startTimeSeconds, onTimeUp
   }, [startTimeSeconds]);
 
   const handleTimeUpdate = useCallback(() => {
-    if (onTimeUpdate && videoRef.current) {
-      onTimeUpdate(videoRef.current.currentTime);
+    if (videoRef.current && onTimeUpdateRef.current) {
+      onTimeUpdateRef.current(videoRef.current.currentTime);
     }
-  }, [onTimeUpdate]);
+  }, []);
+
+  const handleLoadedMetadata = useCallback(() => {
+    if (videoRef.current && onDurationChangeRef.current) {
+      onDurationChangeRef.current(videoRef.current.duration || 0);
+    }
+  }, []);
 
   return (
     <div className="glass-panel rounded-lg p-3">
@@ -42,9 +72,12 @@ export default function LocalVideoPlayer({ videoPath, startTimeSeconds, onTimeUp
           className="w-full max-h-[70vh]"
           controls
           onTimeUpdate={handleTimeUpdate}
+          onLoadedMetadata={handleLoadedMetadata}
           onError={() => {}}
         />
       </div>
     </div>
   );
-}
+});
+
+export default LocalVideoPlayer;

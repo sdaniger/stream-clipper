@@ -1,14 +1,19 @@
 "use client";
-import React, { useState, useCallback } from "react";
-import { extractVideoId, getCandidateSeekTime, secondsToTwitchTime, type HighlightCandidate } from "@/lib/twitch-time";
+import React, { useState, useCallback, useRef, useEffect, useMemo } from "react";
+import { extractVideoId, getCandidateSeekTime, type HighlightCandidate } from "@/lib/twitch-time";
 import type { TimelineRow } from "@/lib/studio-api";
-import TwitchVodPlayer from "@/components/studio/TwitchVodPlayer";
-import LocalVideoPlayer from "@/components/studio/LocalVideoPlayer";
+import { createStudioClip, batchCreateStudioClips } from "@/lib/studio-api";
+import TwitchVodPlayer, { type TwitchVodPlayerHandle } from "@/components/studio/TwitchVodPlayer";
+import LocalVideoPlayer, { type LocalVideoPlayerHandle } from "@/components/studio/LocalVideoPlayer";
 import CandidateList from "@/components/studio/CandidateList";
 import CandidateDetails from "@/components/studio/CandidateDetails";
 import LogPanel from "@/components/studio/LogPanel";
+import AdvancedSettings from "@/components/studio/AdvancedSettings";
+import ClipActionPanel from "@/components/studio/ClipActionPanel";
+import TimelineGraph from "@/components/studio/TimelineGraph";
 
 type StudioMode = "twitch" | "local";
+type ExportStatus = "idle" | "exporting" | "exported" | "error";
 
 interface SseProgress {
   type: "progress";
@@ -51,6 +56,26 @@ interface SseError {
 
 type SseEvent = SseProgress | SseResult | SseError;
 
+function getStart(c: HighlightCandidate): number {
+  return c.clip_start ?? c.start ?? c.peak_time ?? 0;
+}
+function getEnd(c: HighlightCandidate): number {
+  return c.end ?? (c.clip_start != null && c.clip_duration != null ? c.clip_start + c.clip_duration : getStart(c) + 30);
+}
+function getPeak(c: HighlightCandidate): number {
+  return c.peak_time ?? (getStart(c) + getEnd(c)) / 2;
+}
+function formatTimecode(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) {
+    return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+  }
+  return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+}
+
 export default function StudioClient() {
   const [mode, setMode] = useState<StudioMode>("twitch");
 
@@ -58,6 +83,7 @@ export default function StudioClient() {
   const [videoPath, setVideoPath] = useState("");
   const [logPath, setLogPath] = useState("");
 
+  // Advanced analysis params
   const [windowSec, setWindowSec] = useState(30);
   const [topN, setTopN] = useState(10);
   const [minGap, setMinGap] = useState(45);
@@ -66,6 +92,7 @@ export default function StudioClient() {
   const [clipDuration, setClipDuration] = useState(30);
   const [clipOffset, setClipOffset] = useState(10);
   const [keywordWeight, setKeywordWeight] = useState(2.0);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   const [videoId, setVideoId] = useState<string | null>(null);
   const [vodTitle, setVodTitle] = useState<string | null>(null);
@@ -74,6 +101,8 @@ export default function StudioClient() {
   const [selectedCandidate, setSelectedCandidate] = useState<HighlightCandidate | null>(null);
   const [playerStartTime, setPlayerStartTime] = useState(0);
   const [playerReloadKey, setPlayerReloadKey] = useState(0);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [videoDuration, setVideoDuration] = useState(0);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [progressLabel, setProgressLabel] = useState("");
@@ -82,8 +111,39 @@ export default function StudioClient() {
   const [diagnostic, setDiagnostic] = useState<SseResult["diagnostic"] | null>(null);
   const [abortController, setAbortController] = useState<AbortController | null>(null);
 
+  // Export state
+  const [exportedIds, setExportedIds] = useState<Set<string | number>>(new Set());
+  const [exportingId, setExportingId] = useState<string | number | null>(null);
+  const [exportStatus, setExportStatus] = useState<ExportStatus>("idle");
+  const [batchExportStatus, setBatchExportStatus] = useState<ExportStatus>("idle");
+
+  // Player refs
+  const localPlayerRef = useRef<LocalVideoPlayerHandle>(null);
+  const twitchPlayerRef = useRef<TwitchVodPlayerHandle>(null);
+
   const addLog = useCallback((msg: string) => {
     setLogs((prev) => [...prev.slice(-99), `[${new Date().toLocaleTimeString()}] ${msg}`]);
+  }, []);
+
+  const canExport = mode === "local" && !!videoPath.trim();
+
+  // Compute maxTime for timeline graph
+  const maxTime = useMemo(() => {
+    if (timeline.length > 0) {
+      return Math.max(...timeline.map((t) => t.end));
+    }
+    if (candidates.length > 0) {
+      return Math.max(...candidates.map((c) => getEnd(c)));
+    }
+    return videoDuration || 0;
+  }, [timeline, candidates, videoDuration]);
+
+  // Seek helper - updates player state
+  const seekTo = useCallback((time: number) => {
+    const clamped = Math.max(0, time);
+    setPlayerStartTime(clamped);
+    setPlayerReloadKey((v) => v + 1);
+    setCurrentTime(clamped);
   }, []);
 
   const handleSelectCandidate = useCallback((candidate: HighlightCandidate) => {
@@ -94,15 +154,15 @@ export default function StudioClient() {
       return;
     }
     setSelectedCandidate(candidate);
-    setPlayerStartTime(seekTime);
-    setPlayerReloadKey((v) => v + 1);
+    seekTo(seekTime);
     setErrorMessage(null);
-    if (mode === "twitch") {
-      addLog(`候補 #${candidate.rank} に移動: ${secondsToTwitchTime(seekTime)}`);
-    } else {
-      addLog(`候補 #${candidate.rank} に移動: ${seekTime.toFixed(1)}s`);
-    }
-  }, [addLog, mode]);
+    addLog(`候補 #${candidate.rank} を選択: ${formatTimecode(seekTime)}`);
+  }, [addLog, seekTo]);
+
+  const handleEditCandidate = useCallback((candidate: HighlightCandidate) => {
+    handleSelectCandidate(candidate);
+    addLog(`候補 #${candidate.rank} を編集中 (範囲を調整してください)`);
+  }, [addLog, handleSelectCandidate]);
 
   const handleLoadVod = useCallback(() => {
     const id = extractVideoId(vodUrl);
@@ -115,11 +175,13 @@ export default function StudioClient() {
     setCandidates([]);
     setTimeline([]);
     setSelectedCandidate(null);
-    setPlayerStartTime(0);
-    setPlayerReloadKey((v) => v + 1);
+    setExportedIds(new Set());
+    setExportStatus("idle");
+    setBatchExportStatus("idle");
+    seekTo(0);
     setErrorMessage(null);
     addLog(`VOD loaded: v${id}`);
-  }, [vodUrl, addLog]);
+  }, [vodUrl, addLog, seekTo]);
 
   const handleCancel = useCallback(() => {
     if (abortController) {
@@ -202,6 +264,9 @@ export default function StudioClient() {
     setCandidates([]);
     setTimeline([]);
     setSelectedCandidate(null);
+    setExportedIds(new Set());
+    setExportStatus("idle");
+    setBatchExportStatus("idle");
     setDiagnostic(null);
     addLog("分析を開始...");
 
@@ -261,13 +326,160 @@ export default function StudioClient() {
     }
   }, [mode, videoId, vodUrl, videoPath, logPath, topN, windowSec, minGap, keywordsText, step, clipDuration, clipOffset, keywordWeight, readStream, addLog]);
 
-  const maxScore = timeline.length > 0 ? Math.max(...timeline.map(t => t.score)) : 1;
+  // ─── Export functions ─────────────────────────────────────────────────────
+
+  const exportCandidate = useCallback(async (candidate: HighlightCandidate) => {
+    if (!canExport) {
+      setErrorMessage("MP4 書き出しにはローカル動画ファイルが必要です");
+      return;
+    }
+    const id = candidate.id ?? candidate.rank;
+    setExportingId(id);
+    setExportStatus("exporting");
+    addLog(`候補 #${candidate.rank} の書き出しを開始...`);
+
+    try {
+      const start = getStart(candidate);
+      const duration = (getEnd(candidate) - getStart(candidate)) || candidate.clip_duration || 30;
+      const result = await createStudioClip({
+        inputPath: videoPath,
+        candidateId: `rank-${candidate.rank}`,
+        variantId: "default",
+        start: formatTimecode(start),
+        duration: formatTimecode(duration),
+        mode: "reencode",
+      });
+      addLog(`✓ 書き出し完了: ${result.outputPath}`);
+      setExportedIds((prev) => new Set(prev).add(id));
+      setExportStatus("exported");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "書き出しに失敗しました";
+      setErrorMessage(msg);
+      addLog(`✗ 書き出し失敗: ${msg}`);
+      setExportStatus("error");
+    } finally {
+      setExportingId(null);
+    }
+  }, [canExport, videoPath, addLog]);
+
+  const exportTop5 = useCallback(async () => {
+    if (!canExport) {
+      setErrorMessage("MP4 書き出しにはローカル動画ファイルが必要です");
+      return;
+    }
+    if (candidates.length === 0) return;
+
+    setBatchExportStatus("exporting");
+    addLog(`Top 5 候補の一括書き出しを開始 (${Math.min(5, candidates.length)}件)...`);
+
+    try {
+      const top5 = candidates.slice(0, 5);
+      const result = await batchCreateStudioClips(videoPath, top5, { mode: "reencode" });
+      const newExported = new Set<string | number>(exportedIds);
+      top5.forEach((c) => newExported.add(c.id ?? c.rank));
+      setExportedIds(newExported);
+      addLog(`✓ 一括書き出し完了: ${result.clips.length}件成功, ${result.failed.length}件失敗`);
+      if (result.failed.length > 0) {
+        result.failed.forEach((f) => addLog(`  ✗ ${f.candidateId}: ${f.error}`));
+      }
+      setBatchExportStatus(result.failed.length === 0 ? "exported" : "error");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "一括書き出しに失敗しました";
+      setErrorMessage(msg);
+      addLog(`✗ 一括書き出し失敗: ${msg}`);
+      setBatchExportStatus("error");
+    }
+  }, [canExport, candidates, videoPath, exportedIds, addLog]);
+
+  // ─── Action panel handlers ────────────────────────────────────────────────
+
+  const handleJumpStart = useCallback(() => {
+    if (!selectedCandidate) return;
+    seekTo(getStart(selectedCandidate));
+    addLog(`▶ Start: ${formatTimecode(getStart(selectedCandidate))}`);
+  }, [selectedCandidate, seekTo, addLog]);
+
+  const handleJumpPeak = useCallback(() => {
+    if (!selectedCandidate) return;
+    seekTo(getPeak(selectedCandidate));
+    addLog(`⭐ Peak: ${formatTimecode(getPeak(selectedCandidate))}`);
+  }, [selectedCandidate, seekTo, addLog]);
+
+  const handleJumpEnd = useCallback(() => {
+    if (!selectedCandidate) return;
+    seekTo(Math.max(0, getEnd(selectedCandidate) - 1));
+    addLog(`⏭ End: ${formatTimecode(getEnd(selectedCandidate))}`);
+  }, [selectedCandidate, seekTo, addLog]);
+
+  const handlePreviewRange = useCallback(() => {
+    if (!selectedCandidate) return;
+    seekTo(getStart(selectedCandidate));
+    addLog(`▶ Preview: ${formatTimecode(getStart(selectedCandidate))} から再生`);
+  }, [selectedCandidate, seekTo, addLog]);
+
+  const handleSetStartFromCurrent = useCallback(() => {
+    if (!selectedCandidate) return;
+    const newStart = currentTime;
+    const end = getEnd(selectedCandidate);
+    const updated: HighlightCandidate = {
+      ...selectedCandidate,
+      clip_start: newStart,
+      start: newStart,
+      clip_duration: Math.max(1, end - newStart),
+    };
+    setSelectedCandidate(updated);
+    setCandidates((prev) => prev.map((c) => (c.rank === selectedCandidate.rank ? updated : c)));
+    addLog(`Start を ${formatTimecode(newStart)} に設定`);
+  }, [selectedCandidate, currentTime, addLog]);
+
+  const handleSetEndFromCurrent = useCallback(() => {
+    if (!selectedCandidate) return;
+    const newEnd = currentTime;
+    const start = getStart(selectedCandidate);
+    const updated: HighlightCandidate = {
+      ...selectedCandidate,
+      end: newEnd,
+      clip_duration: Math.max(1, newEnd - start),
+    };
+    setSelectedCandidate(updated);
+    setCandidates((prev) => prev.map((c) => (c.rank === selectedCandidate.rank ? updated : c)));
+    addLog(`End を ${formatTimecode(newEnd)} に設定`);
+  }, [selectedCandidate, currentTime, addLog]);
+
+  const handleSelectLocalVideo = useCallback(() => {
+    setMode("local");
+    addLog("Local File モードに切り替えました");
+  }, [addLog]);
+
+  // ─── Time tracking ────────────────────────────────────────────────────────
+
+  const handleTimeUpdate = useCallback((time: number) => {
+    setCurrentTime(time);
+  }, []);
+
+  const handleDurationChange = useCallback((duration: number) => {
+    if (Number.isFinite(duration) && duration > 0) {
+      setVideoDuration(duration);
+    }
+  }, []);
+
+  // Get current time from player (for "Set from current" buttons)
+  const liveCurrentTime = useMemo(() => {
+    if (mode === "local" && localPlayerRef.current) {
+      return localPlayerRef.current.getCurrentTime();
+    }
+    return currentTime;
+  }, [mode, currentTime]);
+
+  // ─── Render ───────────────────────────────────────────────────────────────
+
+  const hasLocalVideo = canExport;
 
   return (
     <div className="min-h-screen flex flex-col bg-[#050816]">
-      {/* Header */}
-      <header className="bg-slate-900/80 border-b border-slate-700/50 px-5 py-2.5 flex items-center gap-4 flex-wrap">
-        <h1 className="text-lg font-bold text-violet-300 whitespace-nowrap">Stream Clipper Studio</h1>
+      {/* Header: only essential controls */}
+      <header className="bg-slate-900/80 border-b border-slate-700/50 px-5 py-2.5 flex items-center gap-3 flex-wrap">
+        <h1 className="text-lg font-bold text-violet-300 whitespace-nowrap">Studio</h1>
 
         <div className="flex bg-slate-800 rounded-md p-0.5 border border-slate-700">
           <button
@@ -289,7 +501,7 @@ export default function StudioClient() {
                 className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500 w-72" />
             </div>
             <button onClick={handleLoadVod} disabled={!vodUrl.trim()}
-              className="px-2.5 py-1.5 text-xs rounded bg-slate-700/60 border border-slate-600 text-slate-300 hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed">Load VOD</button>
+              className="px-2.5 py-1.5 text-xs rounded bg-slate-700/60 border border-slate-600 text-slate-300 hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed">Load</button>
           </div>
         ) : (
           <div className="flex gap-2 items-end">
@@ -308,58 +520,6 @@ export default function StudioClient() {
           </div>
         )}
 
-        {/* Analysis Parameters */}
-        <div className="flex gap-1.5 items-end flex-wrap">
-          <div className="flex flex-col gap-px w-14">
-            <label className="text-[10px] text-slate-500 uppercase tracking-wide">Window</label>
-            <input type="number" value={windowSec} min={10} step={5}
-              onChange={(e) => setWindowSec(Number(e.target.value) || 30)}
-              className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500" />
-          </div>
-          <div className="flex flex-col gap-px w-12">
-            <label className="text-[10px] text-slate-500 uppercase tracking-wide">Step</label>
-            <input type="number" value={step} min={5} step={5}
-              onChange={(e) => setStep(Number(e.target.value) || 10)}
-              className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500" />
-          </div>
-          <div className="flex flex-col gap-px w-12">
-            <label className="text-[10px] text-slate-500 uppercase tracking-wide">Top N</label>
-            <input type="number" value={topN} min={1} max={50} step={1}
-              onChange={(e) => setTopN(Number(e.target.value) || 10)}
-              className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500" />
-          </div>
-          <div className="flex flex-col gap-px w-14">
-            <label className="text-[10px] text-slate-500 uppercase tracking-wide">Min gap</label>
-            <input type="number" value={minGap} min={0} step={5}
-              onChange={(e) => setMinGap(Number(e.target.value) || 45)}
-              className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500" />
-          </div>
-          <div className="flex flex-col gap-px w-12">
-            <label className="text-[10px] text-slate-500 uppercase tracking-wide">Clip</label>
-            <input type="number" value={clipDuration} min={10} max={120} step={5}
-              onChange={(e) => setClipDuration(Number(e.target.value) || 30)}
-              className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500" />
-          </div>
-          <div className="flex flex-col gap-px w-12">
-            <label className="text-[10px] text-slate-500 uppercase tracking-wide">Offset</label>
-            <input type="number" value={clipOffset} min={0} max={60} step={5}
-              onChange={(e) => setClipOffset(Number(e.target.value) || 10)}
-              className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500" />
-          </div>
-          <div className="flex flex-col gap-px w-14">
-            <label className="text-[10px] text-slate-500 uppercase tracking-wide">KW Wt</label>
-            <input type="number" value={keywordWeight} min={0.5} max={5.0} step={0.5}
-              onChange={(e) => setKeywordWeight(Number(e.target.value) || 2.0)}
-              className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500" />
-          </div>
-          <div className="flex flex-col gap-px w-32">
-            <label className="text-[10px] text-slate-500 uppercase tracking-wide">Keywords</label>
-            <input value={keywordsText} onChange={(e) => setKeywordsText(e.target.value)}
-              placeholder="comma,separated"
-              className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500" />
-          </div>
-        </div>
-
         <div className="flex gap-1.5 ml-auto">
           {isAnalyzing ? (
             <button onClick={handleCancel}
@@ -368,12 +528,27 @@ export default function StudioClient() {
             </button>
           ) : (
             <button onClick={handleAnalyze}
+              disabled={mode === "twitch" && !videoId}
               className="px-3 py-1.5 text-xs rounded bg-violet-600 text-white hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed">
-              分析開始
+              🔍 分析開始
             </button>
           )}
         </div>
       </header>
+
+      {/* Advanced Settings (collapsible) */}
+      <AdvancedSettings
+        isOpen={advancedOpen}
+        onToggle={() => setAdvancedOpen((v) => !v)}
+        windowSec={windowSec} setWindowSec={setWindowSec}
+        step={step} setStep={setStep}
+        topN={topN} setTopN={setTopN}
+        minGap={minGap} setMinGap={setMinGap}
+        clipDuration={clipDuration} setClipDuration={setClipDuration}
+        clipOffset={clipOffset} setClipOffset={setClipOffset}
+        keywordWeight={keywordWeight} setKeywordWeight={setKeywordWeight}
+        keywordsText={keywordsText} setKeywordsText={setKeywordsText}
+      />
 
       {/* Progress bar */}
       {isAnalyzing && (
@@ -417,69 +592,84 @@ export default function StudioClient() {
       <div className="flex gap-3 px-5 pt-3 flex-1 min-h-0">
         <div className="flex-[3] flex flex-col gap-2.5 min-w-0">
           {mode === "twitch" && videoId ? (
-            <TwitchVodPlayer videoId={videoId} startTimeSeconds={playerStartTime} reloadKey={playerReloadKey} />
+            <TwitchVodPlayer
+              ref={twitchPlayerRef}
+              videoId={videoId}
+              startTimeSeconds={playerStartTime}
+              reloadKey={playerReloadKey}
+              onTimeUpdate={handleTimeUpdate}
+            />
           ) : mode === "local" && videoPath.trim() ? (
-            <LocalVideoPlayer videoPath={videoPath} startTimeSeconds={playerStartTime} />
+            <LocalVideoPlayer
+              ref={localPlayerRef}
+              videoPath={videoPath}
+              startTimeSeconds={playerStartTime}
+              onTimeUpdate={handleTimeUpdate}
+              onDurationChange={handleDurationChange}
+            />
           ) : (
             <div className="glass-panel rounded-lg p-3 flex items-center justify-center h-[200px]">
               <div className="text-xs text-slate-500">
-                {mode === "twitch" ? 'Enter a Twitch VOD URL above and click "Load VOD"' : "Enter a local video file path above"}
+                {mode === "twitch" ? 'Twitch VOD URL を入力して "Load" をクリック' : "ローカル動画ファイルのパスを入力"}
               </div>
             </div>
           )}
 
-          {/* Timeline Graph */}
+          {/* Timeline Graph (interactive) */}
           {timeline.length > 0 && (
-            <div className="glass-panel rounded-lg p-3">
-              <h3 className="text-xs text-slate-400 mb-2">タイムライン</h3>
-              <div className="flex items-end gap-px h-16">
-                {timeline.map((t, i) => {
-                  const height = (t.score / maxScore) * 100;
-                  const isSelected = selectedCandidate &&
-                    selectedCandidate.start !== undefined &&
-                    selectedCandidate.end !== undefined &&
-                    t.start >= selectedCandidate.start &&
-                    t.end <= selectedCandidate.end;
-                  return (
-                    <div
-                      key={i}
-                      className="flex-1 min-w-1 rounded-t cursor-pointer transition-colors hover:bg-cyan-400"
-                      style={{
-                        height: `${Math.max(2, height)}%`,
-                        backgroundColor: isSelected ? "#22d3ee" : `rgb(139, 92, 246, ${0.3 + (t.score / maxScore) * 0.7})`,
-                      }}
-                      title={`${Math.floor(t.start / 60)}:${String(Math.floor(t.start % 60)).padStart(2, '0')} - Score: ${t.score.toFixed(1)} | Chat: ${t.chat_count} | KW: ${t.keyword_hits}`}
-                      onClick={() => {
-                        const peakTime = (t.start + t.end) / 2;
-                        setPlayerStartTime(peakTime);
-                        setPlayerReloadKey((v) => v + 1);
-                      }}
-                    />
-                  );
-                })}
-              </div>
-              <div className="flex justify-between text-[9px] text-slate-600 mt-1">
-                <span>0:00</span>
-                <span>{timeline.length > 0 ? `${Math.floor(timeline[timeline.length - 1].end / 60)}:00` : '0:00'}</span>
-              </div>
-            </div>
+            <TimelineGraph
+              timeline={timeline}
+              candidates={candidates}
+              selectedCandidate={selectedCandidate}
+              currentTime={currentTime}
+              duration={videoDuration}
+              maxTime={maxTime}
+              onSeek={seekTo}
+            />
           )}
 
-          <CandidateDetails candidate={selectedCandidate} />
+          {/* Clip action panel for selected candidate */}
+          {selectedCandidate && (
+            <ClipActionPanel
+              candidate={selectedCandidate}
+              hasLocalVideo={hasLocalVideo}
+              localVideoPath={videoPath || null}
+              currentTime={liveCurrentTime}
+              isPlayerAvailable={mode === "local" || (mode === "twitch" && !!videoId)}
+              singleExportStatus={exportStatus}
+              batchExportStatus={batchExportStatus}
+              onJumpStart={handleJumpStart}
+              onJumpPeak={handleJumpPeak}
+              onJumpEnd={handleJumpEnd}
+              onPreviewRange={handlePreviewRange}
+              onSetStartFromCurrent={handleSetStartFromCurrent}
+              onSetEndFromCurrent={handleSetEndFromCurrent}
+              onExportThisClip={() => exportCandidate(selectedCandidate)}
+              onExportTop5={exportTop5}
+              onSelectLocalVideo={handleSelectLocalVideo}
+            />
+          )}
 
-          {candidates.length > 0 && mode === "twitch" && (
-            <div className="glass-panel rounded-lg p-2 text-[11px] text-slate-500">
-              mp4 書き出しにはローカル動画ファイルが必要です。Twitch VOD プレイヤーはプレビュー専用です。
+          {/* Detailed reasons (collapsible / on-demand) */}
+          {selectedCandidate && (
+            <CandidateDetails candidate={selectedCandidate} />
+          )}
+
+          {/* Export state hint for Twitch mode */}
+          {mode === "twitch" && candidates.length > 0 && (
+            <div className="glass-panel rounded-lg p-2 text-[11px] text-amber-400/80 flex items-center gap-2">
+              <span>ℹ</span>
+              <span>MP4 書き出しにはローカル動画ファイルが必要です。上の「ローカル動画を指定 →」から切り替えるか、Local File モードで再実行してください。</span>
             </div>
           )}
         </div>
 
-        <div className="flex-[2] flex flex-col min-w-[280px] max-w-[400px]">
-          {/* Diagnostic Panel */}
+        <div className="flex-[2] flex flex-col min-w-[280px] max-w-[400px] gap-2">
+          {/* Diagnostic panel */}
           {diagnostic && (
-            <div className="glass-panel rounded-lg p-3 mb-2">
-              <h3 className="text-xs text-slate-400 mb-2">分析診断</h3>
-              <div className="grid grid-cols-2 gap-1 text-[10px] text-slate-500">
+            <details className="glass-panel rounded-lg p-2.5 text-[10px] text-slate-500" open>
+              <summary className="text-slate-400 cursor-pointer font-semibold text-[11px] uppercase tracking-wider mb-1">分析診断</summary>
+              <div className="grid grid-cols-2 gap-1 mt-1">
                 <div>取得チャット: <span className="text-slate-300">{diagnostic.fetched_chat_count.toLocaleString()}</span></div>
                 <div>タイムライン: <span className="text-slate-300">{diagnostic.timeline_count}</span></div>
                 <div>生候補数: <span className="text-slate-300">{diagnostic.raw_candidate_count}</span></div>
@@ -489,13 +679,18 @@ export default function StudioClient() {
                 <div>最終候補: <span className="text-slate-300 font-medium text-violet-300">{diagnostic.final_candidate_count}</span></div>
                 <div>ウィンドウ: <span className="text-slate-300">{diagnostic.window}s</span></div>
               </div>
-            </div>
+            </details>
           )}
 
           <CandidateList
             candidates={candidates}
             selectedCandidateId={selectedCandidate?.id ?? selectedCandidate?.rank ?? null}
+            exportedCandidateIds={exportedIds}
+            exportingCandidateId={exportingId}
+            canExport={canExport}
             onSelectCandidate={handleSelectCandidate}
+            onEditCandidate={handleEditCandidate}
+            onExportCandidate={exportCandidate}
           />
         </div>
       </div>
