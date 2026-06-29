@@ -2,6 +2,7 @@ import { execFile, spawn } from "node:child_process";
 import { mkdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { createLimiter } from "@/lib/concurrency";
 import { getMediaPaths, probeVideo } from "@/lib/server/media-service";
 
 const execFileAsync = promisify(execFile);
@@ -107,8 +108,12 @@ export async function downloadVideoWithYtDlp(input: YtDlpDownloadInput): Promise
     "--no-playlist",
     "--restrict-filenames",
     "--no-mtime",
-    "-N", "4",
-    "--buffer-size", "32K",
+    "-N", "10",
+    "--buffer-size", "256K",
+    "--concurrent-fragments", "10",
+    "--extractor-retries", "3",
+    "--fragment-retries", "5",
+    "--retry-sleep", "3",
     "--merge-output-format",
     "mp4",
     "-f",
@@ -291,7 +296,7 @@ async function spawnYtDlpWithProgress(args: string[], onProgress: (p: YtDlpProgr
       if (code === 0) {
         resolve(stdout);
       } else {
-        const tail = (stderrBuffer || "").trim().slice(-1000);
+        const tail = (stderr || "").trim().slice(-2000);
         reject(new Error(`yt-dlp exited with code ${code}${tail ? `: ${tail}` : ""}`));
       }
     });
@@ -439,8 +444,12 @@ export async function downloadSectionWithYtDlp(input: YtDlpSectionInput): Promis
     "--no-playlist",
     "--restrict-filenames",
     "--no-mtime",
-    "-N", "4",
-    "--buffer-size", "32K",
+    "-N", "10",
+    "--buffer-size", "256K",
+    "--concurrent-fragments", "10",
+    "--extractor-retries", "3",
+    "--fragment-retries", "5",
+    "--retry-sleep", "3",
     "--merge-output-format", "mp4",
     "-f", "bv*[height<=1080]+ba/best",
     "-o", outputTemplate,
@@ -457,4 +466,25 @@ export async function downloadSectionWithYtDlp(input: YtDlpSectionInput): Promis
   const relativePath = toMediaRelativePath(absolutePath, paths.mediaRoot);
 
   return { inputPath: relativePath, candidateId: input.candidateId };
+}
+
+/**
+ * Download multiple sections from a VOD in parallel using separate yt-dlp
+ * processes. Each section is downloaded independently with its own
+ * `--download-sections` flag and candidateId-tagged output template.
+ *
+ * The concurrency is capped at `concurrency` (default 4) to avoid
+ * overwhelming the CDN while still parallelising across candidates.
+ */
+export async function downloadSectionsParallel(
+  sections: YtDlpSectionInput[],
+  concurrency = 4,
+  signal?: AbortSignal
+): Promise<YtDlpSectionResult[]> {
+  const limiter = createLimiter(concurrency);
+  return Promise.all(
+    sections.map((s) =>
+      limiter(() => downloadSectionWithYtDlp({ ...s, signal }))
+    )
+  );
 }

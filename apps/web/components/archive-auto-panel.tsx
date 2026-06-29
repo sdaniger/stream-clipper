@@ -196,6 +196,7 @@ export function ArchiveAutoPanel({ onImport }: ArchiveAutoPanelProps) {
           transcribe,
           generatePackages,
           burnComments,
+          pipelineMode: "sections",
           timeStartSeconds: useTimeRange ? parseTimeToSeconds(timeRangeStart) : undefined,
           timeEndSeconds: useTimeRange ? parseTimeToSeconds(timeRangeEnd) : undefined,
           clipLength,

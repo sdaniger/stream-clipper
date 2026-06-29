@@ -425,11 +425,11 @@ export default function Home() {
                   const doneCount = Object.values(stageStatus).filter((s) => s === "done").length;
                   setProgress(Math.round((doneCount / STAGE_ORDER.length) * 100));
 
-                  setStages(STAGE_ORDER.map((id) => ({
+                  setStages((prev) => STAGE_ORDER.map((id) => ({
                     id,
                     label: t(STAGE_KEYS[id] ?? id),
                     status: stageStatus[id] ?? "pending",
-                    detail: evt.stage === id ? evt.message : undefined
+                    detail: evt.stage === id ? evt.message : prev.find((s) => s.id === id)?.detail
                   })));
 
                   if (evt.stage === "download" && evt.status === "running" && evt.message) {

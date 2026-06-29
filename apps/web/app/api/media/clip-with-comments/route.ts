@@ -1,5 +1,7 @@
+import path from "node:path";
+import { readFile } from "node:fs/promises";
 import { NextResponse } from "next/server";
-import { burnCommentsIntoClip, probeVideo } from "@/lib/server/media-service";
+import { burnCommentsIntoClip, getMediaRoot, probeVideo } from "@/lib/server/media-service";
 import { downloadSectionWithYtDlp } from "@/lib/server/yt-dlp-service";
 import { fetchChatWithChatDownloader } from "@/lib/server/chat-downloader-service";
 import {
@@ -53,17 +55,36 @@ export async function POST(request: Request) {
       signal: request.signal,
     });
 
-    // 2. Fetch chat for the VOD
+    // 2. Try loading comments from VOD-level cache before fetching
     let chatMessages: ChatLogEntry[] = [];
+    const videoIdMatch = url.match(/\/videos?\/(\d+)/);
+    const videoId = videoIdMatch?.[1] ?? url.replace(/[^a-zA-Z0-9]+/g, "_").slice(0, 60);
+    const cacheFilePath = path.join(getMediaRoot(), "cache", "comments", `${videoId}.rechat.json`);
+
     try {
-      const chatResult = await fetchChatWithChatDownloader({
-        url,
-        maxMessages: 50_000,
-        signal: request.signal,
-      });
-      chatMessages = chatResult.normalizedMessages;
+      const cacheContent = await readFile(cacheFilePath, "utf8");
+      chatMessages = JSON.parse(cacheContent);
     } catch {
-      // Chat fetch failed — continue without comments
+      // Cache miss — fetch from Twitch
+      try {
+        const chatResult = await fetchChatWithChatDownloader({
+          url,
+          maxMessages: 50_000,
+          signal: request.signal,
+        });
+        chatMessages = chatResult.normalizedMessages;
+        // Save to cache for future use
+        try {
+          const { mkdir: mkdirFs, writeFile: writeFileFs } = await import("node:fs/promises");
+          const cacheDir = path.join(getMediaRoot(), "cache", "comments");
+          await mkdirFs(cacheDir, { recursive: true });
+          await writeFileFs(cacheFilePath, JSON.stringify(chatMessages, null, 2) + "\n", "utf8");
+        } catch {
+          // Cache write is non-fatal
+        }
+      } catch {
+        // Chat fetch failed — continue without comments
+      }
     }
 
     // 3. Filter chat to the time range and normalize to 0-based

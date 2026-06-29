@@ -391,13 +391,10 @@ export async function runArchiveAutoAnalysis(
   // downloading a multi-hour VOD when only a few minutes are needed.
   let sectionDownloads: Map<string, string> | null = null;
   if (needsSectionDownload && sourceCandidates.length > 0) {
-    // Sections parallel download is currently disabled — the full VOD is
-    // downloaded once in Phase 1 and FFmpeg extracts per-candidate
-    // sections locally. The code path below is kept as a reference but
-    // is unreachable until the parallel download helper is implemented.
     emitProgress({ stage: "download", status: "running", message: `Downloading ${sourceCandidates.length} sections in parallel...` });
     try {
-      const sectionInputs: YtDlpSectionInput[] = sourceCandidates.map((c) => {
+      const sectionTotal = sourceCandidates.length;
+      const sectionInputs: YtDlpSectionInput[] = sourceCandidates.map((c, idx) => {
         const v = c.variants.find((v) => v.id === c.selectedVariantId) ?? c.variants[0];
         const startSec = parseTimecode(v.start, "section start");
         const durationSec = parseTimecode(v.duration, "section duration");
@@ -407,8 +404,20 @@ export async function runArchiveAutoAnalysis(
           startSeconds: startSec,
           endSeconds: startSec + durationSec,
           signal: input.signal,
+          onProgress: (p) => {
+            emitProgress({ stage: "download", status: "running", message: `Section ${idx + 1}/${sectionTotal} (${c.id}) — ${p.percent.toFixed(1)}% at ${p.speed}, ETA ${p.eta}` });
+          },
         };
       });
+
+      // Emit a "starting" event for each section so the UI shows activity
+      // even when the download completes before the first progress tick.
+      for (let i = 0; i < sectionInputs.length; i++) {
+        const s = sectionInputs[i];
+        const v = sourceCandidates[i].variants.find((v) => v.id === sourceCandidates[i].selectedVariantId) ?? sourceCandidates[i].variants[0];
+        emitProgress({ stage: "download", status: "running", message: `Section ${i + 1}/${sectionTotal} (${s.candidateId}) — starting (${v.start} + ${v.duration})` });
+      }
+
       const sectionResults = await downloadSectionsParallel(sectionInputs, 4, input.signal);
       sectionDownloads = new Map(sectionResults.map((r) => [r.candidateId, r.inputPath]));
       emitProgress({ stage: "download", status: "done", message: `Downloaded ${sectionResults.length} sections` });

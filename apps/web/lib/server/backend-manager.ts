@@ -41,9 +41,8 @@ export async function checkBackendHealth(): Promise<BackendHealth> {
 }
 
 function findApiRoot(): string {
-  const candidate = path.resolve(process.cwd(), "..", "api");
-  if (candidate) return candidate;
-  return path.resolve(process.cwd(), "apps", "api");
+  const candidate = path.resolve(process.cwd(), "apps", "api");
+  return candidate;
 }
 
 export async function spawnBackend(): Promise<boolean> {
@@ -74,7 +73,7 @@ export async function spawnBackend(): Promise<boolean> {
         }
       } catch { /* .env not found, use process.env */ }
 
-      spawn(venvPython, [
+      const child = spawn(venvPython, [
         "app.main:app",
         "--host", "0.0.0.0",
         "--port", "8000",
@@ -85,8 +84,11 @@ export async function spawnBackend(): Promise<boolean> {
         detached: false,
       });
 
-      // wait up to 10s for backend to become healthy
-      for (let i = 0; i < 20; i++) {
+      // Prevent uncaught ENOENT errors from crashing the process.
+      child.on("error", () => {});
+
+      // wait up to 3s for backend to become healthy
+      for (let i = 0; i < 6; i++) {
         await new Promise((r) => setTimeout(r, 500));
         const health = await checkBackendHealth();
         if (health.alive) return true;
