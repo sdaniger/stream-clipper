@@ -1,6 +1,7 @@
 "use client";
 import React, { useState, useCallback, useRef, useEffect, useMemo } from "react";
-import { extractVideoId, getCandidateSeekTime, type HighlightCandidate } from "@/lib/twitch-time";
+import { extractVideoId, type HighlightCandidate } from "@/lib/twitch-time";
+import { getMediaRoot, getMediaPaths } from "@/lib/server/media-service";
 import type { TimelineRow } from "@/lib/studio-api";
 import {
   createStudioClip,
@@ -14,338 +15,175 @@ import {
   type DanmakuExportSource,
 } from "@/lib/studio-api";
 import { useI18n } from "@/lib/i18n";
-import TwitchVodPlayer, { type TwitchVodPlayerHandle } from "@/components/studio/TwitchVodPlayer";
-import LocalVideoPlayer, { type LocalVideoPlayerHandle } from "@/components/studio/LocalVideoPlayer";
-import CandidateList from "@/components/studio/CandidateList";
-import CandidateDetails from "@/components/studio/CandidateDetails";
-import LogPanel from "@/components/studio/LogPanel";
-import AdvancedSettings from "@/components/studio/AdvancedSettings";
-import ClipActionPanel from "@/components/studio/ClipActionPanel";
-import TimelineGraph from "@/components/studio/TimelineGraph";
-import ExportStatusPanel from "@/components/studio/ExportStatusPanel";
-import DanmakuPanel, { type FfmpegQuality } from "@/components/studio/DanmakuPanel";
+import StepContainer from "@/components/studio/StepContainer";
+import Step1VodInput from "@/components/studio/Step1VodInput";
+import Step2CandidateList from "@/components/studio/Step2CandidateList";
+import Step3ExportPanel, { type ExportStage } from "@/components/studio/Step3ExportPanel";
+import AdvancedSettings, { type ExportSource, type FfmpegQuality } from "@/components/studio/AdvancedSettings";
 import LanguageSwitcher from "@/components/studio/LanguageSwitcher";
 
-type StudioMode = "twitch" | "local";
-type ExportStatus = "idle" | "exporting" | "exported" | "error";
-type DanmakuExportKind = "with" | "without" | "ass" | null;
-type LogLevel = "user" | "info" | "warn" | "error";
-type LogEntry = { level: LogLevel; message: string };
-
-interface SseProgress {
-  type: "progress";
-  stage: string;
-  message: string;
-  progress: number;
-}
-
-interface SseResult {
-  type: "result";
-  video_id: string | null;
-  title: string | null;
-  duration_seconds: number | null;
-  message_count: number;
-  candidates: HighlightCandidate[];
-  timeline: TimelineRow[];
-  summary: Record<string, unknown> | null;
-  error?: string;
-  video_exists?: boolean;
-  normalized_chat?: DanmakuChatMessage[];
-  diagnostic?: {
-    fetched_chat_count: number;
-    normalized_chat_count: number;
-    timeline_count: number;
-    raw_candidate_count: number;
-    candidates_after_threshold: number;
-    candidates_after_min_gap: number;
-    final_candidate_count: number;
-    top_n: number;
-    window: number;
-    step: number;
-    threshold: number;
-    min_gap: number;
-  };
-}
-
-interface SseError {
-  type: "error";
-  error: string;
-}
-
-type SseEvent = SseProgress | SseResult | SseError;
-
-function getStart(c: HighlightCandidate): number {
-  return c.clip_start ?? c.start ?? c.peak_time ?? 0;
-}
-function getEnd(c: HighlightCandidate): number {
-  return c.end ?? (c.clip_start != null && c.clip_duration != null ? c.clip_start + c.clip_duration : getStart(c) + 30);
-}
-function getPeak(c: HighlightCandidate): number {
-  return c.peak_time ?? (getStart(c) + getEnd(c)) / 2;
-}
-function formatTimecode(seconds: number): string {
-  const total = Math.max(0, Math.floor(seconds));
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  if (h > 0) {
-    return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
-  }
-  return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
-}
-
-// Map SSE stage to user-friendly i18n messages
-function userFriendlyProgressMessage(stage: string, t: (k: string) => string): string | null {
-  if (stage === "metadata") return null; // too technical
-  if (stage === "metadata_done") return t("studio.logFriendlyMetadata");
-  if (stage === "chat_fetch") return t("studio.logFriendlyChatFetch");
-  if (stage === "chat_done") return t("studio.logFriendlyChatDone");
-  if (stage === "normalize") return t("studio.logFriendlyNormalize");
-  if (stage === "analyze") return t("studio.logFriendlyAnalyzing");
-  if (stage === "analyze_done") return t("studio.logFriendlyAnalyzeDone");
-  if (stage === "timeline") return null;
-  if (stage === "done") return t("studio.logFriendlyDone");
-  if (stage === "error") return null;
-  return null;
-}
+const QUALITY_TO_FFMPEG: Record<FfmpegQuality, { preset: string; crf: number }> = {
+  high_speed: { preset: "ultrafast", crf: 26 },
+  standard: { preset: "veryfast", crf: 23 },
+  high_quality: { preset: "medium", crf: 20 },
+};
 
 export default function StudioClient() {
   const { t, locale } = useI18n();
-  const [mode, setMode] = useState<StudioMode>("twitch");
+  // Workflow step (1/2/3) — auto-derive from state
+  const [mode, setMode] = useState<"twitch" | "local">("twitch");
 
+  // Step 1: VOD input
   const [vodUrl, setVodUrl] = useState("");
+  const [videoId, setVideoId] = useState<string | null>(null);
   const [videoPath, setVideoPath] = useState("");
   const [logPath, setLogPath] = useState("");
-
-  // Advanced analysis params
-  const [windowSec, setWindowSec] = useState(30);
-  const [topN, setTopN] = useState(10);
-  const [minGap, setMinGap] = useState(45);
-  const [keywordsText, setKeywordsText] = useState("");
-  const [step, setStep] = useState(10);
-  const [clipDuration, setClipDuration] = useState(30);
-  const [clipOffset, setClipOffset] = useState(10);
-  const [keywordWeight, setKeywordWeight] = useState(2.0);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
-
-  const [videoId, setVideoId] = useState<string | null>(null);
   const [vodTitle, setVodTitle] = useState<string | null>(null);
+  const [chatLoaded, setChatLoaded] = useState(false);
+  const [messageCount, setMessageCount] = useState(0);
+
+  // Step 2: Candidates
   const [candidates, setCandidates] = useState<HighlightCandidate[]>([]);
   const [timeline, setTimeline] = useState<TimelineRow[]>([]);
   const [selectedCandidate, setSelectedCandidate] = useState<HighlightCandidate | null>(null);
-  const [playerStartTime, setPlayerStartTime] = useState(0);
-  const [playerReloadKey, setPlayerReloadKey] = useState(0);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [videoDuration, setVideoDuration] = useState(0);
+  const [selectedCandidateId, setSelectedCandidateId] = useState<string | number | null>(null);
+
+  // Detection params
+  const [windowSec, setWindowSec] = useState(30);
+  const [step, setStep] = useState(10);
+  const [topN, setTopN] = useState(10);
+  const [minGap, setMinGap] = useState(45);
+  const [keywordWeight, setKeywordWeight] = useState(2.0);
+  const [keywordsText, setKeywordsText] = useState("");
+
+  // Analyze state
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [progressLabel, setProgressLabel] = useState("");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [diagnostic, setDiagnostic] = useState<SseResult["diagnostic"] | null>(null);
-  const [abortController, setAbortController] = useState<AbortController | null>(null);
+  const [analyzeAbortController, setAnalyzeAbortController] = useState<AbortController | null>(null);
 
-  // Export state
+  // Step 3: Export
+  const [exportSource, setExportSource] = useState<ExportSource>("twitch_vod");
   const [exportedIds, setExportedIds] = useState<Set<string | number>>(new Set());
+  const [danmakuExportedIds, setDanmakuExportedIds] = useState<Set<string | number>>(new Set());
   const [exportingId, setExportingId] = useState<string | number | null>(null);
-  const [exportStatus, setExportStatus] = useState<ExportStatus>("idle");
-  const [batchExportStatus, setBatchExportStatus] = useState<ExportStatus>("idle");
-
-  // Danmaku export state
-  const [normalizedChat, setNormalizedChat] = useState<DanmakuChatMessage[]>([]);
-  const [danmakuExporting, setDanmakuExporting] = useState<DanmakuExportKind>(null);
+  const [isExportingTop5, setIsExportingTop5] = useState(false);
+  const [exportStage, setExportStage] = useState<ExportStage | null>(null);
   const [danmakuAbortController, setDanmakuAbortController] = useState<AbortController | null>(null);
   const [danmakuLastResult, setDanmakuLastResult] = useState<DanmakuExportResponse | null>(null);
-  // Danmaku form state (all-comments mode by default — no per-stream cap)
+
+  // Danmaku options (defaults: standard quality, all comments, no cap)
   const [danmakuDensity, setDanmakuDensity] = useState<DanmakuDensity>("medium");
   const [danmakuFontSize, setDanmakuFontSize] = useState(32);
   const [danmakuCommentDuration, setDanmakuCommentDuration] = useState(4.0);
   const [danmakuOpacity, setDanmakuOpacity] = useState(0.9);
   const [danmakuNgWords, setDanmakuNgWords] = useState("");
-  const [danmakuMinMessageLength, setDanmakuMinMessageLength] = useState(1);
-  const [danmakuDeduplicate, setDanmakuDeduplicate] = useState(true);
-  // Quality preset for FFmpeg encoding
-  const [danmakuQuality, setDanmakuQuality] = useState<"high_speed" | "standard" | "high_quality">("standard");
-  // Danmaku export track (which candidates have been danmaku-exported)
-  const [danmakuExportedIds, setDanmakuExportedIds] = useState<Set<string | number>>(new Set());
-  // Danmaku export source selection
-  const [exportSource, setExportSource] = useState<DanmakuExportSource>(
-    typeof window === "undefined" ? "twitch_vod" : (localStorage.getItem("danmaku-source") as DanmakuExportSource) || "twitch_vod",
-  );
+  const [danmakuMinMessageLength, setMinMessageLength] = useState(1);
+  const [danmakuDeduplicate, setDeduplicateConsecutive] = useState(true);
+  const [danmakuQuality, setDanmakuQuality] = useState<FfmpegQuality>("standard");
+  const [safetyCommentLimit, setSafetyCommentLimit] = useState<number | null>(null);
+  const [outputDir, setOutputDir] = useState<string>(() => {
+    if (typeof window === "undefined") return "output/danmaku-clips";
+    try {
+      const stored = window.localStorage.getItem("danmaku-output-dir");
+      if (stored) return stored;
+    } catch {}
+    return "output/danmaku-clips";
+  });
 
+  // Save outputDir to localStorage when it changes
   useEffect(() => {
     try {
-      localStorage.setItem("danmaku-source", exportSource);
+      window.localStorage.setItem("danmaku-output-dir", outputDir);
     } catch {}
-  }, [exportSource]);
-
-  // Default to twitch_vod when we have a VOD URL and no local file.
-  // Default to local_file when we have a local file but no VOD URL.
-  // Default to ass_only when neither is available.
-  useEffect(() => {
-    if (mode === "twitch" && videoId && exportSource === "local_file") {
-      setExportSource("twitch_vod");
-    }
-    if (mode === "local" && videoPath.trim() && exportSource === "twitch_vod" && !videoId) {
-      setExportSource("local_file");
-    }
-  }, [mode, videoId, videoPath, exportSource]);
+  }, [outputDir]);
 
   // Player refs
-  const localPlayerRef = useRef<LocalVideoPlayerHandle>(null);
-  const twitchPlayerRef = useRef<TwitchVodPlayerHandle>(null);
+  const localPlayerRef = useRef<{ getCurrentTime: () => number } | null>(null);
+  const twitchPlayerRef = useRef<{ getCurrentTime: () => number; seekTo: (t: number) => boolean } | null>(null);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [playerStartTime, setPlayerStartTime] = useState(0);
+  const [playerReloadKey, setPlayerReloadKey] = useState(0);
+  const [videoDuration, setVideoDuration] = useState(0);
 
-  const addLog = useCallback((level: LogLevel, message: string) => {
-    setLogs((prev) => [...prev.slice(-149), { level, message }]);
+  // Player time tracking
+  const handleTimeUpdate = useCallback((time: number) => {
+    setCurrentTime(time);
+  }, []);
+  const handleDurationChange = useCallback((duration: number) => {
+    if (Number.isFinite(duration) && duration > 0) setVideoDuration(duration);
   }, []);
 
-  const canExport = mode === "local" && !!videoPath.trim();
+  // Log
+  type LogLevel = "user" | "info" | "warn" | "error";
+  const [logs, setLogs] = useState<{ level: LogLevel; message: string }[]>([]);
+  const addLog = useCallback((level: LogLevel, message: string) => {
+    setLogs((prev) => [...prev.slice(-199), { level, message }]);
+  }, []);
 
-  // Compute maxTime for timeline graph
-  const maxTime = useMemo(() => {
-    if (timeline.length > 0) {
-      return Math.max(...timeline.map((t) => t.end));
-    }
-    if (candidates.length > 0) {
-      return Math.max(...candidates.map((c) => getEnd(c)));
-    }
-    return videoDuration || 0;
-  }, [timeline, candidates, videoDuration]);
+  // Chat in range for selected candidate
+  const [normalizedChat, setNormalizedChat] = useState<DanmakuChatMessage[]>([]);
+  const chatInRange = useMemo(() => {
+    if (!selectedCandidate) return [] as DanmakuChatMessage[];
+    const start = selectedCandidate.clip_start ?? selectedCandidate.start ?? 0;
+    const end = selectedCandidate.end ?? (selectedCandidate.clip_start != null && selectedCandidate.clip_duration != null
+      ? selectedCandidate.clip_start + selectedCandidate.clip_duration
+      : start + 30);
+    return normalizedChat.filter((m) => m.time_sec >= start && m.time_sec <= end);
+  }, [selectedCandidate, normalizedChat]);
 
-  // Seek helper - updates player state
-  const seekTo = useCallback((time: number) => {
-    const clamped = Math.max(0, time);
-    setPlayerStartTime(clamped);
-    setCurrentTime(clamped);
-    // Prefer postMessage-based seek (no reload). TwitchVodPlayer exposes
-    // seekTo() via useImperativeHandle; when it's available and postMessage
-    // mode is on, it sends { event: "video.seek", data: { time } } and the
-    // parent reloadKey stays the same. Fall back to a reload for older
-    // browsers and when postMessage is disabled.
-    if (mode === "twitch" && twitchPlayerRef.current?.seekTo) {
-      const ok = twitchPlayerRef.current.seekTo(clamped);
-      if (ok) return;
-    }
-    setPlayerReloadKey((v) => v + 1);
-  }, [mode]);
+  // Auto-derive workflow step
+  const currentStep: 1 | 2 | 3 = useMemo(() => {
+    if (candidates.length === 0) return 1;
+    if (!selectedCandidate) return 1;
+    return 3; // Once selected, jump to export
+  }, [candidates.length, selectedCandidate]);
 
-  const handleSelectCandidate = useCallback((candidate: HighlightCandidate) => {
-    const seekTime = getCandidateSeekTime(candidate);
-    if (seekTime === null) {
-      setErrorMessage(t("studio.errorInvalidUrl"));
-      addLog("error", t("studio.logCannotExtractTime"));
-      return;
+  const reachable: { 1: boolean; 2: boolean; 3: boolean } = useMemo(() => ({
+    1: true,
+    2: candidates.length > 0,
+    3: !!selectedCandidate,
+  }), [candidates.length, selectedCandidate]);
+
+  // Max score for CandidateCard scaling
+  const maxScore = useMemo(
+    () => candidates.reduce((m, c) => (typeof c.score === "number" && c.score > m ? c.score : m), 0),
+    [candidates],
+  );
+
+  // Default export source follows mode
+  useEffect(() => {
+    if (mode === "twitch" && videoId) {
+      setExportSource("twitch_vod");
+    } else if (mode === "local" && videoPath.trim()) {
+      setExportSource("local_file");
     }
-    setSelectedCandidate(candidate);
-    seekTo(seekTime);
+  }, [mode, videoId, videoPath]);
+
+  // ===== Step 1: VOD load =====
+  const handleLoadVod = useCallback(async () => {
+    if (!vodUrl.trim()) return;
     setErrorMessage(null);
-    addLog("user", t("studio.logSelectCandidate", { rank: candidate.rank, time: formatTimecode(seekTime) }));
-  }, [addLog, seekTo, t]);
-
-  const handleEditCandidate = useCallback((candidate: HighlightCandidate) => {
-    handleSelectCandidate(candidate);
-    addLog("user", t("studio.logEditCandidate", { rank: candidate.rank }));
-  }, [addLog, handleSelectCandidate, t]);
-
-  const handleLoadVod = useCallback(() => {
     const id = extractVideoId(vodUrl);
     if (!id) {
-      setErrorMessage(t("studio.errorInvalidUrl"));
+      setErrorMessage(t("studio.unsupportedVodUrl"));
       return;
     }
     setVideoId(id);
-    setVodTitle(null);
+    setVodTitle(id);
+    setChatLoaded(false);
     setCandidates([]);
     setTimeline([]);
     setSelectedCandidate(null);
+    setSelectedCandidateId(null);
     setExportedIds(new Set());
-    setExportStatus("idle");
-    setBatchExportStatus("idle");
-    seekTo(0);
-    setErrorMessage(null);
-    addLog("user", `VOD loaded: ${id}`);
-  }, [vodUrl, addLog, seekTo, t]);
+    setDanmakuExportedIds(new Set());
+    setMessageCount(0);
+    addLog("user", t("studio.logVodRequired"));
+  }, [vodUrl, addLog, t]);
 
-  const handleCancel = useCallback(() => {
-    if (abortController) {
-      abortController.abort();
-      setAbortController(null);
-      setIsAnalyzing(false);
-      setProgress(0);
-      setProgressLabel("");
-      addLog("user", t("studio.logCancel"));
-    }
-  }, [abortController, addLog, t]);
-
-  const readStream = useCallback(async (res: Response) => {
-    const reader = res.body!.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-
-      for (const line of lines) {
-        if (!line.startsWith("data: ")) continue;
-        try {
-          const event: SseEvent = JSON.parse(line.slice(6));
-          if (event.type === "progress") {
-            setProgress(event.progress);
-            setProgressLabel(event.message);
-            // Only log user-friendly progress
-            const friendly = userFriendlyProgressMessage(event.stage, t);
-            if (friendly) addLog("info", friendly);
-          } else if (event.type === "result") {
-            setVodTitle(event.title);
-            setDiagnostic(event.diagnostic ?? null);
-            // Capture normalized chat for later danmaku export. The server
-            // sends the full chat array (already normalized) using the
-            // {timestamp_seconds, author_name, message} format.
-            const rawChat = (event as any).normalized_chat;
-            if (Array.isArray(rawChat)) {
-              const chatForDanmaku: DanmakuChatMessage[] = rawChat.map((m: any) => ({
-                timestamp: Number(m.timestamp_seconds ?? m.timestamp ?? 0),
-                time_sec: Number(m.timestamp_seconds ?? m.time_sec ?? 0),
-                message: typeof m.message === "string" ? m.message : "",
-                author: typeof m.author_name === "string" ? m.author_name : undefined,
-              }));
-              setNormalizedChat(chatForDanmaku);
-            } else {
-              setNormalizedChat([]);
-            }
-            if (event.error) {
-              addLog("error", `${t("studio.logFriendlyDone")}: ${event.error}`);
-              setCandidates([]);
-              setTimeline([]);
-              setErrorMessage(event.error);
-            } else {
-              if (event.candidates.length > 0) {
-                addLog("user", t("studio.logCandidatesDetected", { count: event.candidates.length }));
-                setCandidates(event.candidates);
-                setTimeline(event.timeline ?? []);
-                handleSelectCandidate(event.candidates[0]);
-              } else {
-                addLog("warn", t("studio.logNoCandidates"));
-                setCandidates([]);
-                setTimeline([]);
-              }
-            }
-          } else if (event.type === "error") {
-            setErrorMessage(event.error);
-            addLog("error", event.error);
-          }
-        } catch {
-          // skip malformed events
-        }
-      }
-    }
-  }, [addLog, handleSelectCandidate, t]);
-
+  // ===== Step 1: Auto-analyze =====
   const handleAnalyze = useCallback(async () => {
     if (mode === "twitch") {
       if (!videoId) { setErrorMessage(t("studio.loadVodFirst")); return; }
@@ -356,7 +194,7 @@ export default function StudioClient() {
     }
 
     const controller = new AbortController();
-    setAbortController(controller);
+    setAnalyzeAbortController(controller);
     setIsAnalyzing(true);
     setProgress(0);
     setProgressLabel("");
@@ -364,10 +202,10 @@ export default function StudioClient() {
     setCandidates([]);
     setTimeline([]);
     setSelectedCandidate(null);
+    setSelectedCandidateId(null);
     setExportedIds(new Set());
-    setExportStatus("idle");
-    setBatchExportStatus("idle");
-    setDiagnostic(null);
+    setDanmakuExportedIds(new Set());
+    setMessageCount(0);
     addLog("user", t("studio.logAnalyzeStart"));
 
     try {
@@ -379,8 +217,6 @@ export default function StudioClient() {
             window: windowSec,
             min_gap: minGap,
             step,
-            clip_duration: clipDuration,
-            clip_offset: clipOffset,
             keyword_weight: keywordWeight,
             keywords: keywordsText.trim() || undefined,
           }
@@ -391,8 +227,6 @@ export default function StudioClient() {
             window: windowSec,
             min_gap: minGap,
             step,
-            clip_duration: clipDuration,
-            clip_offset: clipOffset,
             keyword_weight: keywordWeight,
             keywords: keywordsText.trim() || undefined,
           };
@@ -409,365 +243,260 @@ export default function StudioClient() {
         throw new Error(err.error || `HTTP ${res.status}`);
       }
 
-      await readStream(res);
+      // Read SSE
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const event = JSON.parse(line.slice(6));
+            if (event.type === "progress") {
+              setProgress(event.progress);
+              setProgressLabel(event.message);
+            } else if (event.type === "result") {
+              setVodTitle(event.title ?? event.video_id);
+              if (event.normalized_chat) {
+                setNormalizedChat(
+                  event.normalized_chat.map((m: any) => ({
+                    timestamp: Number(m.timestamp_seconds ?? m.timestamp ?? 0),
+                    time_sec: Number(m.timestamp_seconds ?? m.time_sec ?? 0),
+                    message: String(m.message ?? ""),
+                    author: m.author_name,
+                  })),
+                );
+                setMessageCount(event.normalized_chat.length);
+                setChatLoaded(true);
+              } else {
+                setChatLoaded(true);
+              }
+              if (event.candidates?.length > 0) {
+                setCandidates(event.candidates);
+                setTimeline(event.timeline ?? []);
+                setMessageCount(event.message_count ?? event.normalized_chat?.length ?? 0);
+                addLog("user", t("studio.logCandidatesDetected", { count: event.candidates.length }));
+                // Auto-select top candidate
+                const top = event.candidates[0];
+                setSelectedCandidate(top);
+                setSelectedCandidateId(top.id ?? top.rank);
+              } else {
+                addLog("warn", t("studio.logNoCandidates"));
+              }
+            }
+          } catch {
+            // skip malformed
+          }
+        }
+      }
     } catch (e) {
       if (e instanceof DOMException && e.name === "AbortError") {
-        addLog("user", t("studio.logCancel"));
+        addLog("user", t("studio.btnCancel"));
       } else {
-        const msg = e instanceof Error ? e.message : String(e);
+        const msg = e instanceof Error ? e.message : "Unknown error";
         setErrorMessage(msg);
         addLog("error", msg);
       }
     } finally {
       setIsAnalyzing(false);
-      setProgress(0);
-      setProgressLabel("");
-      setAbortController(null);
+      setAnalyzeAbortController(null);
     }
-  }, [mode, videoId, vodUrl, videoPath, logPath, topN, windowSec, minGap, keywordsText, step, clipDuration, clipOffset, keywordWeight, readStream, addLog, t]);
+  }, [mode, videoId, vodUrl, videoPath, logPath, topN, windowSec, minGap, step, keywordWeight, keywordsText, addLog, t]);
 
-  // ─── Export functions ─────────────────────────────────────────────────────
+  // ===== Step 2: Candidate selection =====
+  const handleSelectCandidate = useCallback((candidate: HighlightCandidate) => {
+    setSelectedCandidate(candidate);
+    setSelectedCandidateId(candidate.id ?? candidate.rank);
+    addLog("user", t("studio.logSelectCandidate", { rank: candidate.rank, time: "" }));
+  }, [addLog, t]);
 
-  const exportCandidate = useCallback(async (candidate: HighlightCandidate) => {
-    if (!canExport) {
-      setErrorMessage(t("studio.errorNoLocalFile"));
-      return;
-    }
-    const id = candidate.id ?? candidate.rank;
-    setExportingId(id);
-    setExportStatus("exporting");
-    addLog("user", `${t("studio.logExportUser", { rank: candidate.rank, start: "MP4", end: "" })}`);
+  // ===== Step 3: Export =====
+  const qualityToFfmpeg = (q: FfmpegQuality) => QUALITY_TO_FFMPEG[q];
 
-    try {
-      const start = getStart(candidate);
-      const duration = (getEnd(candidate) - getStart(candidate)) || candidate.clip_duration || 30;
-      const result = await createStudioClip({
-        inputPath: videoPath,
-        candidateId: `rank-${candidate.rank}`,
-        variantId: "default",
-        start: formatTimecode(start),
-        duration: formatTimecode(duration),
-        mode: "reencode",
-      });
-      const fileName = result.outputPath.split("/").pop();
-      addLog("user", `候補 #${candidate.rank} の書き出しが完了しました（${fileName}）`);
-      setExportedIds((prev) => new Set(prev).add(id));
-      setExportStatus("exported");
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "書き出しに失敗しました";
-      setErrorMessage(msg);
-      addLog("error", `書き出し失敗: ${msg}`);
-      setExportStatus("error");
-    } finally {
-      setExportingId(null);
-    }
-  }, [canExport, videoPath, addLog, t]);
+  const buildDanmakuOptions = (): DanmakuExportOptions => {
+    const q = qualityToFfmpeg(danmakuQuality);
+    return {
+      density: danmakuDensity,
+      font_size: danmakuFontSize,
+      comment_duration: danmakuCommentDuration,
+      opacity: danmakuOpacity,
+      ng_words: danmakuNgWords.split(",").map((s) => s.trim()).filter(Boolean),
+      min_message_length: danmakuMinMessageLength,
+      deduplicate_consecutive: danmakuDeduplicate,
+      all_comments: true,
+      safety_comment_limit: safetyCommentLimit,
+      preset: q.preset as any,
+      crf: q.crf,
+      reuse_temp_clip: true,
+      reuse_ass: false,
+      output_dir: outputDir,
+    };
+  };
 
-  const exportTop5 = useCallback(async () => {
-    if (!canExport) {
-      setErrorMessage(t("studio.errorNoLocalFile"));
-      return;
-    }
-    if (candidates.length === 0) return;
-
-    setBatchExportStatus("exporting");
-    const top5Count = Math.min(5, candidates.length);
-    addLog("user", `上位${top5Count}件を一括書き出し中...`);
-
-    try {
-      const top5 = candidates.slice(0, 5);
-      const result = await batchCreateStudioClips(videoPath, top5, { mode: "reencode" });
-      const newExported = new Set<string | number>(exportedIds);
-      top5.forEach((c) => newExported.add(c.id ?? c.rank));
-      setExportedIds(newExported);
-      if (result.failed.length === 0) {
-        addLog("user", `${result.clips.length}件の書き出しが完了しました`);
-      } else {
-        addLog("warn", `書き出し完了: ${result.clips.length}件成功、${result.failed.length}件失敗`);
-        result.failed.forEach((f) => addLog("error", `  ${f.candidateId}: ${f.error}`));
-      }
-      setBatchExportStatus(result.failed.length === 0 ? "exported" : "error");
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "一括書き出しに失敗しました";
-      setErrorMessage(msg);
-      addLog("error", msg);
-      setBatchExportStatus("error");
-    }
-  }, [canExport, candidates, videoPath, exportedIds, addLog]);
-
-  // ─── Danmaku export functions ───────────────────────────────────────────
-
-  // Filter chat to the candidate's range
-  const getChatInRange = useCallback((c: HighlightCandidate): DanmakuChatMessage[] => {
-    if (normalizedChat.length === 0) return [];
-    const start = getStart(c);
-    const end = getEnd(c);
-    return normalizedChat.filter((m) => m.time_sec >= start && m.time_sec <= end);
-  }, [normalizedChat]);
-
-  // Compute chat in range for the currently selected candidate
-  const chatInRange = useMemo(() => {
-    if (!selectedCandidate) return [];
-    return getChatInRange(selectedCandidate);
-  }, [selectedCandidate, getChatInRange]);
-
-  const handleDanmakuExport = useCallback(async (
-    kind: "with" | "without" | "ass",
-    options: DanmakuExportOptions,
-  ) => {
+  const handleExportSingle = useCallback(async () => {
     if (!selectedCandidate) {
       addLog("error", t("studio.logCandidateRequired"));
       return;
     }
-    const hasVod = mode === "twitch" && !!videoId;
-    const hasLocal = mode === "local" && videoPath.trim().length > 0;
-    if (kind !== "ass") {
-      if (exportSource === "twitch_vod" && !hasVod) {
-        addLog("error", t("studio.logVodSourceRequired"));
-        setErrorMessage(t("studio.logVodSourceRequired"));
-        return;
-      }
-      if (exportSource === "local_file" && !hasLocal) {
-        addLog("error", t("studio.logLocalSourceRequired"));
-        setErrorMessage(t("studio.logLocalRequired"));
-        return;
-      }
-      if (exportSource !== "twitch_vod" && exportSource !== "local_file") {
-        addLog("error", t("studio.logMp4SourceRequired"));
-        return;
-      }
-    }
-    setDanmakuExporting(kind);
+    setExportStage("vod_fetch");
+    setIsExportingTop5(false);
+    setExportingId(selectedCandidate.id ?? selectedCandidate.rank);
     setDanmakuLastResult(null);
     setErrorMessage(null);
+
     const controller = new AbortController();
     setDanmakuAbortController(controller);
-    const start = getStart(selectedCandidate);
-    const end = getEnd(selectedCandidate);
-    addLog("user", `Export source: ${exportSource}`);
-    addLog("user", t("studio.logExportUserRange", { start: formatTimecode(start), end: formatTimecode(end) }));
-    addLog("user", t("studio.logRangeCount", { count: chatInRange.length }));
+
+    addLog("user", t("studio.logExportUser", { rank: selectedCandidate.rank, start: "", end: "" }));
+    const opts = buildDanmakuOptions();
+    opts.output_dir = outputDir;
 
     try {
-      if (kind === "with") {
-        if (exportSource === "twitch_vod") {
-          addLog("info", t("studio.logVodRangeFetch"));
-        }
-        addLog("info", t("studio.logAssGenerating"));
-        const result = await exportDanmakuClip({
-          source: exportSource as "twitch_vod" | "local_file",
-          video_path: exportSource === "local_file" ? videoPath : null,
-          vod_url: exportSource === "twitch_vod" ? vodUrl : null,
-          video_id: exportSource === "twitch_vod" ? videoId : null,
-          candidate: selectedCandidate,
-          chat: chatInRange,
-          edited_start: getStart(selectedCandidate),
-          edited_end: getEnd(selectedCandidate),
-          options: { ...options, with_danmaku: true, all_comments: true, safety_comment_limit: null },
-        }, controller.signal);
-        if (!result.ok) {
-          addLog("error", t("studio.logExportSourceFailed", { source: exportSource, message: result.message ?? "Unknown error" }));
-          setErrorMessage(result.message ?? t("studio.errorExportFailed", { message: "" }));
-          setDanmakuLastResult(result);
-          if (result.fallback) {
-            const f = result.fallback;
-            const opts = [];
-            if (f.local_file) opts.push(t("studio.logFallbackLocal"));
-            if (f.twitch_vod) opts.push(t("studio.logFallbackTwitch"));
-            if (f.ass_only) opts.push(t("studio.logFallbackAss"));
-            if (opts.length > 0) addLog("warn", `${t("studio.logFallback", { options: "" })} ${opts.join(" / ")}`);
-          }
-        } else {
-          if (result.temp_video_cache_hit) {
-            addLog("user", t("studio.logTempVideoCache", { path: result.temporary_video_file ?? "" }));
-          } else if (result.temporary_video_file) {
-            addLog("user", t("studio.logTempVideoNew", { path: result.temporary_video_file }));
-          }
-          if (result.ass_cache_hit) {
-            addLog("user", t("studio.logAssCache"));
-          }
-          addLog("user", t("studio.logDanmakuUsed", { count: result.burned_comment_count ?? result.comment_count ?? 0, total: chatInRange.length }));
-          addLog("user", t("studio.logAssGenerated", { path: result.ass_file ?? "" }));
-          addLog("info", t("studio.logFfmpegBurning"));
-          addLog("user", t("studio.logExportComplete", { path: result.output_file ?? "" }));
-          if (result.ffmpeg_preset && result.ffmpeg_crf) {
-            addLog("info", t("studio.logFfmpegPreset", { preset: result.ffmpeg_preset, crf: result.ffmpeg_crf }));
-          }
-          setDanmakuLastResult(result);
-          setDanmakuExportedIds((prev) => new Set(prev).add(selectedCandidate.id ?? selectedCandidate.rank));
-        }
-      } else if (kind === "without") {
-        if (exportSource === "twitch_vod") {
-          addLog("info", t("studio.logVodRangeFetch"));
-        }
-        addLog("info", t("studio.logWithoutDanmaku"));
-        const result = await exportDanmakuClip({
-          source: exportSource as "twitch_vod" | "local_file",
-          video_path: exportSource === "local_file" ? videoPath : null,
-          vod_url: exportSource === "twitch_vod" ? vodUrl : null,
-          video_id: exportSource === "twitch_vod" ? videoId : null,
-          candidate: selectedCandidate,
-          chat: [],
-          edited_start: getStart(selectedCandidate),
-          edited_end: getEnd(selectedCandidate),
-          options: { ...options, with_danmaku: false, all_comments: true, safety_comment_limit: null },
-        }, controller.signal);
-        if (!result.ok) {
-          addLog("error", t("studio.logExportNoFallback", { message: result.message ?? "Unknown error" }));
-          setErrorMessage(result.message ?? t("studio.errorExportFailed", { message: "" }));
-          setDanmakuLastResult(result);
-          if (result.fallback) {
-            const f = result.fallback;
-            const opts = [];
-            if (f.local_file) opts.push(t("studio.logFallbackLocal"));
-            if (f.twitch_vod) opts.push(t("studio.logFallbackTwitch"));
-            if (f.ass_only) opts.push(t("studio.logFallbackAss"));
-            if (opts.length > 0) addLog("warn", `${t("studio.logFallback", { options: "" })} ${opts.join(" / ")}`);
-          }
-        } else {
-          addLog("user", t("studio.logWithoutDanmakuDone", { path: result.output_file ?? "" }));
-          setDanmakuLastResult(result);
-        }
-      } else {
-        // ASS only
-        addLog("info", t("studio.logAssOnly"));
-        const result = await generateAssOnly({
-          chat: chatInRange,
-          clip_start: start,
-          clip_end: end,
-          output_path: `output/clip_${Date.now()}_${selectedCandidate.rank}.ass`,
-          options: { ...options, all_comments: true, safety_comment_limit: null },
-        }, controller.signal);
-        if (!result.ok) {
-          addLog("error", `${t("studio.errorExportFailed", { message: "ASS generation" })}: ${result.message ?? "Unknown error"}`);
-          setErrorMessage(result.message ?? "ASS generation failed");
-        } else {
-          addLog("user", t("studio.logAssOnlyDone", { path: result.ass_path, count: result.comment_count, total: chatInRange.length }));
-          setDanmakuLastResult({
-            ok: true,
-            source: "ass_only",
-            ass_file: result.ass_path,
-            range_comment_count: result.in_range_count,
-            burned_comment_count: result.comment_count,
-            comment_count: result.comment_count,
-            in_range_count: result.in_range_count,
-            skipped_ng: result.skipped_ng,
-            skipped_too_short: result.skipped_too_short,
-            skipped_duplicate: result.skipped_duplicate,
-            all_comments: true,
-          });
-        }
+      setExportStage("vod_fetch");
+      if (exportSource === "twitch_vod") {
+        addLog("info", t("studio.logVodRangeFetch"));
       }
+      setExportStage("comment_extract");
+      const result = await exportDanmakuClip({
+        source: exportSource as DanmakuExportSource,
+        video_path: exportSource === "local_file" ? videoPath : null,
+        vod_url: exportSource === "twitch_vod" ? vodUrl : null,
+        video_id: exportSource === "twitch_vod" ? videoId : null,
+        candidate: selectedCandidate,
+        chat: chatInRange,
+        edited_start: selectedCandidate.clip_start ?? selectedCandidate.start,
+        edited_end: selectedCandidate.end,
+        options: { ...opts, with_danmaku: true, all_comments: true, safety_comment_limit: safetyCommentLimit },
+      }, controller.signal);
+
+      if (!result.ok) {
+        addLog("error", result.message ?? "Export failed");
+        setErrorMessage(result.message ?? t("studio.errorExportFailed", { message: "" }));
+        setDanmakuLastResult(result);
+        return;
+      }
+
+      setExportStage("ass_generate");
+      setExportStage("mp4_burn");
+      setDanmakuLastResult(result);
+      setDanmakuExportedIds((prev) => new Set(prev).add(selectedCandidate.id ?? selectedCandidate.rank));
+      addLog("user", t("studio.logExportComplete", { path: result.output_file ?? "" }));
     } catch (e) {
-      // AbortError is expected when the user cancels; show a friendly log.
       if (e instanceof DOMException && e.name === "AbortError") {
-        addLog("user", t("studio.btnCancelExport"));
+        addLog("user", t("studio.btnCancel"));
       } else {
         const msg = e instanceof Error ? e.message : "Unknown error";
         addLog("error", msg);
         setErrorMessage(msg);
       }
     } finally {
-      setDanmakuExporting(null);
+      setExportingId(null);
       setDanmakuAbortController(null);
+      setExportStage("complete");
+      setTimeout(() => setExportStage(null), 1500);
     }
-  }, [selectedCandidate, canExport, videoPath, chatInRange, addLog, exportSource, mode, videoId, vodUrl, t]);
+  }, [selectedCandidate, exportSource, vodUrl, videoId, videoPath, chatInRange, outputDir, danmakuQuality, danmakuDensity, danmakuFontSize, danmakuCommentDuration, danmakuOpacity, danmakuNgWords, danmakuMinMessageLength, danmakuDeduplicate, safetyCommentLimit, addLog, t]);
 
-  const handleDanmakuCancel = useCallback(() => {
+  const handleExportTop5 = useCallback(async () => {
+    if (candidates.length === 0) return;
+    setExportStage("vod_fetch");
+    setIsExportingTop5(true);
+    setExportingId(null);
+    setDanmakuLastResult(null);
+    setErrorMessage(null);
+
+    const controller = new AbortController();
+    setDanmakuAbortController(controller);
+
+    addLog("user", `${t("studio.btnExportTop5")} (${Math.min(5, candidates.length)})`);
+    const top5 = candidates.slice(0, 5);
+    const opts = buildDanmakuOptions();
+    opts.output_dir = outputDir;
+
+    try {
+      // Use Twitch VOD source by default for top 5
+      const effectiveSource: ExportSource = exportSource === "ass_only" ? "twitch_vod" : exportSource;
+      setExportStage("vod_fetch");
+      setExportStage("comment_extract");
+      setExportStage("ass_generate");
+      setExportStage("mp4_burn");
+      // For top 5, we call batchCreateStudioClips for non-danmaku, but
+      // for danmaku we need a loop with per-candidate export
+      let successCount = 0;
+      for (let i = 0; i < top5.length; i++) {
+        const c = top5[i];
+        const r = await exportDanmakuClip({
+          source: effectiveSource,
+          video_path: effectiveSource === "local_file" ? videoPath : null,
+          vod_url: effectiveSource === "twitch_vod" ? vodUrl : null,
+          video_id: effectiveSource === "twitch_vod" ? videoId : null,
+          candidate: c,
+          chat: normalizedChat.filter((m) => {
+            const start = c.clip_start ?? c.start ?? 0;
+            const end = c.end ?? (c.clip_start != null && c.clip_duration != null ? c.clip_start + c.clip_duration : start + 30);
+            return m.time_sec >= start && m.time_sec <= end;
+          }),
+          options: { ...opts, with_danmaku: true, all_comments: true, safety_comment_limit: safetyCommentLimit },
+        }, controller.signal);
+        if (r.ok) {
+          successCount++;
+          setDanmakuExportedIds((prev) => new Set(prev).add(c.id ?? c.rank));
+        } else {
+          addLog("error", r.message ?? "Export failed");
+        }
+      }
+      addLog("user", `Top 5 出力: ${successCount}/${top5.length} 完了`);
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") {
+        addLog("user", t("studio.btnCancel"));
+      } else {
+        const msg = e instanceof Error ? e.message : "Unknown error";
+        addLog("error", msg);
+      }
+    } finally {
+      setIsExportingTop5(false);
+      setDanmakuAbortController(null);
+      setExportStage("complete");
+      setTimeout(() => setExportStage(null), 1500);
+    }
+  }, [candidates, exportSource, vodUrl, videoId, videoPath, normalizedChat, outputDir, danmakuQuality, danmakuDensity, danmakuFontSize, danmakuCommentDuration, danmakuOpacity, danmakuNgWords, danmakuMinMessageLength, danmakuDeduplicate, safetyCommentLimit, addLog, t]);
+
+  const handleCancelExport = useCallback(() => {
     if (danmakuAbortController) {
       danmakuAbortController.abort();
-      addLog("user", t("studio.btnCancelExport"));
+      addLog("user", t("studio.btnCancel"));
     }
-  }, [danmakuAbortController, addLog]);
+  }, [danmakuAbortController, addLog, t]);
 
-  // ─── Action panel handlers ────────────────────────────────────────────────
+  // Step navigation
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
-  const handleJumpStart = useCallback(() => {
-    if (!selectedCandidate) return;
-    seekTo(getStart(selectedCandidate));
-    addLog("info", t("studio.logJumpStart", { time: formatTimecode(getStart(selectedCandidate)) }));
-  }, [selectedCandidate, seekTo, addLog, t]);
-
-  const handleJumpPeak = useCallback(() => {
-    if (!selectedCandidate) return;
-    seekTo(getPeak(selectedCandidate));
-    addLog("info", t("studio.logJumpPeak", { time: formatTimecode(getPeak(selectedCandidate)) }));
-  }, [selectedCandidate, seekTo, addLog, t]);
-
-  const handleJumpEnd = useCallback(() => {
-    if (!selectedCandidate) return;
-    seekTo(Math.max(0, getEnd(selectedCandidate) - 1));
-    addLog("info", t("studio.logJumpEnd", { time: formatTimecode(getEnd(selectedCandidate)) }));
-  }, [selectedCandidate, seekTo, addLog, t]);
-
-  const handlePreviewRange = useCallback(() => {
-    if (!selectedCandidate) return;
-    seekTo(getStart(selectedCandidate));
-    addLog("user", t("studio.logPreview", { time: formatTimecode(getStart(selectedCandidate)) }));
-  }, [selectedCandidate, seekTo, addLog, t]);
-
-  const handleSetStartFromCurrent = useCallback(() => {
-    if (!selectedCandidate) return;
-    const newStart = currentTime;
-    const end = getEnd(selectedCandidate);
-    const updated: HighlightCandidate = {
-      ...selectedCandidate,
-      clip_start: newStart,
-      start: newStart,
-      clip_duration: Math.max(1, end - newStart),
-    };
-    setSelectedCandidate(updated);
-    setCandidates((prev) => prev.map((c) => (c.rank === selectedCandidate.rank ? updated : c)));
-    addLog("user", t("studio.logSetStart", { time: formatTimecode(newStart) }));
-  }, [selectedCandidate, currentTime, addLog, t]);
-
-  const handleSetEndFromCurrent = useCallback(() => {
-    if (!selectedCandidate) return;
-    const newEnd = currentTime;
-    const start = getStart(selectedCandidate);
-    const updated: HighlightCandidate = {
-      ...selectedCandidate,
-      end: newEnd,
-      clip_duration: Math.max(1, newEnd - start),
-    };
-    setSelectedCandidate(updated);
-    setCandidates((prev) => prev.map((c) => (c.rank === selectedCandidate.rank ? updated : c)));
-    addLog("user", t("studio.logSetEnd", { time: formatTimecode(newEnd) }));
-  }, [selectedCandidate, currentTime, addLog, t]);
-
-  // M9: Keyboard shortcuts (j/k, Space, Enter, Ctrl+E, 1-9)
+  // Keyboard shortcuts
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      // Ignore when typing in form fields
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || (e.target as HTMLElement)?.isContentEditable) {
         return;
       }
-      // Ctrl+E: export with danmaku
+      // Ctrl+E
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "e") {
         e.preventDefault();
-        if (selectedCandidate) {
-          handleDanmakuExport("with", {
-            density: danmakuDensity,
-            font_size: danmakuFontSize,
-            comment_duration: danmakuCommentDuration,
-            opacity: danmakuOpacity,
-            ng_words: danmakuNgWords.split(",").map((s) => s.trim()).filter(Boolean),
-            min_message_length: danmakuMinMessageLength,
-            deduplicate_consecutive: danmakuDeduplicate,
-          } as DanmakuExportOptions);
-        }
+        if (selectedCandidate) handleExportSingle();
         return;
       }
-      // j/k or ArrowDown/Up: move candidate selection
+      // j/k
       if (e.key === "j" || e.key === "ArrowDown") {
         e.preventDefault();
         if (candidates.length === 0) return;
         const currentIdx = selectedCandidate
           ? candidates.findIndex((c) => c.rank === selectedCandidate.rank)
           : -1;
-        const nextIdx = Math.min(candidates.length - 1, currentIdx + 1);
-        handleSelectCandidate(candidates[nextIdx]);
+        handleSelectCandidate(candidates[Math.min(candidates.length - 1, currentIdx + 1)]);
         return;
       }
       if (e.key === "k" || e.key === "ArrowUp") {
@@ -776,11 +505,9 @@ export default function StudioClient() {
         const currentIdx = selectedCandidate
           ? candidates.findIndex((c) => c.rank === selectedCandidate.rank)
           : candidates.length;
-        const prevIdx = Math.max(0, currentIdx - 1);
-        handleSelectCandidate(candidates[prevIdx]);
+        handleSelectCandidate(candidates[Math.max(0, currentIdx - 1)]);
         return;
       }
-      // 1-9: jump to nth candidate (1-indexed)
       if (/^[1-9]$/.test(e.key)) {
         const idx = parseInt(e.key, 10) - 1;
         if (candidates[idx]) {
@@ -789,341 +516,149 @@ export default function StudioClient() {
         }
         return;
       }
-      // Enter: preview selected candidate
-      if (e.key === "Enter" && selectedCandidate) {
-        e.preventDefault();
-        handlePreviewRange();
-        return;
-      }
-      // Space: preview selected candidate (or play/pause if local)
-      if (e.key === " " && selectedCandidate) {
-        e.preventDefault();
-        handlePreviewRange();
-        return;
-      }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [candidates, selectedCandidate, handleSelectCandidate, handlePreviewRange, handleDanmakuExport, danmakuDensity, danmakuFontSize, danmakuCommentDuration, danmakuOpacity, danmakuNgWords, danmakuMinMessageLength, danmakuDeduplicate]);
-
-  const handleSelectLocalVideo = useCallback(() => {
-    setMode("local");
-    addLog("user", t("studio.logFallbackLocal"));
-  }, [addLog, t]);
-
-  // ─── Time tracking ────────────────────────────────────────────────────────
-
-  const handleTimeUpdate = useCallback((time: number) => {
-    setCurrentTime(time);
-  }, []);
-
-  const handleDurationChange = useCallback((duration: number) => {
-    if (Number.isFinite(duration) && duration > 0) {
-      setVideoDuration(duration);
-    }
-  }, []);
-
-  // Get current time from player (for "Set from current" buttons)
-  const liveCurrentTime = useMemo(() => {
-    if (mode === "local" && localPlayerRef.current) {
-      return localPlayerRef.current.getCurrentTime();
-    }
-    return currentTime;
-  }, [mode, currentTime]);
-
-  // ─── Render ───────────────────────────────────────────────────────────────
-
-  const hasLocalVideo = canExport;
+  }, [candidates, selectedCandidate, handleSelectCandidate, handleExportSingle]);
 
   return (
     <div className="min-h-screen flex flex-col bg-[#050816]">
-      {/* Header: only essential controls */}
-      <header className="bg-slate-900/80 border-b border-slate-700/50 px-5 py-2.5 flex items-center gap-3 flex-wrap">
-        <h1 className="text-lg font-bold text-cyan-300 whitespace-nowrap">{t("studio.title")}</h1>
-
-        {/* Step indicator (M1) */}
-        <div className="flex items-center gap-1 text-[10px]" aria-label={t("studio.step1Title")}>
-          {(() => {
-            const hasVod = mode === "twitch" ? !!videoId : !!videoPath.trim();
-            const hasCandidate = !!selectedCandidate;
-            const hasExported = !!danmakuLastResult?.ok;
-            const currentStep = !hasVod ? 1 : !hasCandidate ? 2 : !hasExported ? 3 : 4;
-            return [1, 2, 3, 4].map((n) => {
-              const titleKeys = ["step1Title", "step2Title", "step3Title", "step4Title"];
-              const active = n === currentStep;
-              const done = n < currentStep;
-              return (
-                <span
-                  key={n}
-                  className={`px-2 py-0.5 rounded ${
-                    active
-                      ? "bg-cyan-600 text-white font-semibold"
-                      : done
-                        ? "bg-slate-700 text-slate-300"
-                        : "bg-slate-800/40 text-slate-500"
-                  }`}
-                >
-                  {n}. {t(`studio.${titleKeys[n - 1]}`)}
-                </span>
-              );
-            });
-          })()}
-        </div>
-
-        <div className="flex bg-slate-800 rounded-md p-0.5 border border-slate-700">
-          <button
-            onClick={() => { setMode("twitch"); setVideoId(null); setCandidates([]); setVodTitle(null); }}
-            className={`px-2.5 py-1 text-xs rounded-sm transition-colors ${mode === "twitch" ? "bg-cyan-600 text-white" : "text-slate-400 hover:text-slate-200"}`}
-          >{t("studio.modeTwitch")}</button>
-          <button
-            onClick={() => { setMode("local"); setVideoId(null); setCandidates([]); setVodTitle(null); }}
-            className={`px-2.5 py-1 text-xs rounded-sm transition-colors ${mode === "local" ? "bg-cyan-600 text-white" : "text-slate-400 hover:text-slate-200"}`}
-          >{t("studio.modeLocal")}</button>
-        </div>
-
-        {mode === "twitch" ? (
-          <div className="flex gap-2 items-end">
-            <div className="flex flex-col gap-px">
-              <label className="text-[10px] text-slate-500 uppercase tracking-wide">{t("studio.labelVodUrl")}</label>
-              <input value={vodUrl} onChange={(e) => setVodUrl(e.target.value)}
-                placeholder={t("studio.placeholderVodUrl")}
-                className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-cyan-500 w-72" />
-            </div>
-            <button onClick={handleLoadVod} disabled={!vodUrl.trim()}
-              className="px-2.5 py-1.5 text-xs rounded bg-slate-700/60 border border-slate-600 text-slate-300 hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed">{t("studio.btnLoad")}</button>
-          </div>
-        ) : (
-          <div className="flex gap-2 items-end">
-            <div className="flex flex-col gap-px">
-              <label className="text-[10px] text-slate-500 uppercase tracking-wide">{t("studio.labelVideoFile")}</label>
-              <input value={videoPath} onChange={(e) => setVideoPath(e.target.value)}
-                placeholder={t("studio.placeholderVideoFile")}
-                className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-cyan-500 w-64" />
-            </div>
-            <div className="flex flex-col gap-px">
-              <label className="text-[10px] text-slate-500 uppercase tracking-wide">{t("studio.labelChatLog")}</label>
-              <input value={logPath} onChange={(e) => setLogPath(e.target.value)}
-                placeholder={t("studio.placeholderChatLog")}
-                className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-cyan-500 w-64" />
-            </div>
-          </div>
-        )}
-
+      {/* Compact header */}
+      <header className="bg-slate-900/80 border-b border-slate-700/50 px-5 py-2 flex items-center gap-3">
+        <h1 className="text-lg font-bold text-cyan-300 whitespace-nowrap">
+          🎬 {t("studio.title")}
+        </h1>
         <div className="ml-auto flex items-center gap-2">
           <LanguageSwitcher />
-          <div className="flex gap-1.5">
-            {isAnalyzing ? (
-              <button onClick={handleCancel}
-                className="px-3 py-1.5 text-xs rounded bg-red-600 text-white hover:brightness-110 font-semibold"
-              >
-                {t("studio.btnCancel")}
-              </button>
-            ) : (
-              <button onClick={handleAnalyze}
-                disabled={mode === "twitch" && !videoId}
-                className="px-3 py-1.5 text-xs rounded bg-cyan-600 text-white hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed font-semibold"
-              >
-                {t("studio.btnAnalyze")}
-              </button>
-            )}
-          </div>
         </div>
       </header>
 
-      {/* Advanced Settings (collapsible) */}
-      <AdvancedSettings
-        isOpen={advancedOpen}
-        onToggle={() => setAdvancedOpen((v) => !v)}
-        windowSec={windowSec} setWindowSec={setWindowSec}
-        step={step} setStep={setStep}
-        topN={topN} setTopN={setTopN}
-        minGap={minGap} setMinGap={setMinGap}
-        clipDuration={clipDuration} setClipDuration={setClipDuration}
-        clipOffset={clipOffset} setClipOffset={setClipOffset}
-        keywordWeight={keywordWeight} setKeywordWeight={setKeywordWeight}
-        keywordsText={keywordsText} setKeywordsText={setKeywordsText}
+      {/* Step navigation */}
+      <StepContainer
+        currentStep={currentStep}
+        reachable={reachable}
+        onStepClick={() => {
+          // Navigation is informational only in this build;
+          // the user advances automatically by completing each step.
+        }}
       />
 
-      {/* Progress bar */}
-      {isAnalyzing && (
-        <div className="bg-slate-900/90 border-b border-slate-700/50 px-5 py-2">
-          <div className="flex items-center gap-3">
-            <div className="flex-1 bg-slate-700 rounded-full h-2 overflow-hidden">
-              <div
-                className="h-full bg-gradient-to-r from-cyan-500 to-fuchsia-400 rounded-full transition-all duration-300 ease-out"
-                style={{ width: `${Math.max(1, progress)}%` }}
-              />
-            </div>
-            <span className="text-xs text-slate-400 min-w-[180px] text-right whitespace-nowrap">
-              {progressLabel || t("studio.preparing")} ({progress}%)
-            </span>
-          </div>
-        </div>
-      )}
+      {/* Main 3-step flow */}
+      <main className="flex-1 max-w-3xl mx-auto w-full px-5 py-4 space-y-4">
+        {/* Step 1: VOD input */}
+        <Step1VodInput
+          vodUrl={vodUrl}
+          setVodUrl={setVodUrl}
+          videoId={videoId}
+          chatLoaded={chatLoaded}
+          messageCount={messageCount}
+          candidatesCount={candidates.length}
+          vodTitle={vodTitle}
+          isAnalyzing={isAnalyzing}
+          progressLabel={progressLabel}
+          progress={progress}
+          errorMessage={errorMessage}
+          onLoad={handleLoadVod}
+          onAutoAnalyze={handleAnalyze}
+        />
 
-      {/* Error */}
-      {errorMessage && (
-        <div className="bg-red-950/80 border-b border-red-800 px-5 py-1.5 flex justify-between items-center text-red-300 text-xs">
-          <span>⚠ {errorMessage}</span>
-          <button onClick={() => setErrorMessage(null)} className="bg-none border-none text-red-300 cursor-pointer text-sm">✕</button>
-        </div>
-      )}
-
-      {/* Title bar */}
-      {vodTitle && (
-        <div className="bg-slate-800/50 border-b border-slate-700/30 px-5 py-1.5 text-sm text-slate-200 flex justify-between items-center">
-          <span className="font-semibold">{vodTitle}</span>
-          <span className="text-xs text-slate-400">
-            {t("studio.candidatesCount", { count: candidates.length })}
-          </span>
-        </div>
-      )}
-
-      {/* Main content */}
-      <div className="flex gap-3 px-5 pt-3 flex-1 min-h-0">
-        <div className="flex-[3] flex flex-col gap-2.5 min-w-0">
-          {mode === "twitch" && videoId ? (
-            <TwitchVodPlayer
-              ref={twitchPlayerRef}
-              videoId={videoId}
-              startTimeSeconds={playerStartTime}
-              reloadKey={playerReloadKey}
-              onTimeUpdate={handleTimeUpdate}
-            />
-          ) : mode === "local" && videoPath.trim() ? (
-            <LocalVideoPlayer
-              ref={localPlayerRef}
-              videoPath={videoPath}
-              startTimeSeconds={playerStartTime}
-              onTimeUpdate={handleTimeUpdate}
-              onDurationChange={handleDurationChange}
-            />
-          ) : (
-            <div className="glass-panel rounded-lg p-3 flex items-center justify-center h-[200px]">
-              <div className="text-sm text-slate-400">
-                {mode === "twitch" ? (
-                  <div className="text-center">
-                    <div className="text-2xl mb-2">📺</div>
-                    <div>{t("studio.emptyTwitch")}</div>
-                  </div>
-                ) : (
-                  <div className="text-center">
-                    <div className="text-2xl mb-2">🎬</div>
-                    <div>{t("studio.emptyLocal")}</div>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Timeline Graph (interactive) */}
-          {timeline.length > 0 && (
-            <TimelineGraph
-              timeline={timeline}
-              candidates={candidates}
-              selectedCandidate={selectedCandidate}
-              currentTime={currentTime}
-              duration={videoDuration}
-              maxTime={maxTime}
-              onSeek={seekTo}
-              onSelectCandidate={handleSelectCandidate}
-            />
-          )}
-
-          {/* Clip action panel for selected candidate */}
-          {selectedCandidate && (
-            <ClipActionPanel
-              candidate={selectedCandidate}
-              hasLocalVideo={hasLocalVideo}
-              localVideoPath={videoPath || null}
-              currentTime={liveCurrentTime}
-              isPlayerAvailable={mode === "local" || (mode === "twitch" && !!videoId)}
-              singleExportStatus={exportStatus}
-              batchExportStatus={batchExportStatus}
-              onJumpStart={handleJumpStart}
-              onJumpPeak={handleJumpPeak}
-              onJumpEnd={handleJumpEnd}
-              onPreviewRange={handlePreviewRange}
-              onSetStartFromCurrent={handleSetStartFromCurrent}
-              onSetEndFromCurrent={handleSetEndFromCurrent}
-              onExportThisClip={() => exportCandidate(selectedCandidate)}
-              onExportTop5={exportTop5}
-              onSelectLocalVideo={handleSelectLocalVideo}
-            />
-          )}
-
-          {/* Danmaku export panel - works for Twitch VOD / Local file / ASS only */}
-          {selectedCandidate && (
-            <DanmakuPanel
-              candidate={selectedCandidate}
-              chatInRange={chatInRange}
-              hasLocalVideo={canExport}
-              hasVodUrl={mode === "twitch" && !!videoId}
-              localVideoPath={videoPath}
-              isExporting={danmakuExporting}
-              lastResult={danmakuLastResult}
-              exportSource={exportSource}
-              setExportSource={setExportSource}
-              onExportWithDanmaku={(opts) => handleDanmakuExport("with", opts)}
-              onExportWithoutDanmaku={(opts) => handleDanmakuExport("without", opts)}
-              onExportAssOnly={(opts) => handleDanmakuExport("ass", opts)}
-              onCancel={handleDanmakuCancel}
-              density={danmakuDensity}
-              setDensity={setDanmakuDensity}
-              fontSize={danmakuFontSize}
-              setFontSize={setDanmakuFontSize}
-              commentDuration={danmakuCommentDuration}
-              setCommentDuration={setDanmakuCommentDuration}
-              opacity={danmakuOpacity}
-              setOpacity={setDanmakuOpacity}
-              ngWords={danmakuNgWords}
-              setNgWords={setDanmakuNgWords}
-              minMessageLength={danmakuMinMessageLength}
-              setMinMessageLength={setDanmakuMinMessageLength}
-              deduplicateConsecutive={danmakuDeduplicate}
-              setDeduplicateConsecutive={setDanmakuDeduplicate}
-              quality={danmakuQuality}
-              setQuality={setDanmakuQuality}
-            />
-          )}
-
-          {/* Detailed reasons (collapsible / on-demand) */}
-          {selectedCandidate && (
-            <CandidateDetails candidate={selectedCandidate} />
-          )}
-        </div>
-
-        <div className="flex-[2] flex flex-col min-w-[280px] max-w-[400px] gap-2">
-          {/* Export status panel */}
-          <ExportStatusPanel
-            mode={mode}
-            videoPath={videoPath}
-            twitchVodId={videoId}
-            exportedCount={exportedIds.size}
-            totalCandidates={candidates.length}
-            onSelectLocalFile={handleSelectLocalVideo}
-          />
-
-          <CandidateList
+        {/* Step 2: Candidates (only shown when candidates exist) */}
+        {candidates.length > 0 && (
+          <Step2CandidateList
             candidates={candidates}
-            selectedCandidateId={selectedCandidate?.id ?? selectedCandidate?.rank ?? null}
+            selectedCandidateId={selectedCandidateId}
             exportedCandidateIds={exportedIds}
             danmakuExportedIds={danmakuExportedIds}
             exportingCandidateId={exportingId}
-            canExport={canExport}
-            onSelectCandidate={handleSelectCandidate}
-            onEditCandidate={handleEditCandidate}
-            onExportCandidate={exportCandidate}
+            canExport={!!selectedCandidate}
+            maxScore={maxScore}
+            onSelect={handleSelectCandidate}
+            onExport={handleExportSingle}
+            onExportTop5={handleExportTop5}
+            isExportingTop5={isExportingTop5}
           />
-        </div>
-      </div>
+        )}
 
-      <div className="px-5 pb-3 pt-2">
-        <LogPanel
-          logs={logs}
-          diagnostic={diagnostic as Record<string, unknown> | null}
+        {/* Step 3: Export panel (only when a candidate is selected) */}
+        {selectedCandidate && (
+          <Step3ExportPanel
+            candidate={selectedCandidate}
+            chatInRangeCount={chatInRange.length}
+            burnedCount={chatInRange.length}
+            outputDir={outputDir}
+            isExporting={!!exportingId && exportingId === (selectedCandidate.id ?? selectedCandidate.rank)}
+            isExportingTop5={isExportingTop5}
+            currentStage={exportStage}
+            fallbackAvailable={!!danmakuLastResult?.fallback}
+            lastResult={danmakuLastResult}
+            onExportSingle={handleExportSingle}
+            onExportTop5={handleExportTop5}
+            onCancel={handleCancelExport}
+            onShowAdvanced={() => setAdvancedOpen(true)}
+          />
+        )}
+
+        {/* Advanced settings (collapsed by default) */}
+        <AdvancedSettings
+          isOpen={advancedOpen}
+          onToggle={() => setAdvancedOpen((v) => !v)}
+          windowSec={windowSec} setWindowSec={setWindowSec}
+          step={step} setStep={setStep}
+          topN={topN} setTopN={setTopN}
+          minGap={minGap} setMinGap={setMinGap}
+          keywordWeight={keywordWeight} setKeywordWeight={setKeywordWeight}
+          keywordsText={keywordsText} setKeywordsText={setKeywordsText}
+          exportSource={exportSource}
+          setExportSource={setExportSource}
+          vodUrl={vodUrl}
+          videoPath={videoPath}
+          setVideoPath={setVideoPath}
+          logPath={logPath}
+          setLogPath={setLogPath}
+          mode={mode}
+          density={danmakuDensity} setDensity={setDanmakuDensity}
+          fontSize={danmakuFontSize} setFontSize={setDanmakuFontSize}
+          commentDuration={danmakuCommentDuration} setCommentDuration={setDanmakuCommentDuration}
+          opacity={danmakuOpacity} setOpacity={setDanmakuOpacity}
+          ngWords={danmakuNgWords} setNgWords={setDanmakuNgWords}
+          minMessageLength={danmakuMinMessageLength} setMinMessageLength={setMinMessageLength}
+          deduplicateConsecutive={danmakuDeduplicate}
+          setDeduplicateConsecutive={setDeduplicateConsecutive}
+          safetyCommentLimit={safetyCommentLimit}
+          setSafetyCommentLimit={setSafetyCommentLimit}
+          quality={danmakuQuality}
+          setQuality={setDanmakuQuality}
+          outputDir={outputDir}
+          setOutputDir={setOutputDir}
         />
-      </div>
+
+        {/* Bottom: log + right notice */}
+        <details className="bg-slate-900/40 rounded p-2 text-[10px] text-slate-500">
+          <summary className="cursor-pointer">Activity Log ({logs.length})</summary>
+          <div className="mt-1 space-y-0.5 max-h-40 overflow-y-auto">
+            {logs.slice(-50).map((l, i) => (
+              <div
+                key={i}
+                className={
+                  l.level === "error"
+                    ? "text-red-300"
+                    : l.level === "warn"
+                      ? "text-amber-300"
+                      : l.level === "info"
+                        ? "text-slate-500"
+                        : "text-slate-300"
+                }
+              >
+                {l.message}
+              </div>
+            ))}
+          </div>
+        </details>
+
+        <div className="text-[9px] text-slate-600 leading-relaxed text-center">
+          ⚠ {t("studio.rightNotice")}
+        </div>
+      </main>
     </div>
   );
 }
