@@ -168,8 +168,14 @@ export async function runArchiveAutoAnalysis(
   // max(download, chat) instead of download + chat. The chat fetch
   // gracefully tolerates the video not being downloaded yet because it only
   // needs the VOD duration (already returned by metadata).
-  const needsFullDownload = pipelineMode === "full" || pipelineMode === "sections";
-  emitProgress({ stage: "download", status: needsFullDownload ? "running" : "skipped", message: needsFullDownload ? `Downloading video...` : `Download skipped (${pipelineMode} mode)` });
+  //
+  // Sections mode: skip the full VOD download. We'll download each
+  // candidate's time range on-demand in Phase 2 via yt-dlp --download-sections.
+  // This is dramatically faster for short clips on long VODs (e.g. a 30s
+  // clip from a 4-hour VOD is 0.2% of the file size).
+  const needsFullDownload = pipelineMode === "full";
+  const usesPerSectionDownload = pipelineMode === "sections";
+  emitProgress({ stage: "download", status: needsFullDownload ? "running" : (usesPerSectionDownload ? "skipped" : "skipped"), message: needsFullDownload ? `Downloading video (full)...` : usesPerSectionDownload ? `Sections mode: per-candidate section downloads` : `Download skipped (${pipelineMode} mode)` });
   emitProgress({ stage: "chat", status: "running", message: "Fetching chat..." });
 
   let downloadedVideo: Awaited<ReturnType<typeof downloadVideoWithYtDlp>> | null = null;
@@ -235,6 +241,8 @@ export async function runArchiveAutoAnalysis(
       await chatPromise.catch(() => undefined);
       throw error;
     }
+  } else if (usesPerSectionDownload) {
+    emitProgress({ stage: "download", status: "skipped", message: "Sections mode: full VOD download skipped, will fetch per-candidate sections" });
   } else {
     emitProgress({ stage: "download", status: "skipped", message: `Download skipped (${pipelineMode} mode)` });
   }
@@ -398,6 +406,9 @@ export async function runArchiveAutoAnalysis(
   const cpuCount = cpus().length;
   const clipLimit = createLimiter(cpuCount);
   const burnLimit = createLimiter(2);
+  // Limit concurrent section downloads to 2 so we don't slam the Twitch
+  // CDN with too many parallel requests when in sections mode.
+  const sectionLimit = createLimiter(2);
 
   const processed = await Promise.all(
     sourceCandidates.map(async (candidate, candidateIndex): Promise<ClipCandidate> => {
@@ -415,17 +426,48 @@ export async function runArchiveAutoAnalysis(
       const clipStartSeconds = parseTimecode(selectedVariant.start, "clip start");
       const clipDurationSeconds = parseTimecode(selectedVariant.duration, "clip duration");
 
-      // Step A: sourceVideoPath existence check
-      // In both "full" and "sections" mode, the full VOD is downloaded once
-      // in Phase 1, then ffmpeg extracts each candidate's section. This avoids
-      // launching yt-dlp once per candidate (6+ calls) and removes the ffmpeg
-      // dependency that yt-dlp's --download-sections requires.
+      // Step A: sourceVideoPath acquisition
+      // - "full" mode: full VOD was downloaded in Phase 1, use it directly.
+      // - "sections" mode: download only this candidate's time range via
+      //   yt-dlp --download-sections. This is dramatically faster than
+      //   downloading the full VOD when only a few short clips are needed.
+      // - "links" / "clips" modes: shouldn't reach here, but fall back to
+      //   the full VOD if available.
       let clipInputPath: string;
-      if (!downloadedVideo?.inputPath) {
+      if (usesPerSectionDownload) {
+        // Per-section download. Limit concurrent downloads to 2 so we
+        // don't slam the Twitch CDN with 6+ parallel requests.
+        const sectionStart = clipStartSeconds;
+        const sectionEnd = clipStartSeconds + clipDurationSeconds;
+        emitProgress({ stage: "clip", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Downloading section ${secondsToClock(sectionStart)}-${secondsToClock(sectionEnd)} for candidate ${indexLabel}...` });
+        try {
+          const sectionDownload = await sectionLimit(() => downloadVideoWithYtDlp({
+            url,
+            format: input.ytDlpFormat,
+            prefetchedMetadata: metadata,
+            timeStartSeconds: sectionStart,
+            timeEndSeconds: sectionEnd,
+            signal: input.signal,
+            onProgress: (p) => {
+              emitProgress({ stage: "clip", status: "running", candidateId: candidate.id, candidateIndex: candidateIndex + 1, candidateTotal: candidateCount, message: `Section ${indexLabel} downloading... ${p.percent.toFixed(1)}% at ${p.speed}, ETA ${p.eta}` });
+            }
+          }));
+          clipInputPath = sectionDownload.inputPath;
+        } catch (err) {
+          const detail = errorMessage(err, "Section download failed");
+          warnings.push({ stage: "clip", candidateId: candidate.id, message: `Section download failed: ${detail}. Falling back to full VOD if available.` });
+          if (downloadedVideo?.inputPath) {
+            clipInputPath = downloadedVideo.inputPath;
+          } else {
+            return candidate;
+          }
+        }
+      } else if (!downloadedVideo?.inputPath) {
         warnings.push({ stage: "clip", candidateId: candidate.id, message: "No downloaded video available for clip generation. Phase 1 download may have failed." });
         return candidate;
+      } else {
+        clipInputPath = downloadedVideo.inputPath;
       }
-      clipInputPath = downloadedVideo.inputPath;
 
       // Step B: clipStartSec / clipDurationSec validation
       if (clipDurationSeconds <= 0) {

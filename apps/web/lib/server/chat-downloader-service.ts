@@ -486,7 +486,15 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
                     "author": {"display_name": user, "id": str(commenter.get("id", ""))},
                     "message_type": "data"
                 }
-                results.append((json.dumps(out, default=str), ts, cid))
+                json_line = json.dumps(out, default=str)
+                results.append((json_line, ts, cid))
+                # INCREMENTAL OUTPUT: print each message immediately so the
+                # Node.js parent process sees streaming progress, not a burst
+                # at the end of the segment. Deduplication still happens in
+                # the main loop (seen_ids cross-thread check), but the
+                # per-thread dedup via the seen set ensures we don't print
+                # duplicates from this segment.
+                with print_lock: print(json_line, flush=True)
                 fetched += 1
                 if ts > max_os: max_os = ts
                 if fetched >= seg_limit: break
@@ -520,13 +528,15 @@ def fetch_chat(vod_id, max_messages, timeout_seconds=600):
                     fatal_error = True
                     with print_lock:
                         print(f"Segment {seg} GQL fatal error", file=sys.stderr)
+                # NOTE: Messages are now printed incrementally inside
+                # fetch_segment as they're fetched, not in a burst here.
+                # We only count cross-segment dedup and totals here.
                 for (json_line, ts, cid) in results:
                     if total[0] >= max_messages: break
                     with seen_lock:
                         if cid and cid in seen_ids: continue
                         if cid: seen_ids.add(cid)
                     with total_lock: total[0] += 1
-                    with print_lock: print(json_line)
             except Exception as e:
                 with print_lock:
                     print(f"Segment {seg} crashed: {str(e).strip().replace(chr(10), ' ')}", file=sys.stderr)
