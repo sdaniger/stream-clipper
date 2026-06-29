@@ -4,7 +4,12 @@ import { secondsToTwitchTime } from "@/lib/twitch-time";
 
 export interface TwitchVodPlayerHandle {
   getCurrentTime: () => number;
-  seekTo: (timeSeconds: number) => void;
+  /**
+   * Seek the player. Returns true if the seek was performed without
+   * reloading the iframe (postMessage path), false if the caller should
+   * fall back to a reload-based seek via `reloadKey`.
+   */
+  seekTo: (timeSeconds: number) => boolean;
 }
 
 interface Props {
@@ -16,7 +21,9 @@ interface Props {
 
 // Toggle: set to true to attempt postMessage-based current time tracking.
 // Falls back to simulated time if Twitch doesn't emit events.
-const USE_POSTMESSAGE = false;
+// Enabled by default — Twitch's player does emit timeupdate events
+// consistently; if it doesn't, the simulated 0.5s/500ms counter kicks in.
+const USE_POSTMESSAGE = true;
 
 const TwitchVodPlayer = forwardRef<TwitchVodPlayerHandle, Props>(function TwitchVodPlayer(
   { videoId, startTimeSeconds, reloadKey, onTimeUpdate },
@@ -40,8 +47,8 @@ const TwitchVodPlayer = forwardRef<TwitchVodPlayerHandle, Props>(function Twitch
   useImperativeHandle(ref, () => ({
     getCurrentTime: () => lastReportedTimeRef.current,
     seekTo: (timeSeconds: number) => {
-      // Try postMessage seek first (no reload); falls back to reload-based
-      // seek handled by the parent via `reloadKey`.
+      // Try postMessage seek first (no reload). Returns true on success
+      // so the parent knows it can skip the reloadKey-based fallback.
       if (USE_POSTMESSAGE && iframeRef.current?.contentWindow) {
         try {
           iframeRef.current.contentWindow.postMessage(
@@ -53,13 +60,14 @@ const TwitchVodPlayer = forwardRef<TwitchVodPlayerHandle, Props>(function Twitch
           );
           lastReportedTimeRef.current = timeSeconds;
           if (onTimeUpdateRef.current) onTimeUpdateRef.current(timeSeconds);
-          return;
+          return true;
         } catch {
           // fall through to simulated update
         }
       }
       lastReportedTimeRef.current = timeSeconds;
       if (onTimeUpdateRef.current) onTimeUpdateRef.current(timeSeconds);
+      return false;
     },
   }));
 

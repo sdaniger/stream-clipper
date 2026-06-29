@@ -216,9 +216,18 @@ export default function StudioClient() {
   const seekTo = useCallback((time: number) => {
     const clamped = Math.max(0, time);
     setPlayerStartTime(clamped);
-    setPlayerReloadKey((v) => v + 1);
     setCurrentTime(clamped);
-  }, []);
+    // Prefer postMessage-based seek (no reload). TwitchVodPlayer exposes
+    // seekTo() via useImperativeHandle; when it's available and postMessage
+    // mode is on, it sends { event: "video.seek", data: { time } } and the
+    // parent reloadKey stays the same. Fall back to a reload for older
+    // browsers and when postMessage is disabled.
+    if (mode === "twitch" && twitchPlayerRef.current?.seekTo) {
+      const ok = twitchPlayerRef.current.seekTo(clamped);
+      if (ok) return;
+    }
+    setPlayerReloadKey((v) => v + 1);
+  }, [mode]);
 
   const handleSelectCandidate = useCallback((candidate: HighlightCandidate) => {
     const seekTime = getCandidateSeekTime(candidate);
@@ -726,6 +735,77 @@ export default function StudioClient() {
     addLog("user", t("studio.logSetEnd", { time: formatTimecode(newEnd) }));
   }, [selectedCandidate, currentTime, addLog, t]);
 
+  // M9: Keyboard shortcuts (j/k, Space, Enter, Ctrl+E, 1-9)
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      // Ignore when typing in form fields
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || (e.target as HTMLElement)?.isContentEditable) {
+        return;
+      }
+      // Ctrl+E: export with danmaku
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "e") {
+        e.preventDefault();
+        if (selectedCandidate) {
+          handleDanmakuExport("with", {
+            density: danmakuDensity,
+            font_size: danmakuFontSize,
+            comment_duration: danmakuCommentDuration,
+            opacity: danmakuOpacity,
+            ng_words: danmakuNgWords.split(",").map((s) => s.trim()).filter(Boolean),
+            min_message_length: danmakuMinMessageLength,
+            deduplicate_consecutive: danmakuDeduplicate,
+          } as DanmakuExportOptions);
+        }
+        return;
+      }
+      // j/k or ArrowDown/Up: move candidate selection
+      if (e.key === "j" || e.key === "ArrowDown") {
+        e.preventDefault();
+        if (candidates.length === 0) return;
+        const currentIdx = selectedCandidate
+          ? candidates.findIndex((c) => c.rank === selectedCandidate.rank)
+          : -1;
+        const nextIdx = Math.min(candidates.length - 1, currentIdx + 1);
+        handleSelectCandidate(candidates[nextIdx]);
+        return;
+      }
+      if (e.key === "k" || e.key === "ArrowUp") {
+        e.preventDefault();
+        if (candidates.length === 0) return;
+        const currentIdx = selectedCandidate
+          ? candidates.findIndex((c) => c.rank === selectedCandidate.rank)
+          : candidates.length;
+        const prevIdx = Math.max(0, currentIdx - 1);
+        handleSelectCandidate(candidates[prevIdx]);
+        return;
+      }
+      // 1-9: jump to nth candidate (1-indexed)
+      if (/^[1-9]$/.test(e.key)) {
+        const idx = parseInt(e.key, 10) - 1;
+        if (candidates[idx]) {
+          e.preventDefault();
+          handleSelectCandidate(candidates[idx]);
+        }
+        return;
+      }
+      // Enter: preview selected candidate
+      if (e.key === "Enter" && selectedCandidate) {
+        e.preventDefault();
+        handlePreviewRange();
+        return;
+      }
+      // Space: preview selected candidate (or play/pause if local)
+      if (e.key === " " && selectedCandidate) {
+        e.preventDefault();
+        handlePreviewRange();
+        return;
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [candidates, selectedCandidate, handleSelectCandidate, handlePreviewRange, handleDanmakuExport, danmakuDensity, danmakuFontSize, danmakuCommentDuration, danmakuOpacity, danmakuNgWords, danmakuMinMessageLength, danmakuDeduplicate]);
+
   const handleSelectLocalVideo = useCallback(() => {
     setMode("local");
     addLog("user", t("studio.logFallbackLocal"));
@@ -760,6 +840,35 @@ export default function StudioClient() {
       {/* Header: only essential controls */}
       <header className="bg-slate-900/80 border-b border-slate-700/50 px-5 py-2.5 flex items-center gap-3 flex-wrap">
         <h1 className="text-lg font-bold text-cyan-300 whitespace-nowrap">{t("studio.title")}</h1>
+
+        {/* Step indicator (M1) */}
+        <div className="flex items-center gap-1 text-[10px]" aria-label={t("studio.step1Title")}>
+          {(() => {
+            const hasVod = mode === "twitch" ? !!videoId : !!videoPath.trim();
+            const hasCandidate = !!selectedCandidate;
+            const hasExported = !!danmakuLastResult?.ok;
+            const currentStep = !hasVod ? 1 : !hasCandidate ? 2 : !hasExported ? 3 : 4;
+            return [1, 2, 3, 4].map((n) => {
+              const titleKeys = ["step1Title", "step2Title", "step3Title", "step4Title"];
+              const active = n === currentStep;
+              const done = n < currentStep;
+              return (
+                <span
+                  key={n}
+                  className={`px-2 py-0.5 rounded ${
+                    active
+                      ? "bg-cyan-600 text-white font-semibold"
+                      : done
+                        ? "bg-slate-700 text-slate-300"
+                        : "bg-slate-800/40 text-slate-500"
+                  }`}
+                >
+                  {n}. {t(`studio.${titleKeys[n - 1]}`)}
+                </span>
+              );
+            });
+          })()}
+        </div>
 
         <div className="flex bg-slate-800 rounded-md p-0.5 border border-slate-700">
           <button

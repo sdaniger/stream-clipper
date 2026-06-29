@@ -38,7 +38,46 @@ export function getCandidateSeekTime(candidate: HighlightCandidate): number | nu
   return Math.max(0, value);
 }
 
+/**
+ * Extract a Twitch VOD video ID from a variety of URL formats.
+ *
+ * Supports:
+ *   - https://www.twitch.tv/videos/1234567890
+ *   - https://twitch.tv/videos/1234567890
+ *   - https://www.twitch.tv/streamer/video/1234567890
+ *   - https://m.twitch.tv/videos/1234567890
+ *   - https://clips.twitch.tv/Slug  (returns the slug, not a numeric id)
+ *   - https://www.twitch.tv/streamer/clip/Slug  (returns the slug)
+ *   - Bare numeric id: "1234567890"
+ *   - URL with `?video=1234567890` query
+ *   - Player URL: https://player.twitch.tv/?video=v1234567890
+ *
+ * Returns the id (or clip slug) as a string, or null if it cannot be parsed.
+ */
 export function extractVideoId(url: string): string | null {
-  const m = url.match(/(?:twitch\.tv\/videos\/|video=)(\d+)/i);
-  return m ? m[1] : null;
+  if (!url) return null;
+  const trimmed = url.trim();
+  if (!trimmed) return null;
+
+  // Bare numeric id
+  if (/^\d+$/.test(trimmed)) return trimmed;
+
+  // Player URL: ?video=v12345 or ?video=12345
+  const playerMatch = trimmed.match(/[?&]video=v?(\d+)/i);
+  if (playerMatch) return playerMatch[1];
+
+  // Standard VOD URL: /videos/12345
+  const vodMatch = trimmed.match(/\/videos?\/(\d+)/i);
+  if (vodMatch) return vodMatch[1];
+
+  // Streamer's VOD: /streamer/video/12345
+  const streamerMatch = trimmed.match(/\/[a-z0-9_]+\/video\/(\d+)/i);
+  if (streamerMatch) return streamerMatch[1];
+
+  // Clip slug (alphabetic identifier)
+  const clipMatch = trimmed.match(/twitch\.tv\/[a-z0-9_-]+\/clip\/([a-z0-9_-]+)/i)
+    || trimmed.match(/clips\.twitch\.tv\/([a-z0-9_-]+)/i);
+  if (clipMatch) return clipMatch[1];
+
+  return null;
 }

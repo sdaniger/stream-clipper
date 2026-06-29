@@ -163,14 +163,27 @@ export default function DanmakuPanel({
     <div className="glass-panel rounded-lg p-3">
       <div className="flex items-center justify-between mb-2">
         <h3 className="text-xs font-semibold text-cyan-300 uppercase tracking-wider">
-          🎬 弾幕コメント付き出力
+          🎬 {t("studio.exportTitle")}
         </h3>
         {chatInRange.length > 0 && (
           <span className="text-[10px] text-slate-400">
-            範囲内コメント: <span className="text-slate-200 font-semibold">{chatInRange.length}</span> 件
+            {t("studio.rangeInComments")}: <span className="text-slate-200 font-semibold">{chatInRange.length}</span> {t("studio.msgCount", { count: "" }).trim()}
           </span>
         )}
       </div>
+
+      {/* M10: comment count warning */}
+      {chatInRange.length >= 100 && (
+        <div className={`mb-2 px-2 py-1.5 text-[10px] rounded border ${
+          chatInRange.length >= 500
+            ? "text-red-300 bg-red-500/10 border-red-500/40"
+            : "text-amber-300 bg-amber-500/10 border-amber-500/30"
+        }`}>
+          {chatInRange.length >= 500
+            ? t("studio.veryHighCommentCount")
+            : t("studio.highCommentCount")}
+        </div>
+      )}
 
       {/* Source availability grid */}
       <div className="grid grid-cols-3 gap-1 mb-2 text-[10px]">
@@ -491,13 +504,40 @@ export default function DanmakuPanel({
             </div>
           )}
           {lastResult.output_file && (
-            <div className="text-emerald-300">
-              <span className="font-semibold">出力:</span> <code className="text-emerald-200">{lastResult.output_file}</code>
+            <div className="text-emerald-300 flex items-center gap-2">
+              <span className="font-semibold">出力:</span>
+              <code className="text-emerald-200 truncate">{lastResult.output_file}</code>
+              <a
+                href={`/api/media/files?path=${encodeURIComponent(lastResult.output_file)}`}
+                download
+                className="ml-auto px-1.5 py-0.5 rounded bg-emerald-600/30 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/40 text-[10px]"
+                title={t("studio.resultDownload")}
+              >
+                ⬇
+              </a>
+              <a
+                href={`/api/media/files?path=${encodeURIComponent(lastResult.output_file)}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="px-1.5 py-0.5 rounded bg-slate-700/40 border border-slate-600/40 text-slate-200 hover:bg-slate-600/40 text-[10px]"
+                title={t("studio.resultPreview")}
+              >
+                ▶
+              </a>
             </div>
           )}
           {lastResult.ass_file && (
-            <div className="text-emerald-300 mt-0.5">
-              <span className="font-semibold">ASS:</span> <code className="text-emerald-200">{lastResult.ass_file}</code>
+            <div className="text-emerald-300 mt-0.5 flex items-center gap-2">
+              <span className="font-semibold">ASS:</span>
+              <code className="text-emerald-200 truncate">{lastResult.ass_file}</code>
+              <a
+                href={`/api/media/files?path=${encodeURIComponent(lastResult.ass_file)}`}
+                download
+                className="ml-auto px-1.5 py-0.5 rounded bg-emerald-600/30 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/40 text-[10px]"
+                title={t("studio.resultDownload")}
+              >
+                ⬇
+              </a>
             </div>
           )}
         </div>
