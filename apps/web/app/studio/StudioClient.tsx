@@ -11,9 +11,12 @@ import LogPanel from "@/components/studio/LogPanel";
 import AdvancedSettings from "@/components/studio/AdvancedSettings";
 import ClipActionPanel from "@/components/studio/ClipActionPanel";
 import TimelineGraph from "@/components/studio/TimelineGraph";
+import ExportStatusPanel from "@/components/studio/ExportStatusPanel";
 
 type StudioMode = "twitch" | "local";
 type ExportStatus = "idle" | "exporting" | "exported" | "error";
+type LogLevel = "user" | "info" | "warn" | "error";
+type LogEntry = { level: LogLevel; message: string };
 
 interface SseProgress {
   type: "progress";
@@ -76,6 +79,21 @@ function formatTimecode(seconds: number): string {
   return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
 }
 
+// Map SSE stage to user-friendly Japanese messages
+function userFriendlyProgressMessage(stage: string, raw: string): string | null {
+  if (stage === "metadata") return null; // too technical
+  if (stage === "metadata_done") return "VOD情報を取得しました";
+  if (stage === "chat_fetch") return "チャットを取得しています...";
+  if (stage === "chat_done") return "チャットの取得が完了しました";
+  if (stage === "normalize") return null;
+  if (stage === "analyze") return "盛り上がりポイントを分析しています...";
+  if (stage === "analyze_done") return null;
+  if (stage === "timeline") return null;
+  if (stage === "done") return "分析が完了しました";
+  if (stage === "error") return null;
+  return null;
+}
+
 export default function StudioClient() {
   const [mode, setMode] = useState<StudioMode>("twitch");
 
@@ -107,7 +125,7 @@ export default function StudioClient() {
   const [progress, setProgress] = useState(0);
   const [progressLabel, setProgressLabel] = useState("");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [logs, setLogs] = useState<string[]>(["Ready"]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
   const [diagnostic, setDiagnostic] = useState<SseResult["diagnostic"] | null>(null);
   const [abortController, setAbortController] = useState<AbortController | null>(null);
 
@@ -121,8 +139,8 @@ export default function StudioClient() {
   const localPlayerRef = useRef<LocalVideoPlayerHandle>(null);
   const twitchPlayerRef = useRef<TwitchVodPlayerHandle>(null);
 
-  const addLog = useCallback((msg: string) => {
-    setLogs((prev) => [...prev.slice(-99), `[${new Date().toLocaleTimeString()}] ${msg}`]);
+  const addLog = useCallback((level: LogLevel, message: string) => {
+    setLogs((prev) => [...prev.slice(-149), { level, message }]);
   }, []);
 
   const canExport = mode === "local" && !!videoPath.trim();
@@ -150,18 +168,18 @@ export default function StudioClient() {
     const seekTime = getCandidateSeekTime(candidate);
     if (seekTime === null) {
       setErrorMessage("この候補には有効な開始時間がありません");
-      addLog("候補の時刻が無効なため移動できませんでした");
+      addLog("error", "候補の時刻が無効なため選択できませんでした");
       return;
     }
     setSelectedCandidate(candidate);
     seekTo(seekTime);
     setErrorMessage(null);
-    addLog(`候補 #${candidate.rank} を選択: ${formatTimecode(seekTime)}`);
+    addLog("user", `候補 #${candidate.rank} を選択しました（${formatTimecode(seekTime)}から）`);
   }, [addLog, seekTo]);
 
   const handleEditCandidate = useCallback((candidate: HighlightCandidate) => {
     handleSelectCandidate(candidate);
-    addLog(`候補 #${candidate.rank} を編集中 (範囲を調整してください)`);
+    addLog("user", `候補 #${candidate.rank} の範囲を調整します`);
   }, [addLog, handleSelectCandidate]);
 
   const handleLoadVod = useCallback(() => {
@@ -180,7 +198,7 @@ export default function StudioClient() {
     setBatchExportStatus("idle");
     seekTo(0);
     setErrorMessage(null);
-    addLog(`VOD loaded: v${id}`);
+    addLog("user", `Twitch VODを読み込みました（ID: ${id}）`);
   }, [vodUrl, addLog, seekTo]);
 
   const handleCancel = useCallback(() => {
@@ -190,7 +208,7 @@ export default function StudioClient() {
       setIsAnalyzing(false);
       setProgress(0);
       setProgressLabel("");
-      addLog("分析をキャンセルしました");
+      addLog("user", "分析をキャンセルしました");
     }
   }, [abortController, addLog]);
 
@@ -214,30 +232,32 @@ export default function StudioClient() {
           if (event.type === "progress") {
             setProgress(event.progress);
             setProgressLabel(event.message);
-            addLog(event.message);
+            // Only log user-friendly progress
+            const friendly = userFriendlyProgressMessage(event.stage, event.message);
+            if (friendly) addLog("info", friendly);
           } else if (event.type === "result") {
             setVodTitle(event.title);
             setDiagnostic(event.diagnostic ?? null);
             if (event.error) {
-              addLog(`エラー: ${event.error}`);
+              addLog("error", `分析エラー: ${event.error}`);
               setCandidates([]);
               setTimeline([]);
               setErrorMessage(event.error);
             } else {
               if (event.candidates.length > 0) {
-                addLog(`候補生成完了: ${event.candidates.length} 件`);
+                addLog("user", `${event.candidates.length}件の候補を検出しました`);
                 setCandidates(event.candidates);
                 setTimeline(event.timeline ?? []);
                 handleSelectCandidate(event.candidates[0]);
               } else {
-                addLog("チャットから候補を生成できませんでした");
+                addLog("warn", "候補が見つかりませんでした。チャットが静かな可能性があります");
                 setCandidates([]);
                 setTimeline([]);
               }
             }
           } else if (event.type === "error") {
             setErrorMessage(event.error);
-            addLog(`エラー: ${event.error}`);
+            addLog("error", event.error);
           }
         } catch {
           // skip malformed events
@@ -268,7 +288,7 @@ export default function StudioClient() {
     setExportStatus("idle");
     setBatchExportStatus("idle");
     setDiagnostic(null);
-    addLog("分析を開始...");
+    addLog("user", "分析を開始します...");
 
     try {
       const endpoint = mode === "twitch" ? "/api/studio/analyze-vod" : "/api/studio/analyze-local";
@@ -312,11 +332,11 @@ export default function StudioClient() {
       await readStream(res);
     } catch (e) {
       if (e instanceof DOMException && e.name === "AbortError") {
-        addLog("分析がキャンセルされました");
+        addLog("user", "分析をキャンセルしました");
       } else {
         const msg = e instanceof Error ? e.message : "分析に失敗しました";
         setErrorMessage(msg);
-        addLog(`エラー: ${msg}`);
+        addLog("error", msg);
       }
     } finally {
       setIsAnalyzing(false);
@@ -336,7 +356,7 @@ export default function StudioClient() {
     const id = candidate.id ?? candidate.rank;
     setExportingId(id);
     setExportStatus("exporting");
-    addLog(`候補 #${candidate.rank} の書き出しを開始...`);
+    addLog("user", `候補 #${candidate.rank} をMP4で書き出し中...`);
 
     try {
       const start = getStart(candidate);
@@ -349,13 +369,14 @@ export default function StudioClient() {
         duration: formatTimecode(duration),
         mode: "reencode",
       });
-      addLog(`✓ 書き出し完了: ${result.outputPath}`);
+      const fileName = result.outputPath.split("/").pop();
+      addLog("user", `候補 #${candidate.rank} の書き出しが完了しました（${fileName}）`);
       setExportedIds((prev) => new Set(prev).add(id));
       setExportStatus("exported");
     } catch (e) {
       const msg = e instanceof Error ? e.message : "書き出しに失敗しました";
       setErrorMessage(msg);
-      addLog(`✗ 書き出し失敗: ${msg}`);
+      addLog("error", `書き出し失敗: ${msg}`);
       setExportStatus("error");
     } finally {
       setExportingId(null);
@@ -370,7 +391,8 @@ export default function StudioClient() {
     if (candidates.length === 0) return;
 
     setBatchExportStatus("exporting");
-    addLog(`Top 5 候補の一括書き出しを開始 (${Math.min(5, candidates.length)}件)...`);
+    const top5Count = Math.min(5, candidates.length);
+    addLog("user", `上位${top5Count}件を一括書き出し中...`);
 
     try {
       const top5 = candidates.slice(0, 5);
@@ -378,15 +400,17 @@ export default function StudioClient() {
       const newExported = new Set<string | number>(exportedIds);
       top5.forEach((c) => newExported.add(c.id ?? c.rank));
       setExportedIds(newExported);
-      addLog(`✓ 一括書き出し完了: ${result.clips.length}件成功, ${result.failed.length}件失敗`);
-      if (result.failed.length > 0) {
-        result.failed.forEach((f) => addLog(`  ✗ ${f.candidateId}: ${f.error}`));
+      if (result.failed.length === 0) {
+        addLog("user", `${result.clips.length}件の書き出しが完了しました`);
+      } else {
+        addLog("warn", `書き出し完了: ${result.clips.length}件成功、${result.failed.length}件失敗`);
+        result.failed.forEach((f) => addLog("error", `  ${f.candidateId}: ${f.error}`));
       }
       setBatchExportStatus(result.failed.length === 0 ? "exported" : "error");
     } catch (e) {
       const msg = e instanceof Error ? e.message : "一括書き出しに失敗しました";
       setErrorMessage(msg);
-      addLog(`✗ 一括書き出し失敗: ${msg}`);
+      addLog("error", msg);
       setBatchExportStatus("error");
     }
   }, [canExport, candidates, videoPath, exportedIds, addLog]);
@@ -396,25 +420,25 @@ export default function StudioClient() {
   const handleJumpStart = useCallback(() => {
     if (!selectedCandidate) return;
     seekTo(getStart(selectedCandidate));
-    addLog(`▶ Start: ${formatTimecode(getStart(selectedCandidate))}`);
+    addLog("info", `開始位置 (${formatTimecode(getStart(selectedCandidate))}) にジャンプ`);
   }, [selectedCandidate, seekTo, addLog]);
 
   const handleJumpPeak = useCallback(() => {
     if (!selectedCandidate) return;
     seekTo(getPeak(selectedCandidate));
-    addLog(`⭐ Peak: ${formatTimecode(getPeak(selectedCandidate))}`);
+    addLog("info", `盛り上がりピーク (${formatTimecode(getPeak(selectedCandidate))}) にジャンプ`);
   }, [selectedCandidate, seekTo, addLog]);
 
   const handleJumpEnd = useCallback(() => {
     if (!selectedCandidate) return;
     seekTo(Math.max(0, getEnd(selectedCandidate) - 1));
-    addLog(`⏭ End: ${formatTimecode(getEnd(selectedCandidate))}`);
+    addLog("info", `終了位置 (${formatTimecode(getEnd(selectedCandidate))}) にジャンプ`);
   }, [selectedCandidate, seekTo, addLog]);
 
   const handlePreviewRange = useCallback(() => {
     if (!selectedCandidate) return;
     seekTo(getStart(selectedCandidate));
-    addLog(`▶ Preview: ${formatTimecode(getStart(selectedCandidate))} から再生`);
+    addLog("user", `プレビュー範囲を再生します（${formatTimecode(getStart(selectedCandidate))}から）`);
   }, [selectedCandidate, seekTo, addLog]);
 
   const handleSetStartFromCurrent = useCallback(() => {
@@ -429,7 +453,7 @@ export default function StudioClient() {
     };
     setSelectedCandidate(updated);
     setCandidates((prev) => prev.map((c) => (c.rank === selectedCandidate.rank ? updated : c)));
-    addLog(`Start を ${formatTimecode(newStart)} に設定`);
+    addLog("user", `開始位置を ${formatTimecode(newStart)} に設定しました`);
   }, [selectedCandidate, currentTime, addLog]);
 
   const handleSetEndFromCurrent = useCallback(() => {
@@ -443,12 +467,12 @@ export default function StudioClient() {
     };
     setSelectedCandidate(updated);
     setCandidates((prev) => prev.map((c) => (c.rank === selectedCandidate.rank ? updated : c)));
-    addLog(`End を ${formatTimecode(newEnd)} に設定`);
+    addLog("user", `終了位置を ${formatTimecode(newEnd)} に設定しました`);
   }, [selectedCandidate, currentTime, addLog]);
 
   const handleSelectLocalVideo = useCallback(() => {
     setMode("local");
-    addLog("Local File モードに切り替えました");
+    addLog("user", "Local Fileモードに切り替えました。動画ファイルのパスを入力してください。");
   }, [addLog]);
 
   // ─── Time tracking ────────────────────────────────────────────────────────
@@ -479,16 +503,16 @@ export default function StudioClient() {
     <div className="min-h-screen flex flex-col bg-[#050816]">
       {/* Header: only essential controls */}
       <header className="bg-slate-900/80 border-b border-slate-700/50 px-5 py-2.5 flex items-center gap-3 flex-wrap">
-        <h1 className="text-lg font-bold text-violet-300 whitespace-nowrap">Studio</h1>
+        <h1 className="text-lg font-bold text-cyan-300 whitespace-nowrap">切り抜きStudio</h1>
 
         <div className="flex bg-slate-800 rounded-md p-0.5 border border-slate-700">
           <button
             onClick={() => { setMode("twitch"); setVideoId(null); setCandidates([]); setVodTitle(null); }}
-            className={`px-2.5 py-1 text-xs rounded-sm transition-colors ${mode === "twitch" ? "bg-violet-600 text-white" : "text-slate-400 hover:text-slate-200"}`}
+            className={`px-2.5 py-1 text-xs rounded-sm transition-colors ${mode === "twitch" ? "bg-cyan-600 text-white" : "text-slate-400 hover:text-slate-200"}`}
           >Twitch VOD</button>
           <button
             onClick={() => { setMode("local"); setVideoId(null); setCandidates([]); setVodTitle(null); }}
-            className={`px-2.5 py-1 text-xs rounded-sm transition-colors ${mode === "local" ? "bg-violet-600 text-white" : "text-slate-400 hover:text-slate-200"}`}
+            className={`px-2.5 py-1 text-xs rounded-sm transition-colors ${mode === "local" ? "bg-cyan-600 text-white" : "text-slate-400 hover:text-slate-200"}`}
           >Local File</button>
         </div>
 
@@ -498,24 +522,24 @@ export default function StudioClient() {
               <label className="text-[10px] text-slate-500 uppercase tracking-wide">Twitch VOD URL</label>
               <input value={vodUrl} onChange={(e) => setVodUrl(e.target.value)}
                 placeholder="https://www.twitch.tv/videos/123456789"
-                className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500 w-72" />
+                className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-cyan-500 w-72" />
             </div>
             <button onClick={handleLoadVod} disabled={!vodUrl.trim()}
-              className="px-2.5 py-1.5 text-xs rounded bg-slate-700/60 border border-slate-600 text-slate-300 hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed">Load</button>
+              className="px-2.5 py-1.5 text-xs rounded bg-slate-700/60 border border-slate-600 text-slate-300 hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed">読み込み</button>
           </div>
         ) : (
           <div className="flex gap-2 items-end">
             <div className="flex flex-col gap-px">
-              <label className="text-[10px] text-slate-500 uppercase tracking-wide">Video File</label>
+              <label className="text-[10px] text-slate-500 uppercase tracking-wide">動画ファイル</label>
               <input value={videoPath} onChange={(e) => setVideoPath(e.target.value)}
                 placeholder="/path/to/video.mp4"
-                className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500 w-64" />
+                className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-cyan-500 w-64" />
             </div>
             <div className="flex flex-col gap-px">
-              <label className="text-[10px] text-slate-500 uppercase tracking-wide">Chat Log</label>
+              <label className="text-[10px] text-slate-500 uppercase tracking-wide">チャットログ</label>
               <input value={logPath} onChange={(e) => setLogPath(e.target.value)}
                 placeholder="/path/to/chat.json"
-                className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-violet-500 w-64" />
+                className="bg-slate-950 border border-slate-700 text-slate-200 rounded-sm px-1.5 py-0.5 text-xs outline-none focus:border-cyan-500 w-64" />
             </div>
           </div>
         )}
@@ -523,14 +547,16 @@ export default function StudioClient() {
         <div className="flex gap-1.5 ml-auto">
           {isAnalyzing ? (
             <button onClick={handleCancel}
-              className="px-3 py-1.5 text-xs rounded bg-red-600 text-white hover:brightness-110">
+              className="px-3 py-1.5 text-xs rounded bg-red-600 text-white hover:brightness-110 font-semibold"
+            >
               キャンセル
             </button>
           ) : (
             <button onClick={handleAnalyze}
               disabled={mode === "twitch" && !videoId}
-              className="px-3 py-1.5 text-xs rounded bg-violet-600 text-white hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed">
-              🔍 分析開始
+              className="px-3 py-1.5 text-xs rounded bg-cyan-600 text-white hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed font-semibold"
+            >
+              候補を検出する
             </button>
           )}
         </div>
@@ -556,7 +582,7 @@ export default function StudioClient() {
           <div className="flex items-center gap-3">
             <div className="flex-1 bg-slate-700 rounded-full h-2 overflow-hidden">
               <div
-                className="h-full bg-gradient-to-r from-violet-500 to-cyan-400 rounded-full transition-all duration-300 ease-out"
+                className="h-full bg-gradient-to-r from-cyan-500 to-fuchsia-400 rounded-full transition-all duration-300 ease-out"
                 style={{ width: `${Math.max(1, progress)}%` }}
               />
             </div>
@@ -577,14 +603,11 @@ export default function StudioClient() {
 
       {/* Title bar */}
       {vodTitle && (
-        <div className="bg-slate-800/50 border-b border-slate-700/30 px-5 py-1 text-xs text-slate-400 flex justify-between items-center">
-          <span>{vodTitle} · {candidates.length} candidates · {timeline.length} timeline buckets</span>
-          {diagnostic && (
-            <span className="text-slate-500">
-              {diagnostic.fetched_chat_count} chat → {diagnostic.final_candidate_count} candidates
-              (threshold={diagnostic.threshold}, min_gap={diagnostic.min_gap}s)
-            </span>
-          )}
+        <div className="bg-slate-800/50 border-b border-slate-700/30 px-5 py-1.5 text-sm text-slate-200 flex justify-between items-center">
+          <span className="font-semibold">{vodTitle}</span>
+          <span className="text-xs text-slate-400">
+            候補 {candidates.length}件
+          </span>
         </div>
       )}
 
@@ -609,8 +632,18 @@ export default function StudioClient() {
             />
           ) : (
             <div className="glass-panel rounded-lg p-3 flex items-center justify-center h-[200px]">
-              <div className="text-xs text-slate-500">
-                {mode === "twitch" ? 'Twitch VOD URL を入力して "Load" をクリック' : "ローカル動画ファイルのパスを入力"}
+              <div className="text-sm text-slate-400">
+                {mode === "twitch" ? (
+                  <div className="text-center">
+                    <div className="text-2xl mb-2">📺</div>
+                    <div>Twitch VOD URL を入力して「読み込み」をクリック</div>
+                  </div>
+                ) : (
+                  <div className="text-center">
+                    <div className="text-2xl mb-2">🎬</div>
+                    <div>ローカル動画ファイルのパスを入力</div>
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -625,6 +658,7 @@ export default function StudioClient() {
               duration={videoDuration}
               maxTime={maxTime}
               onSeek={seekTo}
+              onSelectCandidate={handleSelectCandidate}
             />
           )}
 
@@ -654,33 +688,18 @@ export default function StudioClient() {
           {selectedCandidate && (
             <CandidateDetails candidate={selectedCandidate} />
           )}
-
-          {/* Export state hint for Twitch mode */}
-          {mode === "twitch" && candidates.length > 0 && (
-            <div className="glass-panel rounded-lg p-2 text-[11px] text-amber-400/80 flex items-center gap-2">
-              <span>ℹ</span>
-              <span>MP4 書き出しにはローカル動画ファイルが必要です。上の「ローカル動画を指定 →」から切り替えるか、Local File モードで再実行してください。</span>
-            </div>
-          )}
         </div>
 
         <div className="flex-[2] flex flex-col min-w-[280px] max-w-[400px] gap-2">
-          {/* Diagnostic panel */}
-          {diagnostic && (
-            <details className="glass-panel rounded-lg p-2.5 text-[10px] text-slate-500" open>
-              <summary className="text-slate-400 cursor-pointer font-semibold text-[11px] uppercase tracking-wider mb-1">分析診断</summary>
-              <div className="grid grid-cols-2 gap-1 mt-1">
-                <div>取得チャット: <span className="text-slate-300">{diagnostic.fetched_chat_count.toLocaleString()}</span></div>
-                <div>タイムライン: <span className="text-slate-300">{diagnostic.timeline_count}</span></div>
-                <div>生候補数: <span className="text-slate-300">{diagnostic.raw_candidate_count}</span></div>
-                <div>しきい値: <span className="text-slate-300">{diagnostic.threshold}</span></div>
-                <div>しきい値通過: <span className="text-slate-300">{diagnostic.candidates_after_threshold}</span></div>
-                <div>間引き後: <span className="text-slate-300">{diagnostic.candidates_after_min_gap}</span></div>
-                <div>最終候補: <span className="text-slate-300 font-medium text-violet-300">{diagnostic.final_candidate_count}</span></div>
-                <div>ウィンドウ: <span className="text-slate-300">{diagnostic.window}s</span></div>
-              </div>
-            </details>
-          )}
+          {/* Export status panel */}
+          <ExportStatusPanel
+            mode={mode}
+            videoPath={videoPath}
+            twitchVodId={videoId}
+            exportedCount={exportedIds.size}
+            totalCandidates={candidates.length}
+            onSelectLocalFile={handleSelectLocalVideo}
+          />
 
           <CandidateList
             candidates={candidates}
@@ -696,7 +715,10 @@ export default function StudioClient() {
       </div>
 
       <div className="px-5 pb-3 pt-2">
-        <LogPanel logs={logs} />
+        <LogPanel
+          logs={logs}
+          diagnostic={diagnostic as Record<string, unknown> | null}
+        />
       </div>
     </div>
   );

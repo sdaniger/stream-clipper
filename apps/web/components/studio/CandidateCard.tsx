@@ -43,33 +43,33 @@ export default function CandidateCard({
       onClick={onSelect}
       className={`rounded-md p-2 mb-1 transition-all duration-100 cursor-pointer ${
         isSelected
-          ? "border border-violet-500 shadow-[0_0_0_1px_#7c3aed] bg-slate-700/80"
+          ? "border border-cyan-500 shadow-[0_0_0_1px_#22d3ee] bg-slate-700/80"
           : "border border-slate-700/60 bg-slate-800/60 hover:border-slate-500"
       }`}
     >
       {/* Row 1: rank · score · exported badge */}
       <div className="flex items-center gap-2 mb-1">
-        <span className="text-sm font-bold text-violet-300">#{c.rank}</span>
+        <span className="text-sm font-bold text-cyan-300">#{c.rank}</span>
         {typeof c.score === "number" && (
           <span className="text-[10px] text-amber-400 font-semibold">score {c.score}</span>
         )}
         {isExported && (
-          <span className="text-[9px] text-emerald-400 font-semibold px-1 py-0.5 rounded bg-emerald-500/10 ml-auto">✓ exported</span>
+          <span className="text-[9px] text-emerald-400 font-semibold px-1 py-0.5 rounded bg-emerald-500/10 ml-auto">✓ 書き出し済み</span>
         )}
       </div>
 
       {/* Row 2: time range */}
-      <div className="text-[11px] text-slate-300 font-mono mb-0.5">
-        {fmt(startTime)} – {fmt(endTime)} <span className="text-slate-500">({fmtDuration(duration)})</span>
+      <div className="text-[11px] text-slate-200 font-mono font-semibold mb-0.5">
+        {fmt(startTime)} – {fmt(endTime)} <span className="text-slate-500 font-normal">({fmtDuration(duration)})</span>
       </div>
 
       {/* Row 3: chat_count · keyword_hits */}
       <div className="text-[10px] text-slate-500 flex items-center gap-2 mb-0.5">
         {typeof c.chat_count === "number" && (
-          <span><span className="text-slate-400">{c.chat_count}</span> msgs</span>
+          <span>コメント <span className="text-slate-300 font-semibold">{c.chat_count}</span></span>
         )}
         {typeof c.keyword_hits === "number" && (
-          <span><span className="text-slate-400">{c.keyword_hits}</span> kw</span>
+          <span>KW <span className="text-slate-300 font-semibold">{c.keyword_hits}</span></span>
         )}
       </div>
 
@@ -87,27 +87,31 @@ export default function CandidateCard({
         </div>
       )}
 
-      {/* Row 5: action buttons */}
+      {/* Row 5: action buttons - 見る / 調整 / 書き出し */}
       <div className="flex gap-1" onClick={(e) => e.stopPropagation()}>
         <button
           onClick={onSelect}
-          className="flex-1 px-1.5 py-0.5 text-[9px] rounded bg-violet-600/20 border border-violet-500/40 text-violet-200 hover:bg-violet-500/30"
+          className={`flex-1 px-1.5 py-0.5 text-[10px] rounded font-semibold ${
+            isSelected
+              ? "bg-cyan-600/40 border border-cyan-500/60 text-cyan-100"
+              : "bg-cyan-600/20 border border-cyan-500/40 text-cyan-200 hover:bg-cyan-500/30"
+          }`}
         >
-          確認
+          見る
         </button>
         <button
           onClick={onEdit}
-          className="flex-1 px-1.5 py-0.5 text-[9px] rounded bg-slate-600/30 border border-slate-500/40 text-slate-300 hover:bg-slate-500/30"
+          className="flex-1 px-1.5 py-0.5 text-[10px] rounded bg-slate-600/30 border border-slate-500/40 text-slate-300 hover:bg-slate-500/30 font-semibold"
         >
-          編集
+          調整
         </button>
         <button
           onClick={onExport}
           disabled={!canExport || isExporting}
           title={!canExport ? "ローカル動画が必要です" : isExported ? "再書き出し" : "書き出し"}
-          className="flex-1 px-1.5 py-0.5 text-[9px] rounded bg-emerald-600/20 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30 disabled:opacity-40 disabled:cursor-not-allowed"
+          className="flex-1 px-1.5 py-0.5 text-[10px] rounded bg-emerald-600/20 border border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30 disabled:opacity-40 disabled:cursor-not-allowed font-semibold"
         >
-          {isExporting ? "⏳" : isExported ? "再書出" : "書出"}
+          {isExporting ? "⏳" : "書き出し"}
         </button>
       </div>
     </div>
