@@ -68,7 +68,7 @@ def _seconds_to_hhmmss(seconds: float) -> str:
     h = int(safe // 3600)
     m = int((safe % 3600) // 60)
     s = safe - h * 3600 - m * 60
-    return f"{h:02d}:{m:02d}:{s:06.3f}".replace(".", ":")
+    return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 
 def _extract_video_id(url: str) -> Optional[str]:

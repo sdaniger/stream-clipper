@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import subprocess
 import time
 import uuid
@@ -24,27 +25,57 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from app.services.job_state import (
+    RENDER_STAGE_WEIGHTS,
     JobStage,
     JobState,
     compute_stage_progress,
     mark_failed,
     update_stage,
 )
+from app.services.platform_utils import is_android, nvenc_disabled_reason
 
 
 def _project_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
+# ─── comment_burn_in_mode resolution ─────────────────────────────────────────
+
+
+_VALID_BURN_IN_MODES = ("off", "preview_overlay", "hard_burn")
+
+
+def _resolve_burn_in_mode(req: "RenderRequest") -> str:
+    """
+    Resolve the effective comment burn-in mode for this render.
+
+    - explicit `comment_burn_in_mode` (when not None) wins
+    - otherwise legacy `with_danmaku=True/False` is mapped
+    - preview_overlay and hard_burn both produce the same MP4 output
+      today (both burn-in), but the flag is preserved in job state so
+      the UI can show the right preview badge
+    """
+    if req.comment_burn_in_mode and req.comment_burn_in_mode in _VALID_BURN_IN_MODES:
+        return req.comment_burn_in_mode
+    return "hard_burn" if req.with_danmaku else "off"
+
+
+def _with_style_preset(
+    options: Optional[Dict[str, Any]],
+    preset: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Merge the style preset into the danmaku options dict without
+    overwriting explicit per-field values. The backend ASS generator
+    already supports `style_preset`; we just pass it through.
+    """
+    out: Dict[str, Any] = dict(options or {})
+    if preset and "style_preset" not in out:
+        out["style_preset"] = preset
+    return out
+
+
 # ─── Range fetch (Twitch VOD via yt-dlp) ────────────────────────────────────
-
-def _seconds_to_hhmmss(seconds: float) -> str:
-    safe = max(0.0, seconds)
-    h = int(safe // 3600)
-    m = int((safe % 3600) // 60)
-    s = safe - h * 3600 - m * 60
-    return f"{h:02d}:{m:02d}:{s:06.3f}".replace(".", ":")
-
 
 def _fetch_twitch_range(
     vod_url: str,
@@ -54,49 +85,36 @@ def _fetch_twitch_range(
     output_dir: Path,
 ) -> Dict[str, Any]:
     """
-    Use yt-dlp --download-sections to fetch a Twitch VOD time range.
-    Returns a dict with ok, output_path, etc.
+    Use twitch_range_fetcher to download a Twitch VOD time range.
+    Delegates to the shared module to avoid duplication.
     """
-    if end <= start:
-        return {"ok": False, "error_code": "INVALID_RANGE", "message": "end <= start"}
-    if (end - start) > 30 * 60:
-        return {"ok": False, "error_code": "RANGE_TOO_LARGE", "message": "Twitch range fetch limited to 30 min"}
+    from app.services.twitch_range_fetcher import (
+        TwitchRangeFetchRequest,
+        fetch_twitch_range,
+    )
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    safe_id = (video_id or "video").replace("/", "_")
-    out_path = output_dir / f"v{safe_id}_{int(start)}_{int(end)}_{uuid.uuid4().hex[:6]}.mp4"
-
-    start_str = _seconds_to_hhmmss(start)
-    end_str = _seconds_to_hhmmss(end)
-    args = [
-        "yt-dlp",
-        "--no-playlist",
-        "--restrict-filenames",
-        "--no-mtime",
-        "-N", "4",
-        "--buffer-size", "32K",
-        "--merge-output-format", "mp4",
-        "-f", "bv*[height<=1080]+ba/best",
-        "-o", str(out_path),
-        "--download-sections", f"*{start_str}-{end_str}",
-        "--force-keyframes-at-cuts",
-        vod_url,
-    ]
-    try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=15 * 60)
-    except FileNotFoundError:
-        return {"ok": False, "error_code": "YT_DLP_NOT_FOUND", "message": "yt-dlp not installed"}
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error_code": "YT_DLP_TIMEOUT", "message": "yt-dlp timed out"}
-    if proc.returncode != 0:
-        return {
-            "ok": False,
-            "error_code": "YT_DLP_FAILED",
-            "message": (proc.stderr or "").strip()[-500:],
-        }
-    if not out_path.is_file() or out_path.stat().st_size == 0:
-        return {"ok": False, "error_code": "OUTPUT_MISSING", "message": f"missing: {out_path}"}
-    return {"ok": True, "output_path": str(out_path)}
+    req = TwitchRangeFetchRequest(
+        vod_url=vod_url,
+        video_id=video_id or None,
+        start_seconds=start,
+        end_seconds=end,
+        output_dir=str(output_dir),
+        format="bv*[height<=1080]+ba/best",
+    )
+    result = fetch_twitch_range(req)
+    if result.ok:
+        if not result.output_path:
+            return {
+                "ok": False,
+                "error_code": "RANGE_FETCH_FAILED",
+                "message": "range fetch reported success but no output_path",
+            }
+        return {"ok": True, "output_path": str(_project_root() / result.output_path)}
+    return {
+        "ok": False,
+        "error_code": result.error_code or "RANGE_FETCH_FAILED",
+        "message": result.message or "range fetch failed",
+    }
 
 
 # ─── ASS generation ────────────────────────────────────────────────────────
@@ -122,10 +140,19 @@ def _generate_ass(
         return {"ok": False, "error_code": "DANMAKU_IMPORT_FAILED", "message": str(e)}
 
     options = danmaku_options or {}
+    # Use Noto Sans JP as default; bundled fonts dir overrides system fonts
+    font_name = options.get("font_name", "Noto Sans JP")
+    fonts_dir = _project_fonts_dir()
+    if fonts_dir.is_dir():
+        # Check if the font file actually exists
+        font_files = list(fonts_dir.glob("*.otf")) + list(fonts_dir.glob("*.ttf"))
+        if not font_files:
+            # Bundled fonts dir exists but is empty -- warn but continue
+            pass
     opts = DanmakuOptions(
         play_res_x=int(options.get("play_res_x", 1920)),
         play_res_y=int(options.get("play_res_y", 1080)),
-        font_name=options.get("font_name", "Noto Sans CJK JP"),
+        font_name=font_name,
         font_size=int(options.get("font_size", 32)),
         comment_duration=float(options.get("comment_duration", 4.0)),
         opacity=float(options.get("opacity", 0.9)),
@@ -133,6 +160,7 @@ def _generate_ass(
         min_message_length=int(options.get("min_message_length", 1)),
         deduplicate_consecutive=bool(options.get("deduplicate_consecutive", True)),
         safety_comment_limit=int(options["safety_comment_limit"]) if options.get("safety_comment_limit") is not None else None,
+        ng_words=list(options.get("ng_words", []) or []),
     )
 
     normalized = []
@@ -174,6 +202,11 @@ def _generate_ass(
 
 # ─── FFmpeg render (hard-burn ASS) ─────────────────────────────────────────
 
+def _project_fonts_dir() -> Path:
+    """Resolve the project's bundled fonts directory."""
+    return Path(__file__).resolve().parents[3] / "assets" / "fonts"
+
+
 def _ffmpeg_burn_ass(
     input_path: Path,
     output_path: Path,
@@ -184,10 +217,14 @@ def _ffmpeg_burn_ass(
     crf: int = 23,
     with_danmaku: bool = True,
     target_aspect: str = "16:9",  # "16:9" | "9:16"
+    fonts_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Run FFmpeg to extract the time range and (optionally) hard-burn the ASS.
     libx264 is always used for the video encoder. -c:v copy is never used.
+
+    If fonts_dir is provided, the ass= filter includes a fontsdir parameter
+    so FFmpeg can find bundled TrueType/OpenType fonts (e.g. NotoSansJP).
     """
     if not input_path.is_file():
         return {"ok": False, "error_code": "INPUT_MISSING", "message": f"missing: {input_path}"}
@@ -203,6 +240,9 @@ def _ffmpeg_burn_ass(
 
     if with_danmaku and ass_path is not None:
         ass_filter_value = str(ass_path).replace("\\", "/").replace(":", "\\:")
+        if fonts_dir is not None and fonts_dir.is_dir():
+            fd = str(fonts_dir.resolve()).replace("\\", "/").replace(":", "\\:")
+            ass_filter_value += f":fontsdir={fd}"
         vf_parts.append(f"ass={ass_filter_value}")
         # When we have a separate (already extracted) range, the start is 0
         # and the full duration is in scope. The caller is expected to pass
@@ -295,6 +335,11 @@ class RenderRequest:
     target_aspect: str = "16:9"  # "16:9" | "9:16"
     streamer_name: Optional[str] = None
     vod_title: Optional[str] = None
+    transcription_provider: Optional[str] = None  # "auto" | "existing" | "whisper_cpp" | "disabled" | None
+    # New: explicit comment display mode (overrides `with_danmaku` if set).
+    comment_burn_in_mode: Optional[str] = None  # "off" | "preview_overlay" | "hard_burn" | None
+    # New: style preset name forwarded to the ASS generator.
+    danmaku_style_preset: Optional[str] = None
 
 
 def run_render_job(job: JobState, req: RenderRequest) -> None:
@@ -319,13 +364,68 @@ def run_render_job(job: JobState, req: RenderRequest) -> None:
         mark_failed(job, "INVALID_RANGE", "clip_end <= clip_start")
         return
 
+    # Preserve original candidate range for chat/ASS filtering
+    candidate_clip_start = clip_start
+    candidate_clip_end = clip_end
+
+    # Use a try/finally to guarantee the temp directory is cleaned up,
+    # even on early `mark_failed` returns.
+    try:
+        _run_render_job_inner(
+            job, req,
+            output_dir=output_dir,
+            options=options,
+            candidate=candidate,
+            candidate_id=candidate_id,
+            rank=rank,
+            kind=kind,
+            candidate_clip_start=candidate_clip_start,
+            candidate_clip_end=candidate_clip_end,
+            clip_start=clip_start,
+            clip_end=clip_end,
+        )
+    finally:
+        tmp_dir = output_dir / "tmp"
+        if tmp_dir.is_dir():
+            try:
+                shutil.rmtree(tmp_dir)
+            except Exception as exc:
+                import logging
+                logging.getLogger("render_job").warning("Temp cleanup failed: %s", exc)
+
+
+def _run_render_job_inner(
+    job: JobState,
+    req: RenderRequest,
+    *,
+    output_dir: Path,
+    options: Dict[str, Any],
+    candidate: Dict[str, Any],
+    candidate_id: str,
+    rank: int,
+    kind: str,
+    candidate_clip_start: float,
+    candidate_clip_end: float,
+    clip_start: float,
+    clip_end: float,
+) -> None:
+    """Inner implementation of run_render_job. Caller is responsible
+    for the outer try/finally that cleans up the temp directory."""
+    # Resolve effective comment burn-in mode (handles new + legacy fields)
+    effective_burn_in = _resolve_burn_in_mode(req)
+    should_burn_danmaku = effective_burn_in in ("hard_burn", "preview_overlay")
+    update_stage(
+        job, job.current_stage, f"コメント: {effective_burn_in}",
+        result_patch={"comment_burn_in_mode": effective_burn_in},
+    )
+
     # ── 1. VOD range fetch ────────────────────────────────────────────
     source_video: Optional[Path] = None
     range_fetch_duration = clip_end - clip_start
     if req.source == "twitch_vod":
         update_stage(
             job, JobStage.VOD_RANGE_FETCHING, "Twitch VOD の範囲を取得中...",
-            compute_stage_progress(JobStage.VOD_RANGE_FETCHING, 0.05),
+            compute_stage_progress(JobStage.VOD_RANGE_FETCHING, 0.05, weights=RENDER_STAGE_WEIGHTS),
         )
         if not req.vod_url:
             mark_failed(job, "VOD_URL_REQUIRED", "Twitch VOD URL が必要です")
@@ -363,7 +463,7 @@ def run_render_job(job: JobState, req: RenderRequest) -> None:
                 source_video = Path(fetch["output_path"])
                 update_stage(
                     job, JobStage.VOD_RANGE_FETCHING, f"Range fetched: {source_video.name}",
-                    compute_stage_progress(JobStage.VOD_RANGE_FETCHING, 1.0),
+                    compute_stage_progress(JobStage.VOD_RANGE_FETCHING, 1.0, weights=RENDER_STAGE_WEIGHTS),
                     result_patch={"temp_video_path": str(source_video.relative_to(_project_root()))},
                 )
                 # Since the fetched file is already the exact range, the
@@ -386,14 +486,14 @@ def run_render_job(job: JobState, req: RenderRequest) -> None:
         update_stage(
             job, JobStage.VOD_RANGE_FETCHING,
             f"Local video: {source_video.name}",
-            compute_stage_progress(JobStage.VOD_RANGE_FETCHING, 1.0),
+            compute_stage_progress(JobStage.VOD_RANGE_FETCHING, 1.0, weights=RENDER_STAGE_WEIGHTS),
             result_patch={"source_video": str(source_video.relative_to(_project_root()))},
         )
     elif req.source == "ass_only":
         update_stage(
             job, JobStage.VOD_RANGE_FETCHING,
             "Skipped (ASS only)",
-            compute_stage_progress(JobStage.VOD_RANGE_FETCHING, 1.0),
+            compute_stage_progress(JobStage.VOD_RANGE_FETCHING, 1.0, weights=RENDER_STAGE_WEIGHTS),
         )
 
     if job.cancelled:
@@ -401,31 +501,56 @@ def run_render_job(job: JobState, req: RenderRequest) -> None:
 
     # ── 2. ASS generation ─────────────────────────────────────────────
     rank_part = f"clip_{rank:03d}" if rank else f"clip_{uuid.uuid4().hex[:6]}"
-    suffix = "_danmaku" if req.with_danmaku else "_clip"
+    suffix = "_danmaku" if should_burn_danmaku else "_clip"
     final_path = output_dir / f"{rank_part}_{kind}{suffix}.mp4"
     ass_path: Optional[Path] = None
     ass_info: Dict[str, Any] = {}
-    if req.with_danmaku:
+    if should_burn_danmaku:
+        # 2a. Comment filtering stage
+        chat_in_range_count = sum(
+            1 for m in (req.chat_messages or [])
+            if isinstance(m, dict) and isinstance(m.get("time_sec", m.get("timestamp")), (int, float))
+            and candidate_clip_start <= float(m.get("time_sec", m.get("timestamp"))) <= candidate_clip_end
+        )
         update_stage(
-            job, JobStage.ASS_GENERATION, "ASS を生成中...",
-            compute_stage_progress(JobStage.ASS_GENERATION, 0.1),
+            job, JobStage.COMMENT_FILTERING,
+            f"表示するコメントを選別中 ({chat_in_range_count}件)",
+            compute_stage_progress(JobStage.COMMENT_FILTERING, 0.3, weights=RENDER_STAGE_WEIGHTS),
+        )
+        if job.cancelled:
+            return
+
+        # 2b. ASS generation stage
+        ass_stage_msg = "弾幕ファイルを生成中..."
+        fonts_dir = _project_fonts_dir()
+        if fonts_dir.is_dir():
+            font_files = list(fonts_dir.glob("*.otf")) + list(fonts_dir.glob("*.ttf"))
+            if font_files:
+                ass_stage_msg = f"日本語フォントを読み込み中 ({font_files[0].name})"
+            else:
+                ass_stage_msg = "弾幕ファイルを生成中 (フォントディレクトリが空です)"
+        elif is_android():
+            ass_stage_msg = "弾幕ファイルを生成中 (システムフォントに依存します)"
+        update_stage(
+            job, JobStage.ASS_GENERATION, ass_stage_msg,
+            compute_stage_progress(JobStage.ASS_GENERATION, 0.1, weights=RENDER_STAGE_WEIGHTS),
         )
         ass_path = output_dir / f"{rank_part}_{kind}.ass"
         if req.source == "ass_only":
             chat_in_range = list(req.chat_messages or [])
         else:
-            # Filter to in-range
+            # Filter to in-range using the original candidate range
             chat_in_range = []
             for m in (req.chat_messages or []):
                 ts = m.get("time_sec", m.get("timestamp"))
-                if isinstance(ts, (int, float)) and clip_start <= float(ts) <= clip_end + (clip_start if source_video and req.source == "twitch_vod" else 0):
+                if isinstance(ts, (int, float)) and candidate_clip_start <= float(ts) <= candidate_clip_end:
                     chat_in_range.append(m)
         ass_info = _generate_ass(
             chat_in_range,
-            clip_start=0.0 if (source_video and req.source == "twitch_vod") else clip_start,
-            clip_end=clip_end,
+            clip_start=candidate_clip_start,
+            clip_end=candidate_clip_end,
             output_path=ass_path,
-            danmaku_options=options,
+            danmaku_options=_with_style_preset(options, req.danmaku_style_preset),
         )
         if not ass_info.get("ok"):
             mark_failed(
@@ -436,14 +561,20 @@ def run_render_job(job: JobState, req: RenderRequest) -> None:
         update_stage(
             job, JobStage.ASS_GENERATION,
             f"ASS done: {ass_info.get('used_count', 0)} comments",
-            compute_stage_progress(JobStage.ASS_GENERATION, 1.0),
+            compute_stage_progress(JobStage.ASS_GENERATION, 1.0, weights=RENDER_STAGE_WEIGHTS),
             result_patch={"ass_path": str(ass_path.relative_to(_project_root())), **ass_info},
         )
     else:
+        # No danmaku: skip both filtering and ASS gen
+        update_stage(
+            job, JobStage.COMMENT_FILTERING,
+            "Skipped (no comments)",
+            compute_stage_progress(JobStage.COMMENT_FILTERING, 1.0, weights=RENDER_STAGE_WEIGHTS),
+        )
         update_stage(
             job, JobStage.ASS_GENERATION,
-            "Skipped (no danmaku)",
-            compute_stage_progress(JobStage.ASS_GENERATION, 1.0),
+            "Skipped (no comments)",
+            compute_stage_progress(JobStage.ASS_GENERATION, 1.0, weights=RENDER_STAGE_WEIGHTS),
         )
 
     if job.cancelled:
@@ -451,13 +582,23 @@ def run_render_job(job: JobState, req: RenderRequest) -> None:
 
     # ── 3. ffmpeg_rendering ──────────────────────────────────────────
     if req.source != "ass_only":
+        # Platform-aware messages
+        ffmpeg_message = "FFmpeg でレンダリング中..."
+        if is_android():
+            ffmpeg_message = "Android環境: h264_nvencは利用不可のため libx264 を使用します"
+        else:
+            nv_reason = nvenc_disabled_reason()
+            if nv_reason:
+                ffmpeg_message = nv_reason
         update_stage(
-            job, JobStage.FFMPEG_RENDERING, "FFmpeg でレンダリング中...",
-            compute_stage_progress(JobStage.FFMPEG_RENDERING, 0.1),
+            job, JobStage.FFMPEG_RENDERING, ffmpeg_message,
+            compute_stage_progress(JobStage.FFMPEG_RENDERING, 0.1, weights=RENDER_STAGE_WEIGHTS),
         )
         if source_video is None:
             mark_failed(job, "NO_SOURCE_VIDEO", "source video not available")
             return
+        # Use bundled fonts dir for ASS subtitle rendering (Japanese glyphs)
+        fonts_dir = _project_fonts_dir()
         render = _ffmpeg_burn_ass(
             input_path=source_video,
             output_path=final_path,
@@ -468,6 +609,7 @@ def run_render_job(job: JobState, req: RenderRequest) -> None:
             crf=req.ffmpeg_crf,
             with_danmaku=req.with_danmaku,
             target_aspect=req.target_aspect,
+            fonts_dir=fonts_dir,
         )
         if not render.get("ok"):
             mark_failed(
@@ -478,23 +620,89 @@ def run_render_job(job: JobState, req: RenderRequest) -> None:
         update_stage(
             job, JobStage.FFMPEG_RENDERING,
             f"レンダリング完了: {final_path.name}",
-            compute_stage_progress(JobStage.FFMPEG_RENDERING, 1.0),
+            compute_stage_progress(JobStage.FFMPEG_RENDERING, 1.0, weights=RENDER_STAGE_WEIGHTS),
             result_patch={"output_path": str(final_path.relative_to(_project_root())), "size_bytes": final_path.stat().st_size},
         )
     else:
         update_stage(
             job, JobStage.FFMPEG_RENDERING,
             "Skipped (ASS only)",
-            compute_stage_progress(JobStage.FFMPEG_RENDERING, 1.0),
+            compute_stage_progress(JobStage.FFMPEG_RENDERING, 1.0, weights=RENDER_STAGE_WEIGHTS),
         )
 
     if job.cancelled:
         return
 
-    # ── 4. metadata_generation ────────────────────────────────────────
+    # ── 5. transcription (optional) ──────────────────────────────────
+    if req.transcription_provider and req.transcription_provider != "disabled":
+        update_stage(
+            job, JobStage.TRANSCRIPTION_STARTED, "文字起こしを開始中...",
+            compute_stage_progress(JobStage.TRANSCRIPTION_STARTED, 0.3, weights=RENDER_STAGE_WEIGHTS),
+        )
+        if job.cancelled:
+            return
+        try:
+            from app.services.transcription_provider import get_transcription_provider
+
+            provider = get_transcription_provider(req.transcription_provider)
+            # Determine which clip to transcribe: prefer final video output
+            transcribe_target: Optional[str] = None
+            if final_path.is_file():
+                transcribe_target = str(final_path)
+            elif source_video and source_video.is_file():
+                transcribe_target = str(source_video)
+            if transcribe_target:
+                update_stage(
+                    job, JobStage.TRANSCRIPTION_SEGMENTING, "音声を解析中...",
+                    compute_stage_progress(JobStage.TRANSCRIPTION_SEGMENTING, 0.3, weights=RENDER_STAGE_WEIGHTS),
+                )
+                result = provider.transcribe(
+                    transcribe_target,
+                    language=options.get("transcription_language", "ja"),
+                )
+                update_stage(
+                    job, JobStage.TRANSCRIPTION_COMPLETED,
+                    f"文字起こし完了: {len(result.segments)} セグメント",
+                    compute_stage_progress(JobStage.TRANSCRIPTION_COMPLETED, 1.0, weights=RENDER_STAGE_WEIGHTS),
+                    result_patch={
+                        "transcript": {
+                            "text": result.text,
+                            "segments": [s.model_dump() for s in result.segments],
+                            "srt": result.srt,
+                            "txt": result.txt,
+                            "outputs": result.outputs.model_dump() if result.outputs else None,
+                            "engine": result.engine,
+                            "model": result.model,
+                        },
+                    },
+                )
+            else:
+                update_stage(
+                    job, JobStage.TRANSCRIPTION_STARTED,
+                    "文字起こしスキップ: 出力動画が見つかりません",
+                    compute_stage_progress(JobStage.TRANSCRIPTION_COMPLETED, 1.0, weights=RENDER_STAGE_WEIGHTS),
+                )
+        except Exception as exc:
+            # Non-fatal: log but don't fail the render
+            update_stage(
+                job, JobStage.TRANSCRIPTION_STARTED,
+                f"文字起こしエラー (スキップ): {exc}",
+                compute_stage_progress(JobStage.TRANSCRIPTION_COMPLETED, 1.0, weights=RENDER_STAGE_WEIGHTS),
+            )
+    else:
+        update_stage(
+            job, JobStage.TRANSCRIPTION_COMPLETED,
+            "Skipped (disabled)",
+            compute_stage_progress(JobStage.TRANSCRIPTION_COMPLETED, 1.0, weights=RENDER_STAGE_WEIGHTS),
+        )
+
+    if job.cancelled:
+        return
+
+    # ── 6. metadata_generation ────────────────────────────────────────
     update_stage(
         job, JobStage.METADATA_GENERATION, "YouTube メタデータを生成中...",
-        compute_stage_progress(JobStage.METADATA_GENERATION, 0.2),
+        compute_stage_progress(JobStage.METADATA_GENERATION, 0.2, weights=RENDER_STAGE_WEIGHTS),
     )
     try:
         # Re-hydrate a Candidate from dict if available
@@ -557,7 +765,7 @@ def run_render_job(job: JobState, req: RenderRequest) -> None:
     update_stage(
         job, JobStage.METADATA_GENERATION,
         f"Metadata saved: {metadata_path.name}",
-        compute_stage_progress(JobStage.METADATA_GENERATION, 1.0),
+        compute_stage_progress(JobStage.METADATA_GENERATION, 1.0, weights=RENDER_STAGE_WEIGHTS),
         result_patch={
             "metadata_path": str(metadata_path.relative_to(_project_root())),
             "youtube": meta.to_dict(),

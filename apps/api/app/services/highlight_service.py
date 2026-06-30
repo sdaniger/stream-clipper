@@ -1,17 +1,12 @@
 from __future__ import annotations
 
 import concurrent.futures
-import hashlib
 import json
-import sys
-from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-# Add the CLI package to sys.path so we can reuse its modules
-_cli_path = Path(__file__).resolve().parents[4] / "packages" / "cli"
-if str(_cli_path) not in sys.path:
-    sys.path.insert(0, str(_cli_path))
+# The CLI package is added to sys.path once in app.main. We rely on that
+# to import the modules below.
 
 from stream_clipper_cli.analyzer import analyze_highlights as _analyze, load_chat, bucket_messages
 from stream_clipper_cli.models import ChatEntry, HighlightCandidate, TimelineRow
@@ -23,16 +18,6 @@ from stream_clipper_cli.scorer import (
     compute_scores,
 )
 from stream_clipper_cli.video import generate_clip as _generate_clip
-
-
-def _cache_key(video_path: str, log_path: str, window: int, top: int,
-               min_gap: float, keywords: str, keyword_weight: float,
-               clip_duration: float, clip_padding: float) -> str:
-    raw = f"{video_path}|{log_path}|{window}|{top}|{min_gap}|{keywords}|{keyword_weight}|{clip_duration}|{clip_padding}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
-
-
-_AnalysisCache = lru_cache(maxsize=32)
 
 
 def analyze(

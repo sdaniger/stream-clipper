@@ -18,8 +18,11 @@ import asyncio
 import json
 import re
 import subprocess
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from app.services.job_state import (
     ANALYZE_STAGE_WEIGHTS,
@@ -90,31 +93,270 @@ def _yt_dlp_metadata(url: str) -> Dict[str, Any]:
     }
 
 
+# ─── In-memory LRU chat cache ─────────────────────────────────────────────────
+
+_CHAT_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+_CHAT_CACHE_LOCK = threading.Lock()
+_CHAT_CACHE_MAX = 10
+
+def _cache_get(vod_id: str) -> Optional[List[Dict[str, Any]]]:
+    with _CHAT_CACHE_LOCK:
+        return _CHAT_CACHE.get(vod_id)
+
+def _cache_set(vod_id: str, messages: List[Dict[str, Any]]) -> None:
+    with _CHAT_CACHE_LOCK:
+        while len(_CHAT_CACHE) >= _CHAT_CACHE_MAX:
+            _CHAT_CACHE.pop(next(iter(_CHAT_CACHE)))
+        _CHAT_CACHE[vod_id] = messages
+
+
+def _fetch_twitch_chat_direct(vod_id: str, max_messages: int = 50000,
+                               on_progress=None,
+                               duration_seconds: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Fetch Twitch VOD chat via parallel segment fetching (mirrors the fast
+    Next.js approach):
+    1. Get an integrity token
+    2. Split the VOD timeline into N segments and fetch each in a thread
+    3. Normalize messages as they arrive (merge fetch + normalize)
+    4. Deduplicate via shared seen_ids set
+    """
+    # Check cache first
+    cached = _cache_get(vod_id)
+    if cached is not None:
+        return {"ok": True, "messages": cached, "cached": True}
+
+    import requests as req
+    GQL_URL = "https://gql.twitch.tv/gql"
+    INTEGRITY_URL = "https://gql.twitch.tv/integrity"
+    CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+    HASH_COMMENTS = "b70a3591ff0f4e0313d126c6a1502d79a1c02baebb288227c582044aa76adf6a"
+    BASE_HEADERS = {
+        "Client-ID": CLIENT_ID,
+        "Content-Type": "text/plain;charset=UTF-8",
+        "Origin": "https://www.twitch.tv",
+        "Referer": "https://www.twitch.tv/",
+    }
+
+    # Get integrity token
+    try:
+        it_resp = req.post(INTEGRITY_URL, json={}, headers=BASE_HEADERS, timeout=10)
+        integrity_token = it_resp.json().get("token", "")
+    except Exception:
+        integrity_token = ""
+
+    headers = dict(BASE_HEADERS)
+    if integrity_token:
+        headers["Client-Integrity"] = integrity_token
+
+    # Determine VOD duration (for segment splitting)
+    duration = duration_seconds or 3600
+    if duration <= 0:
+        duration = 3600
+
+    # Dynamic thread count: 4 for short VODs, up to 16 for long ones
+    thread_count = max(4, min(16, int(duration / 300)))
+    segment_count = min(max_messages // 200, 100)
+    if segment_count < 1:
+        segment_count = 1
+    comments_per_segment = max(200, max_messages // segment_count)
+
+    shared_seen: Set[str] = set()
+    seen_lock = threading.Lock()
+    total = [0]
+    total_lock = threading.Lock()
+    deadline = time.time() + 600  # 10 min timeout
+    results_list: List[List[Dict[str, Any]]] = []
+    results_lock = threading.Lock()
+    progress_interval = max(50, max_messages // 100)
+
+    def _gql_page(offset_sec: int) -> dict:
+        query = [{
+            "operationName": "VideoCommentsByOffsetOrCursor",
+            "variables": {"videoID": vod_id, "contentOffsetSeconds": offset_sec, "first": 100},
+            "extensions": {"persistedQuery": {"version": 1, "sha256Hash": HASH_COMMENTS}}
+        }]
+        resp = req.post(GQL_URL, json=query, headers=headers, timeout=10)
+        return resp.json()
+
+    def _parse_edges(edges: list) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for edge in edges:
+            node = edge.get("node") or {}
+            cid = node.get("id")
+            ts = node.get("contentOffsetSeconds")
+            if ts is None:
+                continue
+            try:
+                ts = round(float(ts), 3)
+            except Exception:
+                continue
+            commenter = node.get("commenter") or {}
+            user = str(commenter.get("displayName") or commenter.get("login") or "unknown")
+            fragments = node.get("message", {}).get("fragments") or []
+            msg = ""
+            for f in fragments:
+                if isinstance(f, dict):
+                    msg += f.get("text", "")
+            if not msg:
+                continue
+            out.append({
+                "timestamp": ts,
+                "author": user,
+                "message": msg.strip(),
+                "_cid": cid or "",
+            })
+        return out
+
+    def fetch_segment(seg_offset: int, seg_limit: int) -> List[Dict[str, Any]]:
+        local_results: List[Dict[str, Any]] = []
+        page_offset = seg_offset
+        stale = 0
+        fetched = 0
+        while fetched < seg_limit:
+            if time.time() >= deadline:
+                break
+            try:
+                data = _gql_page(page_offset)
+            except Exception:
+                stale += 1
+                if stale >= 5:
+                    break
+                page_offset += 60
+                continue
+            if isinstance(data, list) and len(data) > 0:
+                result = data[0]
+            else:
+                stale += 1
+                if stale >= 5:
+                    break
+                page_offset += 60
+                continue
+            if "errors" in result:
+                break
+            edges = result.get("data", {}).get("video", {}).get("comments", {}).get("edges") or []
+            if not edges:
+                stale += 1
+                if stale >= 5:
+                    break
+                page_offset += 60
+                continue
+            stale = 0
+            parsed = _parse_edges(edges)
+            max_os = page_offset
+            for item in parsed:
+                cid = item.pop("_cid", "")
+                ts = item["timestamp"]
+                with seen_lock:
+                    if cid and cid in shared_seen:
+                        continue
+                    if cid:
+                        shared_seen.add(cid)
+                local_results.append(item)
+                fetched += 1
+                if ts > max_os:
+                    max_os = ts
+                if fetched >= seg_limit:
+                    break
+            if fetched < seg_limit:
+                page_offset = int(max_os) + 3
+        return local_results
+
+    executor = ThreadPoolExecutor(max_workers=thread_count)
+    try:
+        futures = {}
+        for seg in range(segment_count):
+            seg_offset = int(seg * duration / segment_count)
+            futures[executor.submit(fetch_segment, seg_offset, comments_per_segment)] = seg
+
+        for future in as_completed(futures):
+            try:
+                segment_msgs = future.result()
+                with total_lock:
+                    total[0] += len(segment_msgs)
+                with results_lock:
+                    results_list.append(segment_msgs)
+                if on_progress:
+                    with total_lock:
+                        current = total[0]
+                    on_progress(min(current, max_messages))
+            except Exception as e:
+                import logging
+                logging.getLogger("analyze_job").warning("Chat segment fetch failed: %s", e)
+
+    finally:
+        executor.shutdown(wait=False)
+
+    # Merge segments (sort by timestamp)
+    all_messages: List[Dict[str, Any]] = []
+    for seg in results_list:
+        all_messages.extend(seg)
+    all_messages.sort(key=lambda m: m["timestamp"])
+    all_messages = all_messages[:max_messages]
+
+    if not all_messages:
+        return {"ok": False, "error_code": "TWITCH_CHAT_FAILED", "message": "No chat messages could be fetched"}
+    if on_progress:
+        on_progress(len(all_messages))
+
+    # Cache
+    _cache_set(vod_id, all_messages)
+
+    return {"ok": True, "messages": all_messages}
+
+
 def _fetch_chat_with_chat_downloader(
     url: str,
     max_messages: int,
     on_progress=None,
+    duration_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Fetch chat with chat-downloader. Runs the `chat_downloader` CLI
-    (`python -m chat_downloader`) and parses its JSON-line stdout.
+    Fetch chat for a VOD URL.
+    For Twitch VODs, uses direct Twitch GQL API (same mechanism as Next.js).
+    For other sources, falls back to chat-downloader CLI.
     """
-    # Resolve python
-    candidates = [
-        "chat_downloader",
-    ]
-    last_err = ""
+    # For Twitch VODs, go directly to API (skip broken chat-downloader CLI)
+    import re as _re
+    m = _re.search(r'(?:twitch\.tv/videos/|videos/)(\d+)', url)
+    if m:
+        vid = m.group(1)
+        result = _fetch_twitch_chat_direct(vid, max_messages, on_progress=on_progress, duration_seconds=duration_seconds)
+        if result.get("ok"):
+            return result
+        # Direct fetch failed, try chat-downloader as fallback
+        last_err = result.get("message", "")
+    else:
+        last_err = ""
+
+    # Fallback: chat-downloader CLI for non-Twitch URLs
+    candidates = ["chat_downloader"]
     for cmd in candidates:
         try:
             proc = subprocess.Popen(
-                [cmd, url, "--max-messages", str(max_messages), "-f", "json"],
+                [cmd, url, "--max_messages", str(max_messages), "--format", "json"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
             messages: List[Dict[str, Any]] = []
-            assert proc.stdout is not None
-            for raw in proc.stdout:
+            if proc.stdout is None:
+                last_err = "chat-downloader stdout unavailable"
+                continue
+            try:
+                # Use communicate() with a generous timeout so the
+                # process cannot block forever if the underlying tool
+                # hangs while producing output.
+                stdout_data, stderr_data = proc.communicate(timeout=600)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.communicate(timeout=10)
+                except Exception:
+                    pass
+                last_err = "chat-downloader timed out"
+                continue
+            for raw in stdout_data.splitlines():
                 line = raw.strip()
                 if not line:
                     continue
@@ -136,11 +378,10 @@ def _fetch_chat_with_chat_downloader(
                     "author": str(author) if author else "",
                     "message": str(msg),
                 })
-                if on_progress and len(messages) % 200 == 0:
+                if on_progress and len(messages) % 50 == 0:
                     on_progress(len(messages))
-            proc.wait(timeout=30)
             if proc.returncode != 0:
-                last_err = (proc.stderr.read() if proc.stderr else "").strip()[-500:]
+                last_err = (stderr_data or "").strip()[-500:]
                 continue
             return {"ok": True, "messages": messages}
         except FileNotFoundError:
@@ -148,6 +389,7 @@ def _fetch_chat_with_chat_downloader(
         except Exception as e:
             last_err = str(e)
             continue
+
     return {"ok": False, "error_code": "CHAT_DOWNLOADER_FAILED", "message": last_err or "unknown"}
 
 
@@ -244,13 +486,15 @@ def run_analyze_job(
         )
     elif vod_url:
         max_messages = 50000
+        vod_dur = (metadata.get("duration_seconds") if metadata else None)
         result = _fetch_chat_with_chat_downloader(
             vod_url, max_messages,
             on_progress=lambda n: update_stage(
                 job, JobStage.CHAT_FETCHING,
-                f"チャット取得中: {n} messages",
+                f"Twitchチャット取得中: {n} メッセージ",
                 compute_stage_progress(JobStage.CHAT_FETCHING, min(0.95, n / max_messages)),
             ),
+            duration_seconds=int(vod_dur) if vod_dur else None,
         )
         if not result.get("ok"):
             mark_failed(
@@ -274,12 +518,19 @@ def run_analyze_job(
         return
 
     # ── 3. chat_normalizing ─────────────────────────────────────────────
+    total_raw = len(raw_chat)
     update_stage(
         job, JobStage.CHAT_NORMALIZING, "チャット正規化中...",
-        compute_stage_progress(JobStage.CHAT_NORMALIZING, 0.5),
+        compute_stage_progress(JobStage.CHAT_NORMALIZING, 0.1),
     )
     normalized: List[Dict[str, Any]] = []
-    for entry in raw_chat:
+    for idx, entry in enumerate(raw_chat):
+        if idx % 500 == 0 and total_raw > 0:
+            update_stage(
+                job, JobStage.CHAT_NORMALIZING,
+                f"チャット正規化中: {idx}/{total_raw}",
+                compute_stage_progress(JobStage.CHAT_NORMALIZING, 0.1 + 0.8 * idx / total_raw),
+            )
         if not isinstance(entry, dict):
             continue
         ts = entry.get("timestamp") or entry.get("time") or entry.get("time_sec")
@@ -341,6 +592,8 @@ def run_analyze_job(
         return
 
     # ── 5. candidate_generation ────────────────────────────────────────
+    if job.cancelled:
+        return
     update_stage(
         job, JobStage.CANDIDATE_GENERATION,
         "候補を生成中...",

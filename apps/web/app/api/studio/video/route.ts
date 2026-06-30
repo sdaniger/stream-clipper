@@ -3,8 +3,41 @@ import { createReadStream } from "node:fs";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { NextResponse } from "next/server";
+import { getMediaRoot } from "@/lib/server/media-service";
 
 export const runtime = "nodejs";
+
+/**
+ * Resolve a project-root-relative path to a workspace-allowed absolute
+ * path. We use this in addition to the file-extension allowlist so a
+ * malicious caller cannot read arbitrary files on the host just by
+ * passing an absolute path. Anything outside the project root and the
+ * media root is rejected.
+ */
+function getProjectRoot() {
+  const cwd = process.cwd();
+  const parent = path.basename(path.dirname(cwd));
+  const current = path.basename(cwd);
+  if (current === "web" && parent === "apps") {
+    return path.resolve(cwd, "../..");
+  }
+  return cwd;
+}
+
+function isWithinAllowedRoots(p: string): boolean {
+  const resolved = path.resolve(p);
+  const candidates = [getProjectRoot(), getMediaRoot()];
+  for (const root of candidates) {
+    try {
+      if (resolved === root) return true;
+      const rel = path.relative(root, resolved);
+      if (!rel.startsWith("..") && !path.isAbsolute(rel)) return true;
+    } catch {
+      continue;
+    }
+  }
+  return false;
+}
 
 export async function GET(request: Request) {
   try {
@@ -14,7 +47,12 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: "path query parameter is required." }, { status: 400 });
     }
 
-    const resolved = path.resolve(filePath.trim());
+    const trimmed = filePath.trim();
+    if (!isWithinAllowedRoots(trimmed)) {
+      return NextResponse.json({ error: "Path is not within an allowed directory." }, { status: 400 });
+    }
+
+    const resolved = path.resolve(trimmed);
     const ext = path.extname(resolved).toLowerCase();
     const videoExts = [".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v"];
     const isVideo = videoExts.includes(ext);
@@ -38,6 +76,10 @@ export async function GET(request: Request) {
         const clampedStart = Math.max(0, Math.min(start, total - 1));
         const clampedEnd = Math.max(clampedStart, Math.min(end, total - 1));
         const chunkSize = clampedEnd - clampedStart + 1;
+
+        if (chunkSize <= 0 || chunkSize > 64 * 1024 * 1024) {
+          return NextResponse.json({ error: "Range not satisfiable" }, { status: 416 });
+        }
 
         const handle = await open(resolved, "r");
         try {

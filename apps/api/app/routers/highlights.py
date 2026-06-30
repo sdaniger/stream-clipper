@@ -28,6 +28,47 @@ from app.services.highlight_service import analyze, generate_clip, batch_generat
 router = APIRouter(prefix="/api/gui", tags=["gui"])
 
 
+# Allowlist of directories the legacy /api/gui/* endpoints may access.
+# Anything outside is rejected with HTTP 400.
+def _allowed_roots() -> list[Path]:
+    """
+    Build the list of directories that the legacy GUI endpoints may read
+    from. We use the project root (where `media/`, `output/`, and the
+    workspace live) plus the current working directory.
+    """
+    candidates: list[Path] = []
+    try:
+        # apps/api/app/routers/highlights.py -> project root is 3 levels up
+        project_root = Path(__file__).resolve().parents[3]
+        candidates.append(project_root)
+        candidates.append(project_root / "media")
+        candidates.append(project_root / "output")
+    except Exception:
+        pass
+    cwd = Path.cwd().resolve()
+    candidates.append(cwd)
+    return candidates
+
+
+def _is_within_allowed_roots(p: Path) -> bool:
+    """
+    Return True if `p` (already resolved) is inside one of the allowed
+    roots. This protects against path traversal via the `path` query
+    parameter.
+    """
+    try:
+        roots = _allowed_roots()
+        for root in roots:
+            try:
+                if p == root or root in p.parents:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+
 @router.get("/health")
 async def health():
     return {"status": "ok", "version": "0.1.0"}
@@ -37,6 +78,8 @@ async def health():
 async def stream_video(path: str, request: Request):
     """Stream a local video file for the GUI preview."""
     video_file = Path(path).resolve()
+    if not _is_within_allowed_roots(video_file):
+        raise HTTPException(status_code=400, detail="Path is not within an allowed directory.")
     if not video_file.exists():
         raise HTTPException(status_code=404, detail=f"Video file not found: {path}")
     if not video_file.is_file():
@@ -51,7 +94,7 @@ async def stream_video(path: str, request: Request):
         start = int(range_match[0]) if range_match[0] else 0
         end = int(range_match[1]) if len(range_match) > 1 and range_match[1] else file_size - 1
 
-        if start >= file_size:
+        if start < 0 or end < start or start >= file_size:
             raise HTTPException(status_code=416, detail="Range not satisfiable")
 
         content_length = end - start + 1
@@ -100,12 +143,28 @@ async def analyze_highlights(req: AnalyzeRequest):
         ]
         fd, temp_path = tempfile.mkstemp(suffix=".json", prefix="stream-clipper-chat-")
         os.close(fd)
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(cli_entries, f, ensure_ascii=False)
+        try:
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(cli_entries, f, ensure_ascii=False)
+        except Exception:
+            # Clean up the temp file if writing fails; the surrounding
+            # `finally` block only fires after we successfully enter the
+            # try-block below.
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
         log_path = temp_path
+    elif log_path:
+        _validated_resolved_path(log_path)
 
     if not log_path or not Path(log_path).exists():
         raise HTTPException(status_code=404, detail=f"Chat log not found: {log_path}")
+
+    # Validate video_path (if provided) is within allowed roots.
+    if req.video_path:
+        _validated_resolved_path(req.video_path)
 
     # Support keywords as list
     kw = req.keywords
@@ -147,6 +206,7 @@ async def analyze_highlights(req: AnalyzeRequest):
 
 @router.post("/clips/create", response_model=ClipCreateResponse)
 async def create_clip(req: ClipCreateRequest):
+    _validated_resolved_path(req.video_path)
     if not Path(req.video_path).exists():
         raise HTTPException(status_code=404, detail=f"Video file not found: {req.video_path}")
 
@@ -169,6 +229,7 @@ async def create_clip(req: ClipCreateRequest):
 
 @router.post("/clips/batch", response_model=ClipBatchResponse)
 async def batch_clips(req: ClipBatchRequest):
+    _validated_resolved_path(req.video_path)
     if not Path(req.video_path).exists():
         raise HTTPException(status_code=404, detail=f"Video file not found: {req.video_path}")
 
@@ -191,6 +252,7 @@ async def batch_clips(req: ClipBatchRequest):
 
 @router.post("/short/create", response_model=ShortCreateResponse)
 async def create_short(req: ShortCreateRequest):
+    _validated_resolved_path(req.video_path)
     if not Path(req.video_path).exists():
         raise HTTPException(status_code=404, detail=f"Video file not found: {req.video_path}")
 
@@ -212,9 +274,22 @@ async def create_short(req: ShortCreateRequest):
     return ShortCreateResponse(output_file=output, success=True)
 
 
+def _validated_resolved_path(p: str) -> Path:
+    """Resolve `p` and confirm it stays inside an allowed root."""
+    try:
+        resolved = Path(p).resolve()
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid path: {p}")
+    if not _is_within_allowed_roots(resolved):
+        raise HTTPException(status_code=400, detail="Path is not within an allowed directory.")
+    return resolved
+
+
 @router.get("/export/json")
 async def export_json(video_path: str, log_path: str, window: int = 30, top: int = 10):
     """Analyze and return JSON export."""
+    _validated_resolved_path(video_path)
+    _validated_resolved_path(log_path)
     try:
         highlights, timeline, metadata = await asyncio.to_thread(
             analyze,
@@ -237,6 +312,8 @@ async def export_json(video_path: str, log_path: str, window: int = 30, top: int
 @router.get("/export/csv")
 async def export_csv(video_path: str, log_path: str, window: int = 30, top: int = 10):
     """Analyze and return CSV export of timeline."""
+    _validated_resolved_path(video_path)
+    _validated_resolved_path(log_path)
     try:
         highlights, timeline, metadata = await asyncio.to_thread(
             analyze,
@@ -266,14 +343,20 @@ async def export_csv(video_path: str, log_path: str, window: int = 30, top: int 
 async def list_output_files(output_dir: str = "output"):
     """List generated files in the output directory."""
     out_path = Path(output_dir)
+    try:
+        out_path = out_path.resolve()
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid output_dir: {output_dir}")
+    if not _is_within_allowed_roots(out_path):
+        raise HTTPException(status_code=400, detail="output_dir is not within an allowed directory.")
     if not out_path.exists() or not out_path.is_dir():
-        return {"files": [], "path": str(out_path.resolve())}
+        return {"files": [], "path": str(out_path)}
     files = []
     for f in sorted(out_path.iterdir()):
         if f.is_file() and f.suffix in (".mp4", ".json", ".csv", ".srt", ".txt"):
             files.append({
                 "name": f.name,
                 "size": f.stat().st_size,
-                "path": str(f.resolve()),
+                "path": str(f),
             })
-    return {"files": files, "path": str(out_path.resolve())}
+    return {"files": files, "path": str(out_path)}

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -37,6 +38,7 @@ from app.services.danmaku_ass import (  # noqa: E402
     NormalizedChatMessage,
     generate_danmaku_ass,
 )
+from app.services.platform_utils import is_android, select_video_encoder  # noqa: E402
 from app.services.twitch_range_fetcher import (  # noqa: E402
     TwitchRangeFetchRequest,
     TwitchRangeFetchResult,
@@ -104,6 +106,10 @@ class DanmakuExportResult:
 
 def _project_root() -> Path:
     return Path(__file__).resolve().parents[3]
+
+
+def _fonts_dir() -> Path:
+    return _project_root() / "assets" / "fonts"
 
 
 def _workspace_media_root() -> Path:
@@ -219,8 +225,12 @@ def _ffmpeg_extract_clip_onepass(
     ]
     if ass_path is not None:
         ass_filter_value = str(ass_path).replace("\\", "/").replace(":", "\\:")
+        fd = _fonts_dir()
+        if fd.is_dir():
+            fd_escaped = str(fd.resolve()).replace("\\", "/").replace(":", "\\:")
+            ass_filter_value += f":fontsdir={fd_escaped}"
         args.extend(["-vf", f"ass={ass_filter_value}"])
-        args.extend(["-c:a", "copy"])
+        args.extend(["-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-c:a", "copy"])
     else:
         args.extend(["-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-c:a", "aac", "-b:a", "128k"])
     args.extend(["-movflags", "+faststart", str(output_path)])
@@ -233,6 +243,16 @@ def _ffmpeg_extract_clip_onepass(
     )
 
 
+def _ass_filter_with_fontsdir(ass_path: Path) -> str:
+    """Build ass= filter value with fontsdir if available."""
+    ass_filter_value = str(ass_path).replace("\\", "/").replace(":", "\\:")
+    fd = _fonts_dir()
+    if fd.is_dir():
+        fd_escaped = str(fd.resolve()).replace("\\", "/").replace(":", "\\:")
+        ass_filter_value += f":fontsdir={fd_escaped}"
+    return ass_filter_value
+
+
 def _ffmpeg_burn_ass(
     clip_path: Path,
     ass_path: Path,
@@ -241,7 +261,7 @@ def _ffmpeg_burn_ass(
     crf: int,
 ) -> subprocess.CompletedProcess:
     """Burn ASS into a pre-extracted clip."""
-    ass_filter_value = str(ass_path).replace("\\", "/").replace(":", "\\:")
+    ass_filter_value = _ass_filter_with_fontsdir(ass_path)
     cmd = [
         "ffmpeg", "-y",
         "-i", str(clip_path),
@@ -271,10 +291,26 @@ def _build_danmaku_options(options: Optional[dict]) -> DanmakuOptions:
         play_res_x=int(options.get("play_res_x", 1920)),
         play_res_y=int(options.get("play_res_y", 1080)),
         font_name=options.get("font_name", "Noto Sans CJK JP"),
-        font_size=int(options.get("font_size", 32)),
+        font_size=int(options.get("font_size", 36)),
         comment_duration=float(options.get("comment_duration", 4.0)),
         opacity=float(options.get("opacity", 0.9)),
+        outline=int(options.get("outline", 2)),
+        shadow=int(options.get("shadow", 1)),
         density=options.get("density", "medium"),
+        style_preset=options.get("style_preset"),
+        max_lanes=options.get("max_lanes"),
+        max_comments_per_second=options.get("max_comments_per_second"),
+        lane_height=options.get("lane_height"),
+        lane_fraction=options.get("lane_fraction"),
+        top_margin=options.get("top_margin"),
+        bottom_margin=options.get("bottom_margin"),
+        horizontal_padding=options.get("horizontal_padding"),
+        long_comment_scale=options.get("long_comment_scale"),
+        emoji_only_scale=options.get("emoji_only_scale"),
+        filter_urls=bool(options.get("filter_urls", True)),
+        filter_repeated_by_user=bool(options.get("filter_repeated_by_user", True)),
+        emoji_spam_limit=options.get("emoji_spam_limit", 10),
+        repeated_user_window_sec=float(options.get("repeated_user_window_sec", 3.0)),
         ng_words=tuple(ng_words),
         min_message_length=int(options.get("min_message_length", 1)),
         deduplicate_consecutive=bool(options.get("deduplicate_consecutive", True)),
@@ -519,7 +555,10 @@ def export_danmaku_clip(req: DanmakuExportRequest) -> DanmakuExportResult:
     # ─── Without-danmaku path: return the clip as the final output ──────
     if not req.with_danmaku:
         if source == "twitch_vod":
-            final_path.write_bytes(source_video_abs.read_bytes())
+            # Stream-copy to avoid loading the entire source video into
+            # memory. shutil.copy2 uses sendfile/copy_file_range when
+            # available and is safe for multi-GB files.
+            shutil.copy2(source_video_abs, final_path)
         else:
             try:
                 _ffmpeg_extract_clip_onepass(

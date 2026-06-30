@@ -24,14 +24,13 @@ const I18nContext = createContext<I18nContextValue | null>(null);
 const storageKey = "stream-clipper-locale";
 
 export function I18nProvider({ children }: { children: ReactNode }) {
-  const [locale, setLocaleState] = useState<Locale>("ja");
-
-  useEffect(() => {
-    const storedLocale = window.localStorage.getItem(storageKey);
-    if (storedLocale === "ja" || storedLocale === "en") {
-      setLocaleState(storedLocale);
+  const [locale, setLocaleState] = useState<Locale>(() => {
+    if (typeof window !== "undefined") {
+      const stored = window.localStorage.getItem(storageKey);
+      if (stored === "ja" || stored === "en") return stored;
     }
-  }, []);
+    return "en";
+  });
 
   useEffect(() => {
     document.documentElement.lang = locale;

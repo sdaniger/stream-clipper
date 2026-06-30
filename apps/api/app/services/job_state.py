@@ -23,8 +23,13 @@ class JobStage(str, enum.Enum):
     TIMELINE_SCORING = "timeline_scoring"
     CANDIDATE_GENERATION = "candidate_generation"
     VOD_RANGE_FETCHING = "vod_range_fetching"
+    COMMENT_FILTERING = "comment_filtering"
     ASS_GENERATION = "ass_generation"
+    PREVIEW_RENDERING = "preview_rendering"
     FFMPEG_RENDERING = "ffmpeg_rendering"
+    TRANSCRIPTION_STARTED = "transcription_started"
+    TRANSCRIPTION_SEGMENTING = "transcription_segmenting"
+    TRANSCRIPTION_COMPLETED = "transcription_completed"
     METADATA_GENERATION = "metadata_generation"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -39,8 +44,13 @@ STAGE_ORDER: List[JobStage] = [
     JobStage.TIMELINE_SCORING,
     JobStage.CANDIDATE_GENERATION,
     JobStage.VOD_RANGE_FETCHING,
+    JobStage.COMMENT_FILTERING,
     JobStage.ASS_GENERATION,
+    JobStage.PREVIEW_RENDERING,
     JobStage.FFMPEG_RENDERING,
+    JobStage.TRANSCRIPTION_STARTED,
+    JobStage.TRANSCRIPTION_SEGMENTING,
+    JobStage.TRANSCRIPTION_COMPLETED,
     JobStage.METADATA_GENERATION,
     JobStage.COMPLETED,
 ]
@@ -59,9 +69,24 @@ ANALYZE_STAGE_WEIGHTS: Dict[JobStage, float] = {
 
 RENDER_STAGE_WEIGHTS: Dict[JobStage, float] = {
     JobStage.VOD_RANGE_FETCHING: 30,
-    JobStage.ASS_GENERATION: 10,
-    JobStage.FFMPEG_RENDERING: 50,
-    JobStage.METADATA_GENERATION: 10,
+    JobStage.COMMENT_FILTERING: 3,
+    JobStage.ASS_GENERATION: 7,
+    JobStage.FFMPEG_RENDERING: 40,
+    JobStage.TRANSCRIPTION_STARTED: 3,
+    JobStage.TRANSCRIPTION_SEGMENTING: 7,
+    JobStage.TRANSCRIPTION_COMPLETED: 5,
+    JobStage.METADATA_GENERATION: 5,
+}
+
+
+# Preview-only jobs use a separate, smaller stage set. The full render
+# pipeline is skipped (no transcription, no metadata) and the cap is
+# 30s of clip at 720p, so the per-stage weights are different.
+PREVIEW_STAGE_WEIGHTS: Dict[JobStage, float] = {
+    JobStage.VOD_RANGE_FETCHING: 40,
+    JobStage.COMMENT_FILTERING: 5,
+    JobStage.ASS_GENERATION: 15,
+    JobStage.PREVIEW_RENDERING: 40,
 }
 
 
@@ -89,6 +114,7 @@ class JobState:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def to_dict(self) -> dict:
+        now = time.time()
         return {
             "job_id": self.job_id,
             "job_kind": self.job_kind,
@@ -99,6 +125,7 @@ class JobState:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "finished_at": self.finished_at,
+            "elapsed_seconds": round(now - self.created_at, 1),
             "result": self.result,
             "error_code": self.error_code,
             "error_message": self.error_message,
@@ -111,12 +138,16 @@ class JobState:
 
 _jobs: Dict[str, JobState] = {}
 _jobs_lock = threading.Lock()
+_MAX_JOBS = 100
 
 
 def create_job(job_kind: str) -> JobState:
     job_id = uuid.uuid4().hex
     job = JobState(job_id=job_id, job_kind=job_kind)
     with _jobs_lock:
+        while len(_jobs) >= _MAX_JOBS:
+            oldest = min(_jobs.keys(), key=lambda k: _jobs[k].created_at)
+            _jobs.pop(oldest, None)
         _jobs[job_id] = job
     return job
 
@@ -141,21 +172,27 @@ def delete_job(job_id: str) -> bool:
 
 
 def cancel_job(job_id: str) -> bool:
-    job = get_job(job_id)
-    if not job:
-        return False
-    with job._lock:
-        if job.status not in (JobStage.COMPLETED, JobStage.FAILED, JobStage.CANCELLED):
-            job.cancelled = True
-            job.status = JobStage.CANCELLED
-            job.finished_at = time.time()
-            job.message = "cancelled"
-            job.history.append({
-                "stage": job.current_stage.value,
-                "message": "cancelled",
-                "ts": job.finished_at,
-            })
-            return True
+    """
+    Atomically cancel a job. The registry lock is held for the entire
+    operation so that a concurrent `delete_job` cannot remove the job
+    between the get and the state mutation.
+    """
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return False
+        with job._lock:
+            if job.status not in (JobStage.COMPLETED, JobStage.FAILED, JobStage.CANCELLED):
+                job.cancelled = True
+                job.status = JobStage.CANCELLED
+                job.finished_at = time.time()
+                job.message = "cancelled"
+                job.history.append({
+                    "stage": job.current_stage.value,
+                    "message": "cancelled",
+                    "ts": job.finished_at,
+                })
+                return True
     return False
 
 
@@ -215,10 +252,14 @@ def compute_stage_progress(
 ) -> float:
     """
     Compute the overall progress (0-100) given the current stage and a
-    0..1 fraction of progress within that stage.
+    0..1 fraction of progress within that stage. Returns 0 for stages
+    outside the configured stage order (e.g. PENDING, FAILED, CANCELLED)
+    instead of falling through to 100.
     """
     if weights is None:
         weights = ANALYZE_STAGE_WEIGHTS
+    if stage not in STAGE_ORDER:
+        return 0.0
     total = 0.0
     for s in STAGE_ORDER:
         if s == stage:

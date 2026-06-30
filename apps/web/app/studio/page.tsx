@@ -1,4 +1,5 @@
 import StudioClient from "./StudioClient";
+import ErrorBoundary from "@/components/ErrorBoundary";
 
 export const metadata = {
   title: "Stream Clipper Studio",
@@ -6,5 +7,9 @@ export const metadata = {
 };
 
 export default function StudioPage() {
-  return <StudioClient />;
+  return (
+    <ErrorBoundary>
+      <StudioClient />
+    </ErrorBoundary>
+  );
 }

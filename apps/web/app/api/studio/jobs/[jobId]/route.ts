@@ -5,8 +5,8 @@ export const dynamic = "force-dynamic";
 
 const API_BASE = process.env.STUDIO_API_BASE_URL ?? "http://127.0.0.1:8000";
 
-export async function GET(_request: NextRequest, ctx: { params: { jobId: string } }) {
-  const jobId = ctx.params.jobId;
+export async function GET(_request: NextRequest, ctx: { params: Promise<{ jobId: string }> }) {
+  const { jobId } = await ctx.params;
   try {
     const res = await fetch(`${API_BASE}/studio/jobs/${jobId}`, {
       method: "GET",
@@ -23,8 +23,8 @@ export async function GET(_request: NextRequest, ctx: { params: { jobId: string 
   }
 }
 
-export async function DELETE(_request: NextRequest, ctx: { params: { jobId: string } }) {
-  const jobId = ctx.params.jobId;
+export async function DELETE(_request: NextRequest, ctx: { params: Promise<{ jobId: string }> }) {
+  const { jobId } = await ctx.params;
   try {
     const res = await fetch(`${API_BASE}/studio/jobs/${jobId}`, {
       method: "DELETE",

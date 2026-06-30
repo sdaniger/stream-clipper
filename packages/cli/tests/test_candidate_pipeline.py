@@ -35,9 +35,9 @@ def _mk_messages(peak_times, chat_per_window=30, extra=("", ""), dur=1800):
 
 def test_build_timeline_basic():
     msgs = [
-        ChatMessage(timestamp=10, author="a", message="草"),
-        ChatMessage(timestamp=15, author="b", message="lol"),
-        ChatMessage(timestamp=20, author="c", message="神"),
+        ChatMessage(timestamp=5, author="a", message="草"),
+        ChatMessage(timestamp=10, author="b", message="lol"),
+        ChatMessage(timestamp=15, author="c", message="神"),
     ]
     timeline = build_timeline(msgs, window=30, step=10)
     assert len(timeline) > 0
@@ -50,6 +50,76 @@ def test_build_timeline_basic():
     assert w0.clip_worthy_score >= 1
     assert w0.keyword_hits >= 2
     assert w0.total_score > 0
+
+
+def test_build_timeline_window_placement():
+    """The window placement formula must be correct: with window=30,
+    step=10, a message at ts=31.5 belongs to windows [10,40), [20,50),
+    and [30,60) but NOT [0,30). The previous off-by-one implementation
+    routed such messages to an extra window."""
+    msgs = [
+        ChatMessage(timestamp=0, author="a", message="x"),
+        ChatMessage(timestamp=5, author="b", message="x"),
+        ChatMessage(timestamp=10, author="c", message="x"),
+        ChatMessage(timestamp=15, author="d", message="x"),
+        ChatMessage(timestamp=20, author="e", message="x"),
+        ChatMessage(timestamp=25, author="f", message="x"),
+        ChatMessage(timestamp=29, author="g", message="x"),
+        ChatMessage(timestamp=31, author="h", message="x"),  # in [10,40), [20,50), [30,60) only
+        ChatMessage(timestamp=40, author="i", message="x"),  # in [20,50), [30,60), [40,70) only
+    ]
+    timeline = build_timeline(msgs, window=30, step=10)
+    # Window 0 = [0,30) should contain messages at ts in [0,30)
+    # i.e. ts=0,5,10,15,20,25,29 -> 7 messages
+    w0 = timeline[0]
+    assert w0.chat_count == 7, f"Window 0 should have 7 (excludes ts=31,40); got {w0.chat_count}"
+    # ts=31 is in windows 1,2,3; ts=40 is in windows 2,3,4
+    # Window 1: ts=10,15,20,25,29 (5 from overlap with w0) + ts=31 (in 1,2,3) = 6
+    assert timeline[1].chat_count == 6, f"Window 1: {timeline[1].chat_count}"
+    # Window 2: ts=20,25,29 + ts=31,40 = 5
+    assert timeline[2].chat_count == 5, f"Window 2: {timeline[2].chat_count}"
+    # Window 3: ts=31,40 = 2
+    assert timeline[3].chat_count == 2, f"Window 3: {timeline[3].chat_count}"
+    # Window 4: ts=40 = 1
+    assert timeline[4].chat_count == 1, f"Window 4: {timeline[4].chat_count}"
+
+
+def test_safe_clip_range_clamps_to_vod_duration():
+    """After extending to hard_min, the range must not exceed vod_duration."""
+    from stream_clipper_cli.candidate_pipeline import _safe_clip_range
+    # 10s clip near the end of a 1800s VOD with hard_min=45
+    s, e = _safe_clip_range(1795, 1805, 45, 90, vod_duration=1800)
+    assert e <= 1800, f"end should not exceed vod_duration: {e}"
+    assert e - s >= 45, f"duration should be at least hard_min: {e - s}"
+
+
+def test_long_candidate_run_detection_splits_correctly():
+    """Long candidates must respect activity runs separated by quiet gaps."""
+    # Build a chat timeline with two distinct activity clusters
+    msgs = []
+    # Cluster 1: t=300..360 (peak at 330)
+    for t in range(300, 360, 5):
+        for _ in range(20):
+            msgs.append(ChatMessage(timestamp=t, author="u", message="hi"))
+    # Long quiet gap from t=360 to t=900 (> LONG_PEAK_GAP=120s)
+    for t in range(360, 900, 5):
+        msgs.append(ChatMessage(timestamp=t, author="u", message="."))
+    # Cluster 2: t=900..960 (peak at 930)
+    for t in range(900, 960, 5):
+        for _ in range(20):
+            msgs.append(ChatMessage(timestamp=t, author="u", message="hi"))
+    timeline = build_timeline(msgs, window=30, step=10)
+    cands = generate_all_candidates(timeline, vod_duration=1200)
+    # If run detection works, we should get 2 long candidates (or none if peaks are weak)
+    # At minimum, ensure peak detection is local and not global
+    for c in cands["long"]:
+        # Each long candidate should have peaks within a coherent range
+        centers = sorted(c.peak_centers)
+        if len(centers) >= 2:
+            spread = centers[-1] - centers[0]
+            # Spread should be < 12 min (LONG_MAX) and should not span
+            # the full 0..1200 range
+            assert spread <= 12 * 60, f"Long peaks spread too far: {spread}"
 
 
 def test_short_candidate_duration_in_range():

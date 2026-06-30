@@ -24,7 +24,13 @@ def load_chat_json(path: Path) -> List[ChatEntry]:
     if not isinstance(data, list):
         raise ValueError("Chat JSON must be a list of objects with 'timestamp' field")
     for item in data:
-        ts: float = item.get("timestamp") or item.get("time") or item.get("createdAt") or 0.0
+        ts: Optional[float] = item.get("timestamp")
+        if ts is None:
+            ts = item.get("time")
+        if ts is None:
+            ts = item.get("createdAt")
+        if ts is None:
+            ts = 0.0
         try:
             ts = float(ts)
         except (ValueError, TypeError):

@@ -16,7 +16,9 @@ export interface HighlightCandidate {
 export interface TimelineRow {
   start: number;
   end: number;
+  center?: number;
   score: number;
+  total_score?: number;
   chat_count: number;
   keyword_hits: number;
   matched_keywords: string[];

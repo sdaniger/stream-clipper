@@ -95,6 +95,7 @@ class TimelineWindow:
 
     def to_dict(self) -> dict:
         d = asdict(self)
+        d["score"] = d["total_score"]
         return d
 
 
@@ -178,11 +179,13 @@ def build_timeline(
         w.update(weights)
     custom_kw = list(custom_keywords or [])
 
-    # Pre-lowercase keyword groups
+    # Pre-lowercase keyword groups. Custom keywords are added only to the
+    # catch-all "reaction" group so a single custom keyword cannot inflate
+    # all four sub-scores (previously they were appended to every group).
     groups = {
-        "laugh": _compile_group(LAUGH_KEYWORDS + custom_kw),
-        "surprise": _compile_group(SURPRISE_KEYWORDS + custom_kw),
-        "clip_worthy": _compile_group(CLIP_WORTHY_KEYWORDS + custom_kw),
+        "laugh": _compile_group(LAUGH_KEYWORDS),
+        "surprise": _compile_group(SURPRISE_KEYWORDS),
+        "clip_worthy": _compile_group(CLIP_WORTHY_KEYWORDS),
         "reaction": _compile_group(REACTION_KEYWORDS + custom_kw),
     }
 
@@ -199,11 +202,12 @@ def build_timeline(
             continue
         max_t = max(max_t, ts)
         # Window starts: i*step where i*step <= ts < i*step + window
-        # Equivalent to i in [ceil((ts - window + 1) / step), floor(ts / step)]
+        # i_min = floor((ts - window) / step) + 1   (smallest i with i*step + window > ts)
+        # i_max = floor(ts / step)                   (largest i with i*step <= ts)
         if ts < window:
             i_min = 0
         else:
-            i_min = int(math.ceil((ts - window + 1) / step))
+            i_min = int(math.floor((ts - window) / step)) + 1
         i_max = int(ts / step)
         for i in range(max(0, i_min), i_max + 1):
             by_window.setdefault(i, []).append(m)

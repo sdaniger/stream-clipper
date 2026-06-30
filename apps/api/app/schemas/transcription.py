@@ -18,6 +18,7 @@ class TranscribeRequest(BaseModel):
     device: str | None = None
     compute_type: str | None = None
     beam_size: int = Field(default=5, ge=1, le=10)
+    provider: str | None = Field(default=None, description="Transcription provider: 'auto', 'existing', 'whisper_cpp', or 'disabled'")
 
 
 class TranscriptSegment(BaseModel):

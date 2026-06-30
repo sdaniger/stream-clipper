@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -8,7 +9,19 @@ from typing import List, Optional
 from stream_clipper_cli.models import HighlightCandidate
 
 
+def _is_android() -> bool:
+    """Detect Android via /system/build.prop (Linux kernel hack)."""
+    try:
+        with open("/system/build.prop", "rb") as f:
+            return b"ro.build.version.sdk" in f.read(4096)
+    except (FileNotFoundError, IOError, PermissionError):
+        return False
+
+
 def _detect_nvenc() -> bool:
+    """Check if h264_nvenc is available.  Always False on Android."""
+    if _is_android():
+        return False
     try:
         result = subprocess.run(
             ["ffmpeg", "-hide_banner", "-encoders"],

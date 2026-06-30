@@ -88,17 +88,24 @@ def _safe_clip_range(
 ) -> Tuple[float, float]:
     """
     Clamp a requested clip range so it sits in [hard_min, hard_max] and
-    inside [0, vod_duration].
+    inside [0, vod_duration]. After extension, the range is re-clamped
+    against vod_duration to avoid running off the end of the VOD.
     """
     start = max(0.0, requested_start)
-    end = requested_end
+    end = max(start, requested_end)
     if vod_duration is not None and vod_duration > 0:
         end = min(end, vod_duration)
         start = min(start, max(0.0, vod_duration - 1.0))
     dur = end - start
     if dur < hard_min:
-        # extend end to hit hard_min
+        # extend end to hit hard_min, then re-clamp against vod_duration
         end = start + hard_min
+        if vod_duration is not None and vod_duration > 0:
+            end = min(end, vod_duration)
+            # If we cannot extend the end further, push start back so the
+            # clip still meets hard_min.
+            if end - start < hard_min:
+                start = max(0.0, end - hard_min)
     if end - start > hard_max:
         end = start + hard_max
     return start, end
@@ -108,7 +115,7 @@ def _aggregate_windows(
     windows: Sequence[TimelineWindow],
     indices: Sequence[int],
 ) -> Dict[str, float]:
-    chat = 0; authors: Set[str] = set()
+    chat = 0
     keyword_hits = 0
     laugh = 0.0; surprise = 0.0; clip_worthy = 0.0; reaction = 0.0
     burst = 0.0; total = 0.0
@@ -116,8 +123,6 @@ def _aggregate_windows(
     for i in indices:
         w = windows[i]
         chat += w.chat_count
-        if w.unique_author_count:
-            authors.update()  # We don't have per-author lists; rely on the per-window count
         keyword_hits += w.keyword_hits
         laugh += w.laugh_score
         surprise += w.surprise_score
@@ -171,7 +176,6 @@ def _dead_air_penalty(
     windows: Sequence[TimelineWindow],
     clip_start: float,
     clip_end: float,
-    step: int,
 ) -> float:
     """
     Penalty for low-activity windows inside the clip range. 0 = no penalty.
@@ -358,7 +362,9 @@ def generate_medium_candidates(
         if len(cluster) < 2:
             # Medium requires 2-3 peaks; treat as short fallback candidate.
             # (We drop it from the medium list; the short list will catch it.)
-            used.discard(i)  # re-release so the short list can still pick it
+            # Re-release all cluster members so the short list can still pick them.
+            for k in cluster:
+                used.discard(k)
             continue
 
         cluster.sort(key=lambda k: windows[k].start)
@@ -377,7 +383,7 @@ def generate_medium_candidates(
 
         agg = _aggregate_windows(windows, cluster)
         coherence = _topic_coherence(windows, cluster)
-        dead_air = _dead_air_penalty(windows, clip_start, clip_end, _infer_step(windows))
+        dead_air = _dead_air_penalty(windows, clip_start, clip_end)
 
         score = agg["total_score"] + coherence * 5.0 - dead_air * 3.0
 
@@ -464,6 +470,34 @@ def _infer_step(windows: Sequence[TimelineWindow]) -> int:
     return int(round(sum(diffs) / len(diffs)))
 
 
+def _local_peaks_within_run(
+    windows: Sequence[TimelineWindow],
+    run: Sequence[int],
+    top_n: int = 8,
+) -> List[int]:
+    """
+    Identify local peak windows within an active run. A local peak is a
+    window whose total_score is >= both immediate neighbors (when present)
+    in the run. We then take the top `top_n` local peaks by total_score.
+    """
+    if not run:
+        return []
+    if len(run) == 1:
+        return [run[0]]
+
+    local_peaks: List[int] = []
+    for pos, idx in enumerate(run):
+        cur = windows[idx].total_score
+        left = windows[run[pos - 1]].total_score if pos > 0 else -math.inf
+        right = windows[run[pos + 1]].total_score if pos < len(run) - 1 else -math.inf
+        if cur >= left and cur >= right and cur > 0:
+            local_peaks.append(idx)
+
+    # Sort by total_score desc and keep top_n
+    local_peaks.sort(key=lambda k: windows[k].total_score, reverse=True)
+    return local_peaks[:top_n]
+
+
 # ─── Long candidates ─────────────────────────────────────────────────────────
 
 def generate_long_candidates(
@@ -489,31 +523,47 @@ def generate_long_candidates(
     if not windows:
         return []
 
-    # Find activity gaps
+    # Find activity runs separated by long quiet gaps. We define a window
+    # as "active" when its chat count is above the threshold (50% of the
+    # median). A run is a maximal consecutive sequence of active windows.
+    # We then merge runs whose temporal gap (the distance from the end of
+    # one run to the start of the next) is <= LONG_PEAK_GAP.
     median_chat = _median([w.chat_count for w in windows]) or 0
     threshold = max(1, int(median_chat * 0.5))
 
-    runs: List[List[int]] = []
+    active_runs: List[List[int]] = []
     current: List[int] = []
-    last_end = -1e9
     for i, w in enumerate(windows):
-        gap = w.start - last_end
-        if current and gap > LONG_PEAK_GAP and w.chat_count < threshold:
-            runs.append(current)
-            current = []
-        current.append(i)
-        last_end = w.end
+        if w.chat_count >= threshold:
+            current.append(i)
+        else:
+            if current:
+                active_runs.append(current)
+                current = []
     if current:
-        runs.append(current)
+        active_runs.append(current)
+
+    # Merge runs that are close together (gap between end of run A and
+    # start of run B is <= LONG_PEAK_GAP).
+    runs: List[List[int]] = []
+    for run in active_runs:
+        if runs:
+            prev_last_idx = runs[-1][-1]
+            gap = windows[run[0]].start - windows[prev_last_idx].end
+            if gap <= LONG_PEAK_GAP:
+                runs[-1] = runs[-1] + run
+                continue
+        runs.append(run)
 
     candidates: List[Candidate] = []
 
     for run in runs:
         if not run:
             continue
-        # Find local peak windows within this run (top by total_score)
-        run_sorted = sorted(run, key=lambda k: windows[k].total_score, reverse=True)
-        peak_indices = run_sorted[:max_peaks]
+        # Pick local peak windows within this run: a local peak is a
+        # window whose total_score is >= both immediate neighbors in the
+        # run. Then we take the top max_peaks of those local peaks.
+        peak_indices = _local_peaks_within_run(windows, run, top_n=max_peaks)
         peak_indices.sort(key=lambda k: windows[k].start)
         peak_count = len(peak_indices)
         if peak_count < min_peak_count:
@@ -534,7 +584,7 @@ def generate_long_candidates(
 
         agg = _aggregate_windows(windows, peak_indices)
         coherence = _topic_coherence(windows, peak_indices)
-        dead_air = _dead_air_penalty(windows, clip_start, clip_end, _infer_step(windows))
+        dead_air = _dead_air_penalty(windows, clip_start, clip_end)
         sustained = _sustained_chat_score(windows, peak_indices)
         avg_score = agg["total_score"] / max(1, peak_count)
         max_peak = max(windows[k].total_score for k in peak_indices)

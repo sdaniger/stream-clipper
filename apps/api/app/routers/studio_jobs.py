@@ -18,10 +18,11 @@ job_state registry.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, List, Optional
+import logging
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, model_validator
 
 from app.services.job_state import (
     JobState,
@@ -32,10 +33,35 @@ from app.services.job_state import (
     list_jobs,
 )
 from app.services.analyze_job import run_analyze_job, run_analyze_job_async
+from app.services.preview_job import PreviewRequest, run_preview_job, run_preview_job_async
 from app.services.render_job import RenderRequest, run_render_job, run_render_job_async
 
 
 router = APIRouter(prefix="/studio/jobs", tags=["studio-jobs"])
+
+
+# ─── Background task tracking ────────────────────────────────────────────────
+# We track in-flight asyncio.Tasks so we can attach a done_callback and
+# surface "Task exception was never retrieved" warnings to the log.
+
+_logger = logging.getLogger("studio_jobs")
+_background_tasks: Set[asyncio.Task] = set()
+
+
+def _track_task(task: asyncio.Task) -> asyncio.Task:
+    """Add the task to the in-flight set and log uncaught exceptions."""
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+    def _log_exception(t: asyncio.Task) -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            _logger.exception("Background job task raised an unhandled exception", exc_info=exc)
+
+    task.add_done_callback(_log_exception)
+    return task
 
 
 # ─── Request/response models ────────────────────────────────────────────────
@@ -52,10 +78,11 @@ class AnalyzeJobRequest(BaseModel):
     custom_keywords: Optional[List[str]] = None
     scoring_weights: Optional[Dict[str, float]] = None
 
-    @field_validator("vod_url", "chat_data")
-    @classmethod
-    def at_least_one_source(cls, v, info):
-        return v
+    @model_validator(mode="after")
+    def at_least_one_source(self):
+        if not self.vod_url and not self.chat_data:
+            raise ValueError("vod_url or chat_data is required")
+        return self
 
 
 class AnalyzeJobResponse(BaseModel):
@@ -75,6 +102,7 @@ class DanmakuOptionsModel(BaseModel):
     min_message_length: int = 1
     deduplicate_consecutive: bool = True
     safety_comment_limit: Optional[int] = None
+    ng_words: Optional[List[str]] = None
 
 
 class RenderJobRequest(BaseModel):
@@ -87,11 +115,34 @@ class RenderJobRequest(BaseModel):
     options: Optional[DanmakuOptionsModel] = None
     output_dir: str = "output/clips"
     with_danmaku: bool = True
+    comment_burn_in_mode: Optional[str] = Field(
+        default=None,
+        description="Comment display mode: 'off' | 'preview_overlay' | 'hard_burn'",
+    )
+    danmaku_style_preset: Optional[str] = Field(
+        default=None,
+        description="Style preset name: niconico_classic | twitch_extension_like | minimal | dense",
+    )
     ffmpeg_preset: str = "veryfast"
     ffmpeg_crf: int = 23
     target_aspect: str = "16:9"
     streamer_name: Optional[str] = None
     vod_title: Optional[str] = None
+    transcription_provider: Optional[str] = Field(default=None, description="Transcription provider: 'auto', 'existing', 'whisper_cpp', 'disabled'")
+
+
+class PreviewJobRequest(BaseModel):
+    candidate: Dict[str, Any]
+    source: str = "twitch_vod"
+    vod_url: Optional[str] = None
+    video_id: Optional[str] = None
+    video_path: Optional[str] = None
+    chat_messages: Optional[List[Dict[str, Any]]] = None
+    options: Optional[DanmakuOptionsModel] = None
+    danmaku_style_preset: Optional[str] = None
+    max_duration_sec: Optional[float] = None
+    preview_width: Optional[int] = None
+    preview_height: Optional[int] = None
 
 
 class JobStateResponse(BaseModel):
@@ -104,6 +155,7 @@ class JobStateResponse(BaseModel):
     created_at: float
     updated_at: float
     finished_at: Optional[float]
+    elapsed_seconds: float = 0.0
     result: Dict[str, Any]
     error_code: Optional[str]
     error_message: Optional[str]
@@ -115,11 +167,14 @@ class JobStateResponse(BaseModel):
 
 @router.post("/analyze", response_model=AnalyzeJobResponse)
 async def start_analyze(req: AnalyzeJobRequest) -> AnalyzeJobResponse:
-    if not req.vod_url and not req.chat_data:
-        raise HTTPException(status_code=400, detail="vod_url or chat_data is required")
+    # Pydantic model_validator on AnalyzeJobRequest already rejects
+    # requests missing both vod_url and chat_data with HTTP 422, so no
+    # manual check is needed here.
     job = create_job("analyze")
-    # Schedule on the event loop without blocking the request.
-    asyncio.create_task(run_analyze_job_async(
+    # Schedule on the event loop without blocking the request. We track
+    # the task so that unhandled exceptions are logged instead of being
+    # silently swallowed by the event loop.
+    _track_task(asyncio.create_task(run_analyze_job_async(
         job=job,
         vod_url=req.vod_url,
         chat_data=req.chat_data,
@@ -131,7 +186,7 @@ async def start_analyze(req: AnalyzeJobRequest) -> AnalyzeJobResponse:
         min_score=req.min_score,
         custom_keywords=req.custom_keywords,
         scoring_weights=req.scoring_weights,
-    ))
+    )))
     return AnalyzeJobResponse(
         job_id=job.job_id,
         status=job.status.value,
@@ -157,8 +212,47 @@ async def start_render(req: RenderJobRequest) -> AnalyzeJobResponse:
         target_aspect=req.target_aspect,
         streamer_name=req.streamer_name,
         vod_title=req.vod_title,
+        transcription_provider=req.transcription_provider,
+        comment_burn_in_mode=req.comment_burn_in_mode,
+        danmaku_style_preset=req.danmaku_style_preset,
     )
     asyncio.create_task(run_render_job_async(job, rr))
+    return AnalyzeJobResponse(
+        job_id=job.job_id,
+        status=job.status.value,
+        message="render job started",
+    )
+
+
+@router.post("/preview-render", response_model=AnalyzeJobResponse)
+async def start_preview_render(req: PreviewJobRequest) -> AnalyzeJobResponse:
+    """Render a short, low-res burn-in preview of a candidate clip.
+
+    The preview uses the same ASS / lane / style pipeline as the full
+    render so the user can see exactly what the final MP4 will look
+    like before committing to the (much slower) full render.
+    """
+    job = create_job("preview")
+    pr = PreviewRequest(
+        candidate=req.candidate,
+        source=req.source,
+        vod_url=req.vod_url,
+        video_id=req.video_id,
+        video_path=req.video_path,
+        chat_messages=req.chat_messages,
+        options=req.options.model_dump() if req.options else {},
+        danmaku_style_preset=req.danmaku_style_preset,
+        max_duration_sec=req.max_duration_sec,
+        preview_width=req.preview_width,
+        preview_height=req.preview_height,
+    )
+    asyncio.create_task(run_preview_job_async(job, pr))
+    return AnalyzeJobResponse(
+        job_id=job.job_id,
+        status=job.status.value,
+        message="preview job started",
+    )
+    _track_task(asyncio.create_task(run_render_job_async(job, rr)))
     return AnalyzeJobResponse(
         job_id=job.job_id,
         status=job.status.value,
@@ -204,18 +298,19 @@ async def cancel_only(job_id: str) -> Dict[str, Any]:
 def _job_to_response(job: JobState) -> JobStateResponse:
     d = job.to_dict()
     return JobStateResponse(
-        job_id=d["job_id"],
-        job_kind=d["job_kind"],
-        status=d["status"],
-        progress=d["progress"],
-        current_stage=d["current_stage"],
-        message=d["message"],
-        created_at=d["created_at"],
-        updated_at=d["updated_at"],
-        finished_at=d["finished_at"],
-        result=d["result"],
-        error_code=d["error_code"],
-        error_message=d["error_message"],
-        cancelled=d["cancelled"],
-        history=d["history"],
+        job_id=d.get("job_id", ""),
+        job_kind=d.get("job_kind", ""),
+        status=d.get("status", "pending"),
+        progress=d.get("progress", 0.0),
+        current_stage=d.get("current_stage", "pending"),
+        message=d.get("message", ""),
+        created_at=d.get("created_at", 0.0),
+        updated_at=d.get("updated_at", 0.0),
+        finished_at=d.get("finished_at"),
+        elapsed_seconds=d.get("elapsed_seconds", 0.0),
+        result=d.get("result", {}),
+        error_code=d.get("error_code"),
+        error_message=d.get("error_message"),
+        cancelled=d.get("cancelled", False),
+        history=d.get("history", []),
     )

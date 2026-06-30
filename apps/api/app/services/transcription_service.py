@@ -192,7 +192,7 @@ def write_outputs(
         "duration_seconds": duration_seconds,
         "clip_path": relative_to_media_root(clip_path),
         "text": text,
-        "segments": [segment.dict() for segment in segments],
+        "segments": [segment.model_dump() for segment in segments],
         "outputs": {
             "srt_path": relative_to_media_root(srt_path),
             "txt_path": relative_to_media_root(txt_path),

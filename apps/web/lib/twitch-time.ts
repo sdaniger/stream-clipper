@@ -13,7 +13,56 @@ export type HighlightCandidate = {
   reasons?: string[];
   title?: string;
   output_file?: string | null;
+  peak_centers?: number[];
 };
+
+/**
+ * Convert a Candidate from the new job-based studio API
+ * (`@/lib/studio-jobs-api`) to the legacy HighlightCandidate shape used by
+ * TimelineGraph and other components. The two types overlap heavily but
+ * the new one uses `candidate_id` instead of `id` and has more optional
+ * fields; this adapter provides a single conversion point so we don't
+ * need `as any` casts at every call site.
+ */
+export function toHighlightCandidate(c: {
+  candidate_id: string;
+  rank: number;
+  start?: number;
+  end?: number;
+  peak_time: number;
+  peak_window_index?: number;
+  clip_start?: number;
+  clip_end?: number;
+  clip_duration: number;
+  score: number;
+  chat_count: number;
+  unique_author_count: number;
+  keyword_hits: number;
+  matched_keywords: string[];
+  reasons: string[];
+  peak_centers: number[];
+  id?: string | number;
+  title?: string;
+  output_file?: string | null;
+}): HighlightCandidate {
+  return {
+    id: c.id ?? c.candidate_id,
+    rank: c.rank,
+    start: c.start,
+    end: c.end,
+    clip_start: c.clip_start,
+    clip_duration: c.clip_duration,
+    peak_time: c.peak_time,
+    score: c.score,
+    chat_count: c.chat_count,
+    keyword_hits: c.keyword_hits,
+    matched_keywords: c.matched_keywords,
+    reasons: c.reasons,
+    title: c.title,
+    output_file: c.output_file ?? null,
+    peak_centers: c.peak_centers,
+  };
+}
 
 export function secondsToTwitchTime(seconds: number): string {
   const safe = Math.max(0, Math.floor(seconds));
