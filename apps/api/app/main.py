@@ -16,10 +16,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.routers.transcription import router as transcription_router
 from app.routers.highlights import router as highlights_router
+from app.routers.studio_jobs import router as studio_jobs_router
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Stream Clipper API", version="0.1.0")
+    app = FastAPI(title="Stream Clipper API", version="0.2.0")
     cors_origins = [
         origin.strip()
         for origin in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173").split(",")
@@ -35,6 +36,7 @@ def create_app() -> FastAPI:
     )
     app.include_router(transcription_router)
     app.include_router(highlights_router)
+    app.include_router(studio_jobs_router)
     return app
 
 

@@ -14,6 +14,7 @@ __pycache__/
 *.py[cod]
 media/input/*
 media/output/*
+apps/output/
 !media/input/.gitkeep
 !media/input/downloads/
 !media/input/downloads/.gitkeep

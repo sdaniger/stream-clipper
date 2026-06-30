@@ -2,10 +2,20 @@
 
 import React from "react";
 import { useI18n } from "@/lib/i18n";
-import type { DanmakuDensity } from "@/lib/studio-api";
 
 export type ExportSource = "twitch_vod" | "local_file" | "ass_only";
 export type FfmpegQuality = "high_speed" | "standard" | "high_quality";
+
+export interface ScoringWeights {
+  chat: number;
+  unique_author: number;
+  keyword: number;
+  laugh: number;
+  surprise: number;
+  clip_worthy: number;
+  reaction: number;
+  burst: number;
+}
 
 interface Props {
   isOpen: boolean;
@@ -14,10 +24,16 @@ interface Props {
   // Detection parameters
   windowSec: number; setWindowSec: (v: number) => void;
   step: number; setStep: (v: number) => void;
-  topN: number; setTopN: (v: number) => void;
+  topShort: number; setTopShort: (v: number) => void;
+  topMedium: number; setTopMedium: (v: number) => void;
+  topLong: number; setTopLong: (v: number) => void;
   minGap: number; setMinGap: (v: number) => void;
   keywordWeight: number; setKeywordWeight: (v: number) => void;
   keywordsText: string; setKeywordsText: (v: string) => void;
+
+  // Scoring weights (advanced)
+  scoringWeights: ScoringWeights;
+  setScoringWeights: (v: ScoringWeights) => void;
 
   // Export source selection
   exportSource: ExportSource;
@@ -30,18 +46,21 @@ interface Props {
   mode: "twitch" | "local";
 
   // Danmaku options
-  density: DanmakuDensity; setDensity: (v: DanmakuDensity) => void;
+  density: "low" | "medium" | "high"; setDensity: (v: "low" | "medium" | "high") => void;
   fontSize: number; setFontSize: (v: number) => void;
   commentDuration: number; setCommentDuration: (v: number) => void;
   opacity: number; setOpacity: (v: number) => void;
   ngWords: string; setNgWords: (v: string) => void;
   minMessageLength: number; setMinMessageLength: (v: number) => void;
-  deduplicateConsecutive: boolean; setDeduplicateConsecutive: (v: boolean) => void;
+  deduplicateConsecutive: boolean;
+  setDeduplicateConsecutive: (v: boolean) => void;
   safetyCommentLimit: number | null; setSafetyCommentLimit: (v: number | null) => void;
 
   // FFmpeg quality
-  quality: FfmpegQuality; setQuality: (v: FfmpegQuality) => void;
-  outputDir: string; setOutputDir: (v: string) => void;
+  quality: FfmpegQuality;
+  setQuality: (v: FfmpegQuality) => void;
+  outputDir: string;
+  setOutputDir: (v: string) => void;
 }
 
 const QUALITY_PRESETS: Record<FfmpegQuality, { preset: string; crf: number; label: string }> = {
@@ -50,15 +69,29 @@ const QUALITY_PRESETS: Record<FfmpegQuality, { preset: string; crf: number; labe
   high_quality: { preset: "medium", crf: 20, label: "高品質" },
 };
 
+const DEFAULT_WEIGHTS: ScoringWeights = {
+  chat: 1.0,
+  unique_author: 0.5,
+  keyword: 2.0,
+  laugh: 1.2,
+  surprise: 1.5,
+  clip_worthy: 1.8,
+  reaction: 1.3,
+  burst: 1.5,
+};
+
 export default function AdvancedSettings({
   isOpen,
   onToggle,
   windowSec, setWindowSec,
   step, setStep,
-  topN, setTopN,
+  topShort, setTopShort,
+  topMedium, setTopMedium,
+  topLong, setTopLong,
   minGap, setMinGap,
   keywordWeight, setKeywordWeight,
   keywordsText, setKeywordsText,
+  scoringWeights, setScoringWeights,
   exportSource, setExportSource,
   vodUrl, videoPath, setVideoPath, logPath, setLogPath, mode,
   density, setDensity,
@@ -73,6 +106,9 @@ export default function AdvancedSettings({
   outputDir, setOutputDir,
 }: Props) {
   const { t } = useI18n();
+  const updateWeight = (key: keyof ScoringWeights, v: number) => {
+    setScoringWeights({ ...scoringWeights, [key]: v });
+  };
 
   return (
     <div className="bg-slate-900/60 border border-slate-700/40 rounded-lg">
@@ -83,233 +119,311 @@ export default function AdvancedSettings({
       >
         <span className="text-[10px] text-slate-500">{isOpen ? "▼" : "▶"}</span>
         <span className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold">
-          {t("studio.advancedTitle")}
+          Advanced Settings
         </span>
-        <span className="text-[10px] text-slate-500">{t("studio.advancedDescription")}</span>
+        <span className="text-[10px] text-slate-500">
+          window / step / scoring weights / local file / ASS only / safety
+        </span>
       </button>
 
       {isOpen && (
         <div className="px-3 pb-3 pt-2 border-t border-slate-800/50 space-y-3">
-          {/* Section: Export source */}
-          <div>
-            <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-1.5 font-semibold">
-              {t("studio.advancedExportSource")}
-            </div>
-            <div className="space-y-1">
-              <label className="flex items-center gap-2 px-2 py-1 rounded cursor-pointer hover:bg-slate-800/40">
-                <input
-                  type="radio"
-                  name="export-source"
-                  value="twitch_vod"
-                  checked={exportSource === "twitch_vod"}
-                  onChange={() => setExportSource("twitch_vod")}
-                  className="accent-cyan-500"
-                />
-                <span className="text-[11px] text-slate-200">{t("studio.advancedSourceTwitchVod")}</span>
-                <span className="text-[9px] text-emerald-400 ml-1">推奨</span>
-              </label>
-              <label className="flex items-center gap-2 px-2 py-1 rounded cursor-pointer hover:bg-slate-800/40">
-                <input
-                  type="radio"
-                  name="export-source"
-                  value="local_file"
-                  checked={exportSource === "local_file"}
-                  onChange={() => setExportSource("local_file")}
-                  className="accent-cyan-500"
-                />
-                <span className="text-[11px] text-slate-200">{t("studio.advancedSourceLocalFile")}</span>
-              </label>
-              <label className="flex items-center gap-2 px-2 py-1 rounded cursor-pointer hover:bg-slate-800/40">
-                <input
-                  type="radio"
-                  name="export-source"
-                  value="ass_only"
-                  checked={exportSource === "ass_only"}
-                  onChange={() => setExportSource("ass_only")}
-                  className="accent-cyan-500"
-                />
-                <span className="text-[11px] text-slate-200">{t("studio.advancedSourceAss")}</span>
-              </label>
-            </div>
-            <div className="text-[9px] text-slate-500 mt-1 ml-1">
-              {t("studio.advancedSourceFallbackHint")}
-            </div>
-            {exportSource === "local_file" && (
-              <div className="mt-2 space-y-1.5">
-                <div className="flex flex-col gap-1">
-                  <label className="text-[10px] text-slate-500 uppercase">{t("studio.advancedLocalFileLabel")}</label>
-                  <input
-                    value={videoPath}
-                    onChange={(e) => setVideoPath(e.target.value)}
-                    placeholder={mode === "local" ? "/path/to/video.mp4" : vodUrl}
-                    className="bg-slate-950 border border-slate-700 text-slate-200 rounded px-2 py-1 text-xs outline-none focus:border-cyan-500"
-                  />
-                </div>
-                <div className="flex flex-col gap-1">
-                  <label className="text-[10px] text-slate-500 uppercase">Chat log path</label>
-                  <input
-                    value={logPath}
-                    onChange={(e) => setLogPath(e.target.value)}
-                    placeholder="/path/to/chat.json"
-                    className="bg-slate-950 border border-slate-700 text-slate-200 rounded px-2 py-1 text-xs outline-none focus:border-cyan-500"
-                  />
-                </div>
-              </div>
-            )}
-          </div>
-
           {/* Section: Detection parameters */}
           <div>
-            <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-1.5 font-semibold">検出パラメータ</div>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-              <div className="flex flex-col gap-0.5">
-                <label className="text-[9px] text-slate-500 uppercase">{t("studio.advancedTopN")}</label>
-                <input type="number" value={topN} min={1} max={50}
-                  onChange={(e) => setTopN(Number(e.target.value) || 10)}
-                  className="bg-slate-950 border border-slate-700 text-slate-200 rounded px-2 py-0.5 text-xs outline-none focus:border-cyan-500" />
-              </div>
-              <div className="flex flex-col gap-0.5">
-                <label className="text-[9px] text-slate-500 uppercase">{t("studio.advancedWindow")}</label>
-                <input type="number" value={windowSec} min={10} step={5}
-                  onChange={(e) => setWindowSec(Number(e.target.value) || 30)}
-                  className="bg-slate-950 border border-slate-700 text-slate-200 rounded px-2 py-0.5 text-xs outline-none focus:border-cyan-500" />
-              </div>
-              <div className="flex flex-col gap-0.5">
-                <label className="text-[9px] text-slate-500 uppercase">{t("studio.advancedStep")}</label>
-                <input type="number" value={step} min={5} step={5}
-                  onChange={(e) => setStep(Number(e.target.value) || 10)}
-                  className="bg-slate-950 border border-slate-700 text-slate-200 rounded px-2 py-0.5 text-xs outline-none focus:border-cyan-500" />
-              </div>
-              <div className="flex flex-col gap-0.5">
-                <label className="text-[9px] text-slate-500 uppercase">{t("studio.advancedMinGap")}</label>
-                <input type="number" value={minGap} min={0} step={5}
-                  onChange={(e) => setMinGap(Number(e.target.value) || 45)}
-                  className="bg-slate-950 border border-slate-700 text-slate-200 rounded px-2 py-0.5 text-xs outline-none focus:border-cyan-500" />
-              </div>
-              <div className="flex flex-col gap-0.5">
-                <label className="text-[9px] text-slate-500 uppercase">{t("studio.advancedKeywordWeight")}</label>
-                <input type="number" value={keywordWeight} min={0.5} max={5.0} step={0.5}
-                  onChange={(e) => setKeywordWeight(Number(e.target.value) || 2.0)}
-                  className="bg-slate-950 border border-slate-700 text-slate-200 rounded px-2 py-0.5 text-xs outline-none focus:border-cyan-500" />
-              </div>
-              <div className="flex flex-col gap-0.5 col-span-2">
-                <label className="text-[9px] text-slate-500 uppercase">{t("studio.advancedKeywords")}</label>
-                <input value={keywordsText} onChange={(e) => setKeywordsText(e.target.value)}
-                  placeholder="カンマ区切り"
-                  className="bg-slate-950 border border-slate-700 text-slate-200 rounded px-2 py-0.5 text-xs outline-none focus:border-cyan-500" />
-              </div>
+            <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-1.5 font-semibold">
+              Detection
             </div>
+            <div className="grid grid-cols-2 gap-2 text-[11px]">
+              <label className="flex flex-col gap-0.5">
+                <span className="text-slate-400">Window (s)</span>
+                <input
+                  type="number"
+                  value={windowSec}
+                  onChange={(e) => setWindowSec(Number(e.target.value))}
+                  className="px-2 py-1 bg-slate-800/60 border border-slate-700/40 rounded text-slate-100"
+                />
+              </label>
+              <label className="flex flex-col gap-0.5">
+                <span className="text-slate-400">Step (s)</span>
+                <input
+                  type="number"
+                  value={step}
+                  onChange={(e) => setStep(Number(e.target.value))}
+                  className="px-2 py-1 bg-slate-800/60 border border-slate-700/40 rounded text-slate-100"
+                />
+              </label>
+              <label className="flex flex-col gap-0.5">
+                <span className="text-slate-400">Min gap (s)</span>
+                <input
+                  type="number"
+                  value={minGap}
+                  onChange={(e) => setMinGap(Number(e.target.value))}
+                  className="px-2 py-1 bg-slate-800/60 border border-slate-700/40 rounded text-slate-100"
+                />
+              </label>
+              <label className="flex flex-col gap-0.5">
+                <span className="text-slate-400">Keyword weight</span>
+                <input
+                  type="number"
+                  step="0.1"
+                  value={keywordWeight}
+                  onChange={(e) => setKeywordWeight(Number(e.target.value))}
+                  className="px-2 py-1 bg-slate-800/60 border border-slate-700/40 rounded text-slate-100"
+                />
+              </label>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2 mt-2 text-[11px]">
+              <label className="flex flex-col gap-0.5">
+                <span className="text-slate-400">Top short</span>
+                <input
+                  type="number"
+                  value={topShort}
+                  onChange={(e) => setTopShort(Number(e.target.value))}
+                  className="px-2 py-1 bg-slate-800/60 border border-slate-700/40 rounded text-slate-100"
+                />
+              </label>
+              <label className="flex flex-col gap-0.5">
+                <span className="text-slate-400">Top medium</span>
+                <input
+                  type="number"
+                  value={topMedium}
+                  onChange={(e) => setTopMedium(Number(e.target.value))}
+                  className="px-2 py-1 bg-slate-800/60 border border-slate-700/40 rounded text-slate-100"
+                />
+              </label>
+              <label className="flex flex-col gap-0.5">
+                <span className="text-slate-400">Top long</span>
+                <input
+                  type="number"
+                  value={topLong}
+                  onChange={(e) => setTopLong(Number(e.target.value))}
+                  className="px-2 py-1 bg-slate-800/60 border border-slate-700/40 rounded text-slate-100"
+                />
+              </label>
+            </div>
+
+            <label className="flex flex-col gap-0.5 mt-2 text-[11px]">
+              <span className="text-slate-400">Extra keywords (comma-separated)</span>
+              <input
+                type="text"
+                value={keywordsText}
+                onChange={(e) => setKeywordsText(e.target.value)}
+                placeholder="草, 笑, lol, 神, ... (default keywords are always included)"
+                className="px-2 py-1 bg-slate-800/60 border border-slate-700/40 rounded text-slate-100"
+              />
+            </label>
           </div>
 
-          {/* Section: Quality preset */}
+          {/* Section: Scoring weights */}
           <div>
-            <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-1.5 font-semibold">FFmpeg 品質</div>
-            <div className="grid grid-cols-3 gap-1.5">
-              {(["high_speed", "standard", "high_quality"] as FfmpegQuality[]).map((q) => (
-                <label
-                  key={q}
-                  className={`flex flex-col items-center gap-0.5 px-1.5 py-1.5 rounded cursor-pointer transition-colors ${
-                    quality === q
-                      ? "bg-cyan-600/30 border border-cyan-500/60"
-                      : "bg-slate-800/40 border border-slate-700/40 hover:bg-slate-700/40"
-                  }`}
-                >
+            <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-1.5 font-semibold flex items-center justify-between">
+              <span>Scoring weights</span>
+              <button
+                type="button"
+                onClick={() => setScoringWeights(DEFAULT_WEIGHTS)}
+                className="text-[9px] text-cyan-400 hover:text-cyan-300 normal-case tracking-normal"
+              >
+                Reset
+              </button>
+            </div>
+            <div className="grid grid-cols-4 gap-2 text-[11px]">
+              {(
+                [
+                  ["chat", "chat"],
+                  ["unique_author", "unique_author"],
+                  ["keyword", "keyword"],
+                  ["laugh", "laugh"],
+                  ["surprise", "surprise"],
+                  ["clip_worthy", "clip_worthy"],
+                  ["reaction", "reaction"],
+                  ["burst", "burst"],
+                ] as [keyof ScoringWeights, string][]
+              ).map(([key, label]) => (
+                <label key={key} className="flex flex-col gap-0.5">
+                  <span className="text-slate-400 text-[10px]">{label}</span>
                   <input
-                    type="radio"
-                    name="quality"
-                    value={q}
-                    checked={quality === q}
-                    onChange={() => setQuality(q)}
-                    className="sr-only"
+                    type="number"
+                    step="0.1"
+                    value={scoringWeights[key]}
+                    onChange={(e) => updateWeight(key, Number(e.target.value))}
+                    className="px-1.5 py-1 bg-slate-800/60 border border-slate-700/40 rounded text-slate-100"
                   />
-                  <span className="text-[11px] font-semibold text-slate-200">{QUALITY_PRESETS[q].label}</span>
-                  <span className="text-[9px] text-slate-500 font-mono">
-                    {QUALITY_PRESETS[q].preset} crf={QUALITY_PRESETS[q].crf}
-                  </span>
                 </label>
               ))}
             </div>
           </div>
 
-          {/* Section: Danmaku options */}
+          {/* Section: Source */}
           <div>
-            <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-1.5 font-semibold">弾幕表示</div>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-              <div className="flex flex-col gap-0.5">
-                <label className="text-[9px] text-slate-500 uppercase">{t("studio.advancedDensity")}</label>
+            <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-1.5 font-semibold">
+              Source
+            </div>
+            <div className="space-y-1">
+              <label className="flex items-center gap-2 px-2 py-1 rounded cursor-pointer hover:bg-slate-800/40">
+                <input
+                  type="radio"
+                  name="adv-source"
+                  checked={exportSource === "twitch_vod"}
+                  onChange={() => setExportSource("twitch_vod")}
+                />
+                <span className="text-[11px]">📺 Twitch VOD (default)</span>
+              </label>
+              <label className="flex items-center gap-2 px-2 py-1 rounded cursor-pointer hover:bg-slate-800/40">
+                <input
+                  type="radio"
+                  name="adv-source"
+                  checked={exportSource === "local_file"}
+                  onChange={() => setExportSource("local_file")}
+                />
+                <span className="text-[11px]">📁 Local file (fallback)</span>
+              </label>
+              <label className="flex items-center gap-2 px-2 py-1 rounded cursor-pointer hover:bg-slate-800/40">
+                <input
+                  type="radio"
+                  name="adv-source"
+                  checked={exportSource === "ass_only"}
+                  onChange={() => setExportSource("ass_only")}
+                />
+                <span className="text-[11px]">📄 ASS only (no video)</span>
+              </label>
+            </div>
+            {exportSource === "local_file" && (
+              <input
+                type="text"
+                value={videoPath}
+                onChange={(e) => setVideoPath(e.target.value)}
+                placeholder="/path/to/video.mp4"
+                className="w-full mt-1.5 px-2 py-1 bg-slate-800/60 border border-slate-700/40 rounded text-[11px] text-slate-200"
+              />
+            )}
+          </div>
+
+          {/* Section: Danmaku */}
+          <div>
+            <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-1.5 font-semibold">
+              Danmaku
+            </div>
+            <div className="grid grid-cols-3 gap-2 text-[11px]">
+              <label className="flex flex-col gap-0.5">
+                <span className="text-slate-400">Density</span>
                 <select
                   value={density}
-                  onChange={(e) => setDensity(e.target.value as DanmakuDensity)}
-                  className="bg-slate-950 border border-slate-700 text-slate-200 rounded px-2 py-0.5 text-xs outline-none focus:border-cyan-500"
+                  onChange={(e) => setDensity(e.target.value as "low" | "medium" | "high")}
+                  className="px-2 py-1 bg-slate-800/60 border border-slate-700/40 rounded text-slate-100"
                 >
-                  <option value="low">low (見やすさ)</option>
-                  <option value="medium">medium (標準)</option>
-                  <option value="high">high (多め)</option>
+                  <option value="low">low</option>
+                  <option value="medium">medium</option>
+                  <option value="high">high</option>
                 </select>
-              </div>
-              <div className="flex flex-col gap-0.5">
-                <label className="text-[9px] text-slate-500 uppercase">{t("studio.advancedFontSize")}</label>
-                <input type="number" value={fontSize} min={8} max={96}
-                  onChange={(e) => setFontSize(Number(e.target.value) || 32)}
-                  className="bg-slate-950 border border-slate-700 text-slate-200 rounded px-2 py-0.5 text-xs outline-none focus:border-cyan-500" />
-              </div>
-              <div className="flex flex-col gap-0.5">
-                <label className="text-[9px] text-slate-500 uppercase">{t("studio.advancedCommentDuration")}</label>
-                <input type="number" value={commentDuration} min={0.5} max={30} step={0.5}
-                  onChange={(e) => setCommentDuration(Number(e.target.value) || 4.0)}
-                  className="bg-slate-950 border border-slate-700 text-slate-200 rounded px-2 py-0.5 text-xs outline-none focus:border-cyan-500" />
-              </div>
-              <div className="flex flex-col gap-0.5">
-                <label className="text-[9px] text-slate-500 uppercase">{t("studio.advancedOpacity")}</label>
-                <input type="number" value={opacity} min={0} max={1} step={0.1}
-                  onChange={(e) => setOpacity(Number(e.target.value) || 0.9)}
-                  className="bg-slate-950 border border-slate-700 text-slate-200 rounded px-2 py-0.5 text-xs outline-none focus:border-cyan-500" />
-              </div>
-              <div className="flex flex-col gap-0.5">
-                <label className="text-[9px] text-slate-500 uppercase">{t("studio.advancedMinLength")}</label>
-                <input type="number" value={minMessageLength} min={0} max={10}
-                  onChange={(e) => setMinMessageLength(Number(e.target.value) || 1)}
-                  className="bg-slate-950 border border-slate-700 text-slate-200 rounded px-2 py-0.5 text-xs outline-none focus:border-cyan-500" />
-              </div>
-              <div className="flex flex-col gap-0.5 col-span-2">
-                <label className="text-[9px] text-slate-500 uppercase">{t("studio.advancedNgWords")}</label>
-                <input value={ngWords} onChange={(e) => setNgWords(e.target.value)}
-                  placeholder="カンマ区切り"
-                  className="bg-slate-950 border border-slate-700 text-slate-200 rounded px-2 py-0.5 text-xs outline-none focus:border-cyan-500" />
-              </div>
+              </label>
+              <label className="flex flex-col gap-0.5">
+                <span className="text-slate-400">Font size</span>
+                <input
+                  type="number"
+                  value={fontSize}
+                  onChange={(e) => setFontSize(Number(e.target.value))}
+                  className="px-2 py-1 bg-slate-800/60 border border-slate-700/40 rounded text-slate-100"
+                />
+              </label>
+              <label className="flex flex-col gap-0.5">
+                <span className="text-slate-400">Duration (s)</span>
+                <input
+                  type="number"
+                  step="0.1"
+                  value={commentDuration}
+                  onChange={(e) => setCommentDuration(Number(e.target.value))}
+                  className="px-2 py-1 bg-slate-800/60 border border-slate-700/40 rounded text-slate-100"
+                />
+              </label>
             </div>
-            <label className="flex items-center gap-1.5 mt-2 text-[11px] text-slate-300 cursor-pointer">
+            <div className="grid grid-cols-2 gap-2 mt-2 text-[11px]">
+              <label className="flex flex-col gap-0.5">
+                <span className="text-slate-400">Opacity</span>
+                <input
+                  type="number"
+                  step="0.05"
+                  min="0"
+                  max="1"
+                  value={opacity}
+                  onChange={(e) => setOpacity(Number(e.target.value))}
+                  className="px-2 py-1 bg-slate-800/60 border border-slate-700/40 rounded text-slate-100"
+                />
+              </label>
+              <label className="flex flex-col gap-0.5">
+                <span className="text-slate-400">Min message length</span>
+                <input
+                  type="number"
+                  value={minMessageLength}
+                  onChange={(e) => setMinMessageLength(Number(e.target.value))}
+                  className="px-2 py-1 bg-slate-800/60 border border-slate-700/40 rounded text-slate-100"
+                />
+              </label>
+            </div>
+            <label className="flex items-center gap-2 mt-2 text-[11px]">
               <input
                 type="checkbox"
                 checked={deduplicateConsecutive}
                 onChange={(e) => setDeduplicateConsecutive(e.target.checked)}
-                className="accent-cyan-500"
               />
-              {t("studio.advancedDeduplicate")}
+              <span>Deduplicate consecutive comments</span>
             </label>
-            <div className="mt-1 flex flex-col gap-0.5">
-              <label className="text-[9px] text-slate-500 uppercase">{t("studio.advancedSafetyLimit")}</label>
+            <label className="flex flex-col gap-0.5 mt-2 text-[11px]">
+              <span className="text-slate-400">NG words (comma-separated)</span>
+              <input
+                type="text"
+                value={ngWords}
+                onChange={(e) => setNgWords(e.target.value)}
+                className="px-2 py-1 bg-slate-800/60 border border-slate-700/40 rounded text-slate-100"
+              />
+            </label>
+            <label className="flex flex-col gap-0.5 mt-2 text-[11px]">
+              <span className="text-slate-400">Safety comment limit (empty=unlimited)</span>
               <input
                 type="number"
                 value={safetyCommentLimit ?? ""}
-                placeholder="空=無制限"
-                onChange={(e) => {
-                  const v = e.target.value;
-                  setSafetyCommentLimit(v === "" ? null : Number(v));
-                }}
-                className="bg-slate-950 border border-slate-700 text-slate-200 rounded px-2 py-0.5 text-xs outline-none focus:border-cyan-500 w-32"
+                onChange={(e) => setSafetyCommentLimit(e.target.value ? Number(e.target.value) : null)}
+                className="px-2 py-1 bg-slate-800/60 border border-slate-700/40 rounded text-slate-100"
               />
+            </label>
+          </div>
+
+          {/* Section: FFmpeg */}
+          <div>
+            <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-1.5 font-semibold">
+              FFmpeg
+            </div>
+            <div className="space-y-1">
+              {(
+                [
+                  ["high_speed", "高速 (ultrafast / crf 26)"],
+                  ["standard", "標準 (veryfast / crf 23)"],
+                  ["high_quality", "高品質 (medium / crf 20)"],
+                ] as [FfmpegQuality, string][]
+              ).map(([q, label]) => (
+                <label key={q} className="flex items-center gap-2 px-2 py-1 rounded cursor-pointer hover:bg-slate-800/40">
+                  <input
+                    type="radio"
+                    name="adv-quality"
+                    checked={quality === q}
+                    onChange={() => setQuality(q)}
+                  />
+                  <span className="text-[11px]">{label}</span>
+                </label>
+              ))}
             </div>
           </div>
 
-          {/* Section: Output directory */}
+          {/* Section: Output */}
           <div>
-            <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-1.5 font-semibold">{t("studio.advancedOutputDir")}</div>
+            <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-1.5 font-semibold">
+              Output
+            </div>
             <input
+              type="text"
               value={outputDir}
               onChange={(e) => setOutputDir(e.target.value)}
-              placeholder="output/danmaku-clips"
-              className="w-full bg-slate-950 border border-slate-700 text-slate-200 rounded px-2 py-1 text-xs outline-none focus:border-cyan-500"
+              className="w-full px-2 py-1 bg-slate-800/60 border border-slate-700/40 rounded text-[11px] text-slate-200"
             />
           </div>
         </div>
