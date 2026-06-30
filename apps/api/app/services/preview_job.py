@@ -193,6 +193,7 @@ def run_preview_job(job: JobState, req: PreviewRequest) -> None:
         preview_h -= 1
 
     # ── 1. VOD range fetch ───────────────────────────────────────────────
+    tmp_dir: Optional[Path] = None
     source_video: Optional[Path] = None
     fetch_ok = True
     if req.source == "twitch_vod":
@@ -435,8 +436,7 @@ def run_preview_job(job: JobState, req: PreviewRequest) -> None:
     )
 
     # Cleanup temp dir
-    tmp_dir = out_dir / f"tmp_{rank_part}"
-    if tmp_dir.is_dir():
+    if tmp_dir is not None and tmp_dir.is_dir():
         try:
             import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)

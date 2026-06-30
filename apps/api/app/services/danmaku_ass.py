@@ -36,7 +36,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 DEFAULT_PLAY_RES_X = 1920
 DEFAULT_PLAY_RES_Y = 1080
 DEFAULT_FONT_NAME = "Noto Sans JP"
-DEFAULT_FONT_SIZE = 36
+DEFAULT_FONT_SIZE = 30
 DEFAULT_OPACITY = 0.9
 DEFAULT_OUTLINE = 2
 DEFAULT_SHADOW = 1
@@ -69,7 +69,7 @@ DENSITY_PRESETS = {
 # explicit option value from the caller.
 STYLE_PRESETS: dict[str, dict[str, object]] = {
     "niconico_classic": {
-        "font_size": 36,
+        "font_size": 30,
         "outline": 2,
         "shadow": 1,
         "opacity": 0.90,
@@ -78,7 +78,7 @@ STYLE_PRESETS: dict[str, dict[str, object]] = {
         "comment_duration": 4.5,
     },
     "twitch_extension_like": {
-        "font_size": 34,
+        "font_size": 28,
         "outline": 2,
         "shadow": 0,
         "opacity": 0.88,
@@ -87,7 +87,7 @@ STYLE_PRESETS: dict[str, dict[str, object]] = {
         "comment_duration": 5.0,
     },
     "minimal": {
-        "font_size": 32,
+        "font_size": 26,
         "outline": 2,
         "shadow": 0,
         "opacity": 0.85,
@@ -96,7 +96,7 @@ STYLE_PRESETS: dict[str, dict[str, object]] = {
         "comment_duration": 5.5,
     },
     "dense": {
-        "font_size": 38,
+        "font_size": 32,
         "outline": 2,
         "shadow": 1,
         "opacity": 0.92,
@@ -238,7 +238,7 @@ def estimate_text_width(text: str, font_size: int) -> int:
     """
     Approximate the rendered pixel width of a comment.
 
-    Heuristic (close enough for ASS \move end_x):
+    Heuristic (close enough for ASS \\move end_x):
     - CJK and full-width characters: ~ 0.60 * font_size
     - Latin / half-width:           ~ 0.35 * font_size
     - Emoji:                        ~ 0.85 * font_size

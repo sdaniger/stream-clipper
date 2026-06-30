@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -156,11 +157,25 @@ def _generate_ass(
         font_size=int(options.get("font_size", 32)),
         comment_duration=float(options.get("comment_duration", 4.0)),
         opacity=float(options.get("opacity", 0.9)),
+        outline=int(options.get("outline", 3)),
+        shadow=int(options.get("shadow", 0)),
         density=options.get("density", "medium"),
         min_message_length=int(options.get("min_message_length", 1)),
         deduplicate_consecutive=bool(options.get("deduplicate_consecutive", True)),
         safety_comment_limit=int(options["safety_comment_limit"]) if options.get("safety_comment_limit") is not None else None,
         ng_words=list(options.get("ng_words", []) or []),
+        style_preset=options.get("style_preset"),
+        max_lanes=options.get("max_lanes"),
+        max_comments_per_second=options.get("max_comments_per_second"),
+        lane_height=options.get("lane_height"),
+        top_margin=options.get("top_margin"),
+        bottom_margin=options.get("bottom_margin"),
+        horizontal_padding=options.get("horizontal_padding"),
+        long_comment_scale=options.get("long_comment_scale"),
+        emoji_only_scale=options.get("emoji_only_scale"),
+        filter_urls=bool(options.get("filter_urls", True)),
+        filter_repeated_by_user=bool(options.get("filter_repeated_by_user", True)),
+        emoji_spam_limit=options.get("emoji_spam_limit"),
     )
 
     normalized = []
@@ -368,27 +383,38 @@ def run_render_job(job: JobState, req: RenderRequest) -> None:
     candidate_clip_start = clip_start
     candidate_clip_end = clip_end
 
+    # Track UUID-based temp dir for cleanup (set during range fetch)
+    tmp_dir_cleanup: Optional[Path] = None
+
     # Use a try/finally to guarantee the temp directory is cleaned up,
     # even on early `mark_failed` returns.
     try:
-        _run_render_job_inner(
-            job, req,
-            output_dir=output_dir,
-            options=options,
-            candidate=candidate,
-            candidate_id=candidate_id,
-            rank=rank,
-            kind=kind,
-            candidate_clip_start=candidate_clip_start,
-            candidate_clip_end=candidate_clip_end,
-            clip_start=clip_start,
-            clip_end=clip_end,
-        )
+        try:
+            _run_render_job_inner(
+                job, req,
+                output_dir=output_dir,
+                options=options,
+                candidate=candidate,
+                candidate_id=candidate_id,
+                rank=rank,
+                kind=kind,
+                candidate_clip_start=candidate_clip_start,
+                candidate_clip_end=candidate_clip_end,
+                clip_start=clip_start,
+                clip_end=clip_end,
+            )
+        except Exception as exc:
+            mark_failed(job, "UNHANDLED_RENDER_ERROR", f"{type(exc).__name__}: {exc}")
+            import logging
+            logging.getLogger("render_job").error(
+                "Unhandled exception in render job %s", job.job_id, exc_info=True,
+            )
     finally:
-        tmp_dir = output_dir / "tmp"
-        if tmp_dir.is_dir():
+        # Use the same UUID-based tmp_dir that was set during range fetch.
+        # If range fetch was not used, tmp_dir_cleanup is None and we skip.
+        if tmp_dir_cleanup is not None and tmp_dir_cleanup.is_dir():
             try:
-                shutil.rmtree(tmp_dir)
+                shutil.rmtree(tmp_dir_cleanup)
             except Exception as exc:
                 import logging
                 logging.getLogger("render_job").warning("Temp cleanup failed: %s", exc)
@@ -445,7 +471,8 @@ def _run_render_job_inner(
                 )
                 return
         else:
-            tmp_dir = output_dir / "tmp"
+            tmp_dir_cleanup = output_dir / f"tmp_{uuid.uuid4().hex[:6]}"
+            tmp_dir = tmp_dir_cleanup
             fetch = _fetch_twitch_range(
                 req.vod_url, req.video_id or "", clip_start, clip_end, tmp_dir,
             )
@@ -607,7 +634,7 @@ def _run_render_job_inner(
             duration=(clip_end - clip_start),
             preset=req.ffmpeg_preset,
             crf=req.ffmpeg_crf,
-            with_danmaku=req.with_danmaku,
+            with_danmaku=should_burn_danmaku,
             target_aspect=req.target_aspect,
             fonts_dir=fonts_dir,
         )
@@ -642,10 +669,10 @@ def _run_render_job_inner(
         if job.cancelled:
             return
         try:
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
             from app.services.transcription_provider import get_transcription_provider
 
             provider = get_transcription_provider(req.transcription_provider)
-            # Determine which clip to transcribe: prefer final video output
             transcribe_target: Optional[str] = None
             if final_path.is_file():
                 transcribe_target = str(final_path)
@@ -656,10 +683,14 @@ def _run_render_job_inner(
                     job, JobStage.TRANSCRIPTION_SEGMENTING, "音声を解析中...",
                     compute_stage_progress(JobStage.TRANSCRIPTION_SEGMENTING, 0.3, weights=RENDER_STAGE_WEIGHTS),
                 )
-                result = provider.transcribe(
-                    transcribe_target,
-                    language=options.get("transcription_language", "ja"),
-                )
+                TRANSCRIPTION_TIMEOUT = int(os.getenv("TRANSCRIPTION_TIMEOUT", "1800"))
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(
+                        provider.transcribe,
+                        transcribe_target,
+                        language=options.get("transcription_language", "ja"),
+                    )
+                    result = future.result(timeout=TRANSCRIPTION_TIMEOUT)
                 update_stage(
                     job, JobStage.TRANSCRIPTION_COMPLETED,
                     f"文字起こし完了: {len(result.segments)} セグメント",
@@ -682,8 +713,13 @@ def _run_render_job_inner(
                     "文字起こしスキップ: 出力動画が見つかりません",
                     compute_stage_progress(JobStage.TRANSCRIPTION_COMPLETED, 1.0, weights=RENDER_STAGE_WEIGHTS),
                 )
+        except FuturesTimeout:
+            update_stage(
+                job, JobStage.TRANSCRIPTION_STARTED,
+                "文字起こしタイムアウト (スキップ): 30分を超えたため中断しました。TRANSCRIPTION_TIMEOUT 環境変数で調整可能",
+                compute_stage_progress(JobStage.TRANSCRIPTION_COMPLETED, 1.0, weights=RENDER_STAGE_WEIGHTS),
+            )
         except Exception as exc:
-            # Non-fatal: log but don't fail the render
             update_stage(
                 job, JobStage.TRANSCRIPTION_STARTED,
                 f"文字起こしエラー (スキップ): {exc}",

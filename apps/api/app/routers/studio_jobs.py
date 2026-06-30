@@ -98,11 +98,25 @@ class DanmakuOptionsModel(BaseModel):
     font_size: int = 32
     comment_duration: float = 4.0
     opacity: float = 0.9
+    outline: int = 3
+    shadow: int = 0
     density: str = "medium"
     min_message_length: int = 1
     deduplicate_consecutive: bool = True
     safety_comment_limit: Optional[int] = None
     ng_words: Optional[List[str]] = None
+    style_preset: Optional[str] = None
+    max_lanes: Optional[int] = None
+    max_comments_per_second: Optional[int] = None
+    lane_height: Optional[int] = None
+    top_margin: Optional[int] = None
+    bottom_margin: Optional[int] = None
+    horizontal_padding: Optional[int] = None
+    long_comment_scale: Optional[float] = None
+    emoji_only_scale: Optional[float] = None
+    filter_urls: bool = True
+    filter_repeated_by_user: bool = True
+    emoji_spam_limit: Optional[int] = 10
 
 
 class RenderJobRequest(BaseModel):
@@ -216,7 +230,7 @@ async def start_render(req: RenderJobRequest) -> AnalyzeJobResponse:
         comment_burn_in_mode=req.comment_burn_in_mode,
         danmaku_style_preset=req.danmaku_style_preset,
     )
-    asyncio.create_task(run_render_job_async(job, rr))
+    _track_task(asyncio.create_task(run_render_job_async(job, rr)))
     return AnalyzeJobResponse(
         job_id=job.job_id,
         status=job.status.value,
@@ -246,17 +260,11 @@ async def start_preview_render(req: PreviewJobRequest) -> AnalyzeJobResponse:
         preview_width=req.preview_width,
         preview_height=req.preview_height,
     )
-    asyncio.create_task(run_preview_job_async(job, pr))
+    _track_task(asyncio.create_task(run_preview_job_async(job, pr)))
     return AnalyzeJobResponse(
         job_id=job.job_id,
         status=job.status.value,
         message="preview job started",
-    )
-    _track_task(asyncio.create_task(run_render_job_async(job, rr)))
-    return AnalyzeJobResponse(
-        job_id=job.job_id,
-        status=job.status.value,
-        message="render job started",
     )
 
 

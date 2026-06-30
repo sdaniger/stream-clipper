@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useI18n } from "@/lib/i18n";
 import { StudioCommentOverlay } from "./CommentOverlay";
 import {
@@ -33,6 +33,8 @@ export type VideoPlayerProps = {
   twitchVideoId?: string | null;
   /** Twitch VOD start offset (seconds) for parent+offset embedding */
   startSeconds?: number;
+  /** Bump this to force a full iframe reload (e.g. when user selects a candidate) */
+  reloadKey?: number;
   /** Aspect ratio (9:16 or 16:9) */
   aspect: "16:9" | "9:16";
   /** Current candidate (for overlay context) */
@@ -93,6 +95,7 @@ export default function VideoPlayer({
   src,
   twitchVideoId,
   startSeconds = 0,
+  reloadKey,
   aspect,
   candidate,
   chatMessages = [],
@@ -108,24 +111,128 @@ export default function VideoPlayer({
   const { locale } = useI18n();
   const isJa = locale === "ja";
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const [internalTime, setInternalTime] = useState(currentTime);
   const [internalPlaying, setInternalPlaying] = useState(playing);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const twitchTimeRef = useRef(currentTime);
+  const twitchPlayingRef = useRef(false);
 
-  // Sync external state -> internal
+  // ── Twitch iframe: postMessage time tracking ──────────────────────────
   useEffect(() => {
+    if (sourceType !== "twitch") return;
+
+    const handleMessage = (e: MessageEvent) => {
+      try {
+        const payload = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
+        if (!payload?.event) return;
+
+        const absTime = payload.data?.currentTime;
+        if (typeof absTime === "number") {
+          const relTime = Math.max(0, absTime - startSeconds);
+          twitchTimeRef.current = relTime;
+          setInternalTime(relTime);
+          onTimeUpdate?.(relTime);
+        }
+
+        if (payload.event === "player-playing") {
+          setInternalPlaying(true);
+          twitchPlayingRef.current = true;
+        } else if (payload.event === "player-paused" || payload.event === "player-ended") {
+          setInternalPlaying(false);
+          twitchPlayingRef.current = false;
+        }
+      } catch {}
+    };
+
+    window.addEventListener("message", handleMessage);
+    return () => window.removeEventListener("message", handleMessage);
+  }, [sourceType, startSeconds, onTimeUpdate]);
+
+  // Simulated time ticker for Twitch (0.5s fallback when no timeupdate events)
+  useEffect(() => {
+    if (sourceType !== "twitch") return;
+    const interval = setInterval(() => {
+      if (twitchPlayingRef.current) {
+        twitchTimeRef.current += 0.5;
+        setInternalTime(twitchTimeRef.current);
+        onTimeUpdate?.(twitchTimeRef.current);
+      }
+    }, 500);
+    return () => clearInterval(interval);
+  }, [sourceType, onTimeUpdate]);
+
+  // Reset tracking state when the iframe reloads (startSeconds changed)
+  useEffect(() => {
+    twitchTimeRef.current = currentTime;
+    twitchPlayingRef.current = false;
+  }, [startSeconds]);
+
+  // Sync external currentTime → Twitch seek (>2s delta avoids echo loop)
+  useEffect(() => {
+    if (sourceType !== "twitch") return;
+    const absTime = startSeconds + currentTime;
+    const currentAbs = twitchTimeRef.current + startSeconds;
+    if (Math.abs(absTime - currentAbs) < 2) return;
+
+    const doSeek = () => {
+      if (iframeRef.current?.contentWindow) {
+        try {
+          iframeRef.current.contentWindow.postMessage(
+            JSON.stringify({ event: "video.seek", data: { time: absTime } }),
+            "*",
+          );
+        } catch {}
+        twitchTimeRef.current = currentTime;
+        setInternalTime(currentTime);
+        return true;
+      }
+      return false;
+    };
+
+    if (!doSeek()) {
+      const id = setTimeout(doSeek, 600);
+      return () => clearTimeout(id);
+    }
+  }, [currentTime, sourceType, startSeconds]);
+
+  // ── end Twitch tracking ─────────────────────────────────────────────────
+
+  // Listen for fullscreen changes
+  useEffect(() => {
+    const onChange = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
+
+  const toggleFullscreen = useCallback(() => {
+    if (!document.fullscreenElement) {
+      containerRef.current?.requestFullscreen().catch(() => {});
+    } else {
+      document.exitFullscreen().catch(() => {});
+    }
+  }, []);
+
+  // Sync external state -> internal (for non-Twitch sources)
+  useEffect(() => {
+    if (sourceType === "twitch") return;
     setInternalTime(currentTime);
-  }, [currentTime]);
+  }, [currentTime, sourceType]);
   useEffect(() => {
+    if (sourceType === "twitch") return;
     setInternalPlaying(playing);
     const v = videoRef.current;
     if (v) {
       if (playing && v.paused) v.play().catch(() => {});
       if (!playing && !v.paused) v.pause();
     }
-  }, [playing]);
+  }, [playing, sourceType]);
 
+  // Show canvas overlay as a lightweight preview for any non-"off" mode
+  // while the source is still raw (not yet rendered / preview-burned).
   const showOverlay =
-    commentMode === "preview_overlay" && (sourceType === "local" || sourceType === "twitch");
+    commentMode !== "off" && (sourceType === "local" || sourceType === "twitch");
   const showIframe = sourceType === "twitch" && !!twitchVideoId;
   const showVideo = (sourceType === "local" || sourceType === "preview" || sourceType === "rendered") && !!src;
 
@@ -152,11 +259,12 @@ export default function VideoPlayer({
           )}
         </div>
       )}
-      <div className="relative bg-black">
-        <div className={`relative ${aspectClass} w-full`}>
+      <div ref={containerRef} className="relative bg-black">
+        <div className={`relative ${aspectClass} w-full ${isFullscreen ? "!aspect-auto !h-full" : ""}`}>
           {showIframe ? (
             <iframe
-              src={`https://player.twitch.tv/?video=${twitchVideoId}&parent=${typeof window !== "undefined" ? window.location.hostname : "localhost"}&time=${Math.max(0, Math.floor(startSeconds + (currentTime || 0)))}s`}
+              ref={iframeRef}
+              src={`https://player.twitch.tv/?video=${twitchVideoId}&parent=${typeof window !== "undefined" ? window.location.hostname : "localhost"}&time=${Math.max(0, Math.floor(startSeconds))}s&autoplay=true`}
               allowFullScreen
               className="absolute inset-0 w-full h-full"
             />
@@ -188,7 +296,7 @@ export default function VideoPlayer({
             </div>
           )}
 
-          {showOverlay && showVideo && (
+          {showOverlay && (
             <StudioCommentOverlay
               chatMessages={chatMessages}
               clipStartSec={candidate?.clip_start ?? 0}
@@ -205,47 +313,63 @@ export default function VideoPlayer({
           {showOverlay && (
             <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent px-2 pt-3 pb-1.5 text-[9px] leading-snug pointer-events-none z-20">
               <div className="text-cyan-200/80 font-semibold">
-                {isJa ? "軽量プレビュー" : "Lightweight preview"}
+                {commentMode === "hard_burn"
+                  ? (isJa ? "焼き込みプレビュー" : "Burn-in preview")
+                  : (isJa ? "軽量プレビュー" : "Lightweight preview")}
               </div>
               <div className="text-slate-300/70">
-                {isJa
-                  ? "この表示は確認用です。本番MP4に焼き込むには『MP4に焼き込み』を選んでください。"
-                  : "For preview only. Choose \u201cBurn to MP4\u201d to bake comments into the video."}
+                {commentMode === "hard_burn"
+                  ? (isJa ? "実際のMP4とは見た目が異なる場合があります" : "Preview may differ from the final MP4")
+                  : (isJa ? "この表示は確認用です。本番MP4に焼き込むには『MP4に焼き込み』を選んでください。"
+                     : "For preview only. Choose \u201cBurn to MP4\u201d to bake comments into the video.")}
               </div>
             </div>
           )}
 
-          {/* Custom controls for local/preview/rendered video */}
-          {showVideo && !showIframe && (
+          {/* Custom controls */}
+          {(showVideo || showIframe) && (
             <div className="absolute bottom-0 left-0 right-0 px-2 py-1.5 bg-gradient-to-t from-black/70 to-transparent flex items-center gap-2 z-20">
-              <button
-                type="button"
-                onClick={() => {
-                  const v = videoRef.current;
-                  if (!v) return;
-                  if (v.paused) v.play().catch(() => {});
-                  else v.pause();
-                }}
-                className="w-7 h-7 rounded-full bg-white/20 hover:bg-white/30 text-white text-xs flex items-center justify-center"
-                aria-label={internalPlaying ? "Pause" : "Play"}
-              >
-                {internalPlaying ? "❚❚" : "▶"}
-              </button>
-              <div className="flex-1 h-1 rounded-full bg-white/20 overflow-hidden">
-                <div
-                  className="h-full bg-cyan-400"
-                  style={{
-                    width: `${
-                      videoRef.current && videoRef.current.duration > 0
-                        ? Math.min(100, (videoRef.current.currentTime / videoRef.current.duration) * 100)
-                        : 0
-                    }%`,
-                  }}
-                />
-              </div>
+              {showVideo && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const v = videoRef.current;
+                      if (!v) return;
+                      if (v.paused) v.play().catch(() => {});
+                      else v.pause();
+                    }}
+                    className="w-7 h-7 rounded-full bg-white/20 hover:bg-white/30 text-white text-xs flex items-center justify-center"
+                    aria-label={internalPlaying ? "Pause" : "Play"}
+                  >
+                    {internalPlaying ? "❚❚" : "▶"}
+                  </button>
+                  <div className="flex-1 h-1 rounded-full bg-white/20 overflow-hidden">
+                    <div
+                      className="h-full bg-cyan-400"
+                      style={{
+                        width: `${
+                          videoRef.current && videoRef.current.duration > 0
+                            ? Math.min(100, (videoRef.current.currentTime / videoRef.current.duration) * 100)
+                            : 0
+                        }%`,
+                      }}
+                    />
+                  </div>
+                </>
+              )}
+              {showIframe && <div className="flex-1" />}
               <span className="text-[9px] font-mono text-white/80 tabular-nums">
                 {fmtTime(internalTime)}
               </span>
+              <button
+                type="button"
+                onClick={toggleFullscreen}
+                className="w-7 h-7 rounded-full bg-white/20 hover:bg-white/30 text-white text-xs flex items-center justify-center"
+                aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+              >
+                {isFullscreen ? "⤓" : "⛶"}
+              </button>
             </div>
           )}
         </div>

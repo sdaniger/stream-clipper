@@ -114,9 +114,9 @@ export const BURN_IN_MODE_DESCRIPTION_EN: Record<CommentBurnInMode, string> = {
 
 /** Maps our size preset to a baseline font size in pixels (1080p). */
 export const SIZE_TO_FONT_PX: Record<DanmakuCommentSize, number> = {
-  small: 30,
-  medium: 36,
-  large: 44,
+  small: 24,
+  medium: 30,
+  large: 38,
 };
 
 /** Maps our density preset to max comments per second. */

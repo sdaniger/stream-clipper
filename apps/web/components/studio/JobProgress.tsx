@@ -6,6 +6,7 @@ import {
   type JobStage,
   type Candidate,
   ANALYZE_STAGES,
+  PREVIEW_STAGES,
   RENDER_STAGES,
   STAGE_USER_LABELS_JA,
   STAGE_USER_LABELS_EN,
@@ -105,7 +106,8 @@ export default function JobProgress({ job, candidate, onCancel, onRetry, onDismi
   }
 
   const isAnalyze = job.job_kind === "analyze";
-  const stages = isAnalyze ? ANALYZE_STAGES : RENDER_STAGES;
+  const isPreview = job.job_kind === "preview";
+  const stages = isAnalyze ? ANALYZE_STAGES : isPreview ? PREVIEW_STAGES : RENDER_STAGES;
   const currentStage = job.current_stage as JobStage;
   const currentStageIdx = stages.indexOf(currentStage);
   const isTerminal = TERMINAL.includes(job.status as JobStage);
@@ -427,8 +429,20 @@ export default function JobProgress({ job, candidate, onCancel, onRetry, onDismi
               </div>
             )}
 
+            {/* Preview result: preview video */}
+            {job.job_kind === "preview" && job.result?.preview_path && (
+              <div className="flex items-center gap-2">
+                <span className="text-amber-300/70 shrink-0 text-[11px]">🖼️ Preview:</span>
+                <code className="text-[10px] text-amber-200/80 truncate flex-1">{job.result.preview_filename || job.result.preview_path}</code>
+                <a href={toMediaDownloadHref(job.result.preview_path)} download
+                  className="px-2 py-1.5 rounded bg-amber-600/30 border border-amber-500/40 text-amber-200 hover:bg-amber-500/40 text-[10px] shrink-0 font-semibold min-h-[32px] flex items-center">
+                  ⬇ {isJa ? "DL" : "DL"}
+                </a>
+              </div>
+            )}
+
             {/* Render result: output files */}
-            {!isAnalyze && (
+            {!isAnalyze && job.job_kind !== "preview" && (
               <>
                 {job.result?.output_path && (
                   <div className="flex items-center gap-2">

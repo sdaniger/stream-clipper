@@ -20,6 +20,8 @@ import re
 import subprocess
 import time
 import threading
+import urllib.request
+import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -56,6 +58,85 @@ def _extract_video_id(url: str) -> Optional[str]:
     return None
 
 
+# ─── Twitch GQL metadata bypass ─────────────────────────────────────────────
+# Uses Twitch's GraphQL API directly instead of yt-dlp for much faster
+# (typically ~200ms vs 5-30s) VOD metadata resolution. Falls back to
+# yt-dlp if GQL fails.
+# Both methods fail quickly (10s GQL timeout, 30s yt-dlp with 15s socket timeout).
+
+_TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
+_TWITCH_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"  # Twitch Web client ID
+
+# In-memory cache: video_id -> (expires_at, metadata)
+_METADATA_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
+_METADATA_CACHE_TTL = 3600  # 1 hour
+_METADATA_CACHE_LOCK = threading.Lock()
+
+
+def _twitch_gql_metadata(video_id: str) -> Dict[str, Any]:
+    """Fetch VOD metadata via Twitch GQL (fast, no yt-dlp)."""
+    # Check cache first
+    with _METADATA_CACHE_LOCK:
+        cached = _METADATA_CACHE.get(video_id)
+        if cached and cached[0] > time.time():
+            return cached[1].copy()
+
+    query = {
+        "query": """
+            query($id: ID!) {
+                video(id: $id) {
+                    id
+                    title
+                    createdAt
+                    lengthSeconds
+                    owner { displayName }
+                }
+            }
+        """,
+        "variables": {"id": video_id},
+    }
+    data = json.dumps(query).encode("utf-8")
+    req = urllib.request.Request(
+        _TWITCH_GQL_URL,
+        data=data,
+        headers={
+            "Client-Id": _TWITCH_CLIENT_ID,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+        return {"ok": False, "error_code": "GQL_FAILED", "error": str(e)}
+
+    video = (body or {}).get("data", {}).get("video")
+    if not video:
+        errors = body.get("errors", [])
+        msg = errors[0].get("message", "unknown") if errors else "video not found"
+        return {"ok": False, "error_code": "GQL_VIDEO_NOT_FOUND", "error": msg}
+
+    result = {
+        "ok": True,
+        "video_id": video.get("id", video_id),
+        "title": video.get("title"),
+        "duration_seconds": video.get("lengthSeconds"),
+        "uploader": video.get("owner", {}).get("displayName") if video.get("owner") else None,
+        "thumbnail": None,
+    }
+    # Cache the result
+    with _METADATA_CACHE_LOCK:
+        _METADATA_CACHE[video_id] = (time.time() + _METADATA_CACHE_TTL, result.copy())
+        # Evict old entries if cache grows too large
+        if len(_METADATA_CACHE) > 200:
+            now = time.time()
+            stale = [k for k, v in _METADATA_CACHE.items() if v[0] < now]
+            for k in stale:
+                del _METADATA_CACHE[k]
+    return result
+
+
 def _yt_dlp_metadata(url: str) -> Dict[str, Any]:
     """
     Fetch VOD metadata via yt-dlp. Uses --dump-single-json for a single JSON
@@ -64,10 +145,10 @@ def _yt_dlp_metadata(url: str) -> Dict[str, Any]:
     """
     try:
         proc = subprocess.run(
-            ["yt-dlp", "--no-playlist", "--skip-download", "-J", url],
+            ["yt-dlp", "--no-playlist", "--skip-download", "--socket-timeout", "15", "-J", url],
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=30,
         )
     except FileNotFoundError:
         return {"ok": False, "error_code": "YT_DLP_NOT_FOUND"}
@@ -428,7 +509,12 @@ def run_analyze_job(
     metadata: Dict[str, Any] = {"ok": False}
     if vod_url:
         video_id = _extract_video_id(vod_url) or ""
-        meta = _yt_dlp_metadata(vod_url)
+        # Try Twitch GQL first (fast, ~200ms). Falls back to yt-dlp on failure.
+        meta: Dict[str, Any] = {"ok": False}
+        if video_id and "twitch.tv" in vod_url:
+            meta = _twitch_gql_metadata(video_id)
+        if not meta.get("ok"):
+            meta = _yt_dlp_metadata(vod_url)
         if meta.get("ok"):
             metadata = meta
             update_stage(
@@ -449,7 +535,7 @@ def run_analyze_job(
             }
             update_stage(
                 job, JobStage.METADATA_FETCHING,
-                f"Metadata limited (yt-dlp {meta.get('error_code')})",
+                f"Metadata limited ({meta.get('error_code')})",
                 compute_stage_progress(JobStage.METADATA_FETCHING, 1.0),
                 result_patch={"vod_url": vod_url, "video_id": video_id, "metadata": metadata},
             )

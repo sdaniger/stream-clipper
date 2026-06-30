@@ -26,6 +26,7 @@ interface Props {
   selectedCandidates: Candidate[];
   chatInRangeCount: number;
   outputDir: string;
+  renderError?: string | null;
   // New: comment display mode (replaces legacy withDanmaku boolean)
   commentBurnInMode: CommentBurnInMode;
   setCommentBurnInMode: (v: CommentBurnInMode) => void;
@@ -119,7 +120,7 @@ function BatchItemRow({ item }: { item: BatchItem }) {
 
 export default function Step3ExportPanel({
   candidate, selectedCandidates, chatInRangeCount,
-  outputDir,
+  outputDir, renderError,
   commentBurnInMode, setCommentBurnInMode,
   danmakuStylePreset, setDanmakuStylePreset,
   danmakuRenderOptions, setDanmakuRenderOptions,
@@ -273,6 +274,13 @@ export default function Step3ExportPanel({
               );
             })}
           </div>
+        </div>
+      )}
+
+      {/* Render error */}
+      {renderError && (
+        <div className="px-3 py-2 rounded-lg bg-red-900/30 border border-red-700/40 text-red-200 text-[11px] leading-snug">
+          ✗ {renderError}
         </div>
       )}
 

@@ -12,7 +12,7 @@
  * job_id immediately, and the UI polls the job's state.
  */
 
-export type JobKind = "analyze" | "render";
+export type JobKind = "analyze" | "render" | "preview";
 
 export type JobStage =
   | "pending"
@@ -207,8 +207,8 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
     body: JSON.stringify(body),
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ message: `HTTP ${res.status}` }));
-    throw new Error(err.message || err.error || err.error_code || `HTTP ${res.status}`);
+    const err = await res.json().catch(() => ({}));
+    throw new Error(extractApiError(err, res.status));
   }
   return res.json();
 }
@@ -225,11 +225,23 @@ export async function startPreviewJob(req: PreviewRenderRequest): Promise<StartJ
   return postJson<StartJobResponse>("/api/studio/jobs/preview-render", req);
 }
 
+function extractApiError(err: any, status: number): string {
+  // FastAPI 422 validation errors: { detail: [{ loc, msg, type }] }
+  if (Array.isArray(err?.detail)) {
+    return err.detail.map((d: any) => d.msg).join("; ");
+  }
+  // FastAPI errors: { detail: "..." }
+  if (typeof err?.detail === "string") {
+    return err.detail;
+  }
+  return err?.message || err?.error || err?.error_code || `HTTP ${status}`;
+}
+
 export async function getJob(jobId: string, signal?: AbortSignal): Promise<JobState> {
   const res = await fetch(`/api/studio/jobs/${jobId}`, { cache: "no-store", signal });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ message: `HTTP ${res.status}` }));
-    throw new Error(err.message || `HTTP ${res.status}`);
+    const err = await res.json().catch(() => ({}));
+    throw new Error(extractApiError(err, res.status));
   }
   return res.json();
 }
@@ -238,8 +250,8 @@ export async function listJobs(jobKind?: JobKind, signal?: AbortSignal): Promise
   const url = jobKind ? `/api/studio/jobs?job_kind=${jobKind}` : "/api/studio/jobs";
   const res = await fetch(url, { cache: "no-store", signal });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ message: `HTTP ${res.status}` }));
-    throw new Error(err.message || `HTTP ${res.status}`);
+    const err = await res.json().catch(() => ({}));
+    throw new Error(extractApiError(err, res.status));
   }
   return res.json();
 }
@@ -247,7 +259,8 @@ export async function listJobs(jobKind?: JobKind, signal?: AbortSignal): Promise
 export async function cancelJob(jobId: string): Promise<void> {
   const res = await fetch(`/api/studio/jobs/${jobId}/cancel`, { method: "POST" });
   if (!res.ok) {
-    throw new Error(`Cancel job failed: HTTP ${res.status}`);
+    const err = await res.json().catch(() => ({}));
+    throw new Error(extractApiError(err, res.status));
   }
 }
 
@@ -312,12 +325,19 @@ export const ANALYZE_STAGES: JobStage[] = [
   "candidate_generation",
 ];
 
-export const RENDER_STAGES: JobStage[] = [
+export const PREVIEW_STAGES: JobStage[] = [
   "pending",
   "vod_range_fetching",
   "comment_filtering",
   "ass_generation",
   "preview_rendering",
+];
+
+export const RENDER_STAGES: JobStage[] = [
+  "pending",
+  "vod_range_fetching",
+  "comment_filtering",
+  "ass_generation",
   "ffmpeg_rendering",
   "transcription_started",
   "transcription_segmenting",

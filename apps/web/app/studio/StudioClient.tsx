@@ -24,6 +24,7 @@ import {
 import JobProgress from "@/components/studio/JobProgress";
 import {
   DEFAULT_DANMAKU_RENDER_OPTIONS,
+  SIZE_TO_FONT_PX,
   type CommentBurnInMode,
   type DanmakuStylePreset,
   type DanmakuRenderOptions,
@@ -240,7 +241,7 @@ export default function StudioClient() {
     const custom_keywords = keywordsText.split(",").map(s => s.trim()).filter(Boolean);
     const opts: RenderRequest["options"] = {
       density: danmakuRenderOptions.density === "insane" ? "high" : danmakuRenderOptions.density === "normal" ? "medium" : danmakuRenderOptions.density,
-      font_size: danmakuRenderOptions.fontSize,
+      font_size: danmakuRenderOptions.fontSize ?? SIZE_TO_FONT_PX[danmakuRenderOptions.size],
       comment_duration: danmakuRenderOptions.durationSec,
       opacity: danmakuRenderOptions.opacity,
       outline: danmakuRenderOptions.outline,
@@ -389,7 +390,7 @@ export default function StudioClient() {
         chat_messages: chatInRangeForCand,
         options: {
           density: danmakuRenderOptions.density === "insane" ? "high" : danmakuRenderOptions.density === "normal" ? "medium" : danmakuRenderOptions.density,
-          font_size: danmakuRenderOptions.fontSize,
+          font_size: danmakuRenderOptions.fontSize ?? SIZE_TO_FONT_PX[danmakuRenderOptions.size],
           comment_duration: danmakuRenderOptions.durationSec,
           opacity: danmakuRenderOptions.opacity,
           outline: danmakuRenderOptions.outline,
@@ -431,9 +432,20 @@ export default function StudioClient() {
   }, [analyzeJob]);
 
   const handleDismissJob = useCallback(() => {
+    // Cancel any running backend jobs before dismissing
+    if (currentRenderJob && !["completed", "failed", "cancelled"].includes(currentRenderJob.status)) {
+      cancelJob(currentRenderJob.job_id).catch(console.error);
+    }
+    if (analyzeJob && !["completed", "failed", "cancelled"].includes(analyzeJob.status)) {
+      cancelJob(analyzeJob.job_id).catch(console.error);
+    }
+    if (currentPreviewJob && !["completed", "failed", "cancelled"].includes(currentPreviewJob.status)) {
+      cancelJob(currentPreviewJob.job_id).catch(console.error);
+    }
     setCurrentRenderJob(null); setAnalyzeJob(null); setAnalyzeError(null); setRenderError(null);
+    setCurrentPreviewJob(null);
     setBatchItems([]);
-  }, []);
+  }, [currentRenderJob, analyzeJob, currentPreviewJob]);
 
   const handleRetry = useCallback(() => {
     if (selectedCandidate) {
@@ -581,6 +593,7 @@ export default function StudioClient() {
               }
               twitchVideoId={videoId}
               startSeconds={selectedCandidate.clip_start ?? 0}
+              reloadKey={playerReloadKey}
               aspect={selectedCandidate.kind === "short" ? "9:16" : "16:9"}
               candidate={{
                 clip_start: selectedCandidate.clip_start ?? 0,
@@ -646,6 +659,7 @@ export default function StudioClient() {
         {hasCandidates && (
           <Step3ExportPanel
             candidate={selectedCandidate}
+            renderError={renderError}
             selectedCandidates={top5Candidates}
             chatInRangeCount={chatInRangeCount}
             outputDir={outputDir}
