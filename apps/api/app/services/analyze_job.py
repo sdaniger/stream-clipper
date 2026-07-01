@@ -98,16 +98,60 @@ def _yt_dlp_metadata(url: str) -> Dict[str, Any]:
 _CHAT_CACHE: Dict[str, List[Dict[str, Any]]] = {}
 _CHAT_CACHE_LOCK = threading.Lock()
 _CHAT_CACHE_MAX = 10
+_CHAT_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+_PRACTICAL_MESSAGE_CAP = 300_000
 
 def _cache_get(vod_id: str) -> Optional[List[Dict[str, Any]]]:
     with _CHAT_CACHE_LOCK:
-        return _CHAT_CACHE.get(vod_id)
+        cached = _CHAT_CACHE.get(vod_id)
+        if cached is not None:
+            return cached
+
+    cache_path = _chat_cache_path(vod_id)
+    if not cache_path.is_file():
+        return None
+    try:
+        if time.time() - cache_path.stat().st_mtime > _CHAT_CACHE_TTL_SECONDS:
+            cache_path.unlink(missing_ok=True)
+            return None
+        loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(loaded, list) or not loaded:
+        return None
+    messages = [m for m in loaded if isinstance(m, dict)]
+    if not messages:
+        return None
+    with _CHAT_CACHE_LOCK:
+        while len(_CHAT_CACHE) >= _CHAT_CACHE_MAX:
+            _CHAT_CACHE.pop(next(iter(_CHAT_CACHE)))
+        _CHAT_CACHE[vod_id] = messages
+    return messages
 
 def _cache_set(vod_id: str, messages: List[Dict[str, Any]]) -> None:
     with _CHAT_CACHE_LOCK:
         while len(_CHAT_CACHE) >= _CHAT_CACHE_MAX:
             _CHAT_CACHE.pop(next(iter(_CHAT_CACHE)))
         _CHAT_CACHE[vod_id] = messages
+    try:
+        cache_path = _chat_cache_path(vod_id)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(messages, ensure_ascii=False), encoding="utf-8")
+        legacy_path = cache_path.with_name(f"v{vod_id}.rechat.json")
+        legacy_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _chat_cache_path(vod_id: str) -> Path:
+    return _project_root() / "media" / "cache" / "comments" / f"{vod_id}.rechat.json"
+
+
+def _default_chat_limit_for_duration(duration_seconds: Optional[int]) -> int:
+    if not duration_seconds or duration_seconds <= 0:
+        return 50000
+    estimated = int(duration_seconds * 7)
+    return max(5000, min(_PRACTICAL_MESSAGE_CAP, estimated))
 
 
 def _fetch_twitch_chat_direct(vod_id: str, max_messages: int = 50000,
@@ -154,8 +198,8 @@ def _fetch_twitch_chat_direct(vod_id: str, max_messages: int = 50000,
     if duration <= 0:
         duration = 3600
 
-    # Dynamic thread count: 4 for short VODs, up to 16 for long ones
-    thread_count = max(4, min(16, int(duration / 300)))
+    # Dynamic thread count: 4 for short VODs, up to 16 for long ones.
+    thread_count = max(4, min(16, int((duration + 299) // 300)))
     segment_count = min(max_messages // 200, 100)
     if segment_count < 1:
         segment_count = 1
@@ -166,7 +210,7 @@ def _fetch_twitch_chat_direct(vod_id: str, max_messages: int = 50000,
     total = [0]
     total_lock = threading.Lock()
     deadline = time.time() + 600  # 10 min timeout
-    results_list: List[List[Dict[str, Any]]] = []
+    all_messages: List[Dict[str, Any]] = []
     results_lock = threading.Lock()
     progress_interval = max(50, max_messages // 100)
 
@@ -208,8 +252,7 @@ def _fetch_twitch_chat_direct(vod_id: str, max_messages: int = 50000,
             })
         return out
 
-    def fetch_segment(seg_offset: int, seg_limit: int) -> List[Dict[str, Any]]:
-        local_results: List[Dict[str, Any]] = []
+    def fetch_segment(seg_offset: int, seg_limit: int) -> int:
         page_offset = seg_offset
         stale = 0
         fetched = 0
@@ -220,26 +263,26 @@ def _fetch_twitch_chat_direct(vod_id: str, max_messages: int = 50000,
                 data = _gql_page(page_offset)
             except Exception:
                 stale += 1
-                if stale >= 5:
+                if stale >= 3:
                     break
-                page_offset += 60
+                page_offset += 30
                 continue
             if isinstance(data, list) and len(data) > 0:
                 result = data[0]
             else:
                 stale += 1
-                if stale >= 5:
+                if stale >= 3:
                     break
-                page_offset += 60
+                page_offset += 30
                 continue
             if "errors" in result:
                 break
             edges = result.get("data", {}).get("video", {}).get("comments", {}).get("edges") or []
             if not edges:
                 stale += 1
-                if stale >= 5:
+                if stale >= 3:
                     break
-                page_offset += 60
+                page_offset += 30
                 continue
             stale = 0
             parsed = _parse_edges(edges)
@@ -252,15 +295,23 @@ def _fetch_twitch_chat_direct(vod_id: str, max_messages: int = 50000,
                         continue
                     if cid:
                         shared_seen.add(cid)
-                local_results.append(item)
+                with total_lock:
+                    if total[0] >= max_messages:
+                        return fetched
+                    total[0] += 1
+                    current = total[0]
+                with results_lock:
+                    all_messages.append(item)
                 fetched += 1
                 if ts > max_os:
                     max_os = ts
+                if on_progress and (current % progress_interval == 0 or current <= 100):
+                    on_progress(min(current, max_messages))
                 if fetched >= seg_limit:
                     break
             if fetched < seg_limit:
                 page_offset = int(max_os) + 3
-        return local_results
+        return fetched
 
     executor = ThreadPoolExecutor(max_workers=thread_count)
     try:
@@ -271,11 +322,7 @@ def _fetch_twitch_chat_direct(vod_id: str, max_messages: int = 50000,
 
         for future in as_completed(futures):
             try:
-                segment_msgs = future.result()
-                with total_lock:
-                    total[0] += len(segment_msgs)
-                with results_lock:
-                    results_list.append(segment_msgs)
+                future.result()
                 if on_progress:
                     with total_lock:
                         current = total[0]
@@ -288,9 +335,6 @@ def _fetch_twitch_chat_direct(vod_id: str, max_messages: int = 50000,
         executor.shutdown(wait=False)
 
     # Merge segments (sort by timestamp)
-    all_messages: List[Dict[str, Any]] = []
-    for seg in results_list:
-        all_messages.extend(seg)
     all_messages.sort(key=lambda m: m["timestamp"])
     all_messages = all_messages[:max_messages]
 
@@ -485,8 +529,8 @@ def run_analyze_job(
             result_patch={"chat_count": len(raw_chat)},
         )
     elif vod_url:
-        max_messages = 50000
         vod_dur = (metadata.get("duration_seconds") if metadata else None)
+        max_messages = _default_chat_limit_for_duration(int(vod_dur) if vod_dur else None)
         result = _fetch_chat_with_chat_downloader(
             vod_url, max_messages,
             on_progress=lambda n: update_stage(
