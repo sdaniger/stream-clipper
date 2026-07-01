@@ -754,6 +754,11 @@ def _run_render_job_inner(
             vod_title=req.vod_title,
             streamer_name=req.streamer_name,
         )
+        try:
+            from app.services.llm_metadata import build_llm_metadata
+            llm_meta = build_llm_metadata(candidate, meta.to_dict(), req.vod_title, req.streamer_name)
+        except Exception:
+            llm_meta = None
     except Exception as e:
         mark_failed(job, "METADATA_FAILED", f"YouTube metadata failed: {e}")
         return
@@ -768,6 +773,7 @@ def _run_render_job_inner(
         "vod_title": req.vod_title,
         "streamer": req.streamer_name,
         "youtube": meta.to_dict(),
+        "youtube_llm": llm_meta,
         "render": {
             "output_path": str(final_path.relative_to(_project_root())),
             "ass_path": str(ass_path.relative_to(_project_root())) if ass_path else None,
@@ -785,6 +791,7 @@ def _run_render_job_inner(
         result_patch={
             "metadata_path": str(metadata_path.relative_to(_project_root())),
             "youtube": meta.to_dict(),
+            "youtube_llm": llm_meta,
         },
     )
 

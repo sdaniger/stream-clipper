@@ -28,6 +28,7 @@ import {
   type DanmakuStylePreset,
   type DanmakuRenderOptions,
 } from "@/types/danmaku-render";
+import { evaluateStudioCandidate, generateStudioPostPackage, type StudioLlmEvaluation } from "@/lib/studio-llm-api";
 
 export default function StudioClient() {
   const { t, locale } = useI18n();
@@ -77,6 +78,8 @@ export default function StudioClient() {
   useEffect(() => {
     try { window.localStorage.setItem("studio-candidate-feedback", JSON.stringify(candidateFeedback)); } catch {}
   }, [candidateFeedback]);
+  const [aiEvaluatingIds, setAiEvaluatingIds] = useState<Set<string>>(new Set());
+  const [aiMessage, setAiMessage] = useState<string | null>(null);
 
   // ─── Step 3: Render ─────────────────────────────────────────────────────
   const [currentRenderJob, setCurrentRenderJob] = useState<JobState | null>(null);
@@ -239,6 +242,75 @@ export default function StudioClient() {
     if (candidates.long[0]) out.push(candidates.long[0]);
     return out.slice(0, 5);
   }, [candidates]);
+
+  const patchCandidate = useCallback((candidateId: string, patch: Partial<Candidate>) => {
+    setCandidates(prev => ({
+      short: prev.short.map(c => c.candidate_id === candidateId ? { ...c, ...patch } : c),
+      medium: prev.medium.map(c => c.candidate_id === candidateId ? { ...c, ...patch } : c),
+      long: prev.long.map(c => c.candidate_id === candidateId ? { ...c, ...patch } : c),
+    }));
+    setSelectedCandidate(prev => prev?.candidate_id === candidateId ? { ...prev, ...patch } : prev);
+  }, []);
+
+  const evaluateCandidateWithAi = useCallback(async (c: Candidate): Promise<StudioLlmEvaluation | null> => {
+    setAiMessage(null);
+    setAiEvaluatingIds(prev => new Set(prev).add(c.candidate_id));
+    try {
+      const chatInRangeForCand = normalizedChat.filter(
+        m => m.time_sec >= (c.clip_start ?? 0) && m.time_sec <= (c.clip_end ?? 0),
+      );
+      const evaluation = await evaluateStudioCandidate({
+        candidate: c,
+        chatMessages: chatInRangeForCand,
+        context: { streamer, archiveTitle: vodTitle },
+      });
+      patchCandidate(c.candidate_id, { llm_evaluation: evaluation });
+      return evaluation;
+    } catch (error) {
+      setAiMessage(error instanceof Error ? error.message : "AI evaluation failed");
+      return null;
+    } finally {
+      setAiEvaluatingIds(prev => { const next = new Set(prev); next.delete(c.candidate_id); return next; });
+    }
+  }, [normalizedChat, patchCandidate, streamer, vodTitle]);
+
+  const evaluateTopCandidatesWithAi = useCallback(async () => {
+    const targets = top5Candidates.slice(0, 5);
+    if (targets.length === 0) return;
+    setAiMessage(isJa ? "AI編集者が候補を評価中..." : "AI editor is reviewing candidates...");
+    const evaluated: Array<{ candidate: Candidate; evaluation: StudioLlmEvaluation }> = [];
+    for (const c of targets) {
+      const evaluation = await evaluateCandidateWithAi(c);
+      if (evaluation) evaluated.push({ candidate: c, evaluation });
+    }
+    if (evaluated.length > 0) {
+      const order = new Map(evaluated.sort((a, b) => b.evaluation.combinedScore - a.evaluation.combinedScore).map((item, idx) => [item.candidate.candidate_id, idx]));
+      setCandidates(prev => ({
+        short: [...prev.short].sort((a, b) => (order.get(a.candidate_id) ?? 999) - (order.get(b.candidate_id) ?? 999)),
+        medium: [...prev.medium].sort((a, b) => (order.get(a.candidate_id) ?? 999) - (order.get(b.candidate_id) ?? 999)),
+        long: [...prev.long].sort((a, b) => (order.get(a.candidate_id) ?? 999) - (order.get(b.candidate_id) ?? 999)),
+      }));
+    }
+    setAiMessage(isJa ? "AI評価が完了しました" : "AI review complete");
+  }, [evaluateCandidateWithAi, isJa, top5Candidates]);
+
+  const generatePostForSelected = useCallback(async () => {
+    const c = selectedCandidate;
+    if (!c) return;
+    setAiMessage(isJa ? "投稿パッケージを生成中..." : "Generating post package...");
+    try {
+      const evaluation = c.llm_evaluation || await evaluateCandidateWithAi(c) || undefined;
+      const postPackage = await generateStudioPostPackage({
+        candidate: c,
+        evaluation,
+        context: { streamer, archiveTitle: vodTitle },
+      });
+      patchCandidate(c.candidate_id, { llm_post_package: postPackage });
+      setAiMessage(isJa ? "投稿パッケージを生成しました" : "Post package generated");
+    } catch (error) {
+      setAiMessage(error instanceof Error ? error.message : "Post package generation failed");
+    }
+  }, [evaluateCandidateWithAi, isJa, patchCandidate, selectedCandidate, streamer, vodTitle]);
 
   // ─── Step 3: Render a single candidate ─────────────────────────────────
   const startRenderForCandidate = useCallback(async (c: Candidate) => {
@@ -548,6 +620,21 @@ export default function StudioClient() {
           </div>
         )}
 
+        {hasCandidates && !isAnalyzing && (
+          <div className="flex flex-wrap items-center gap-2 px-3 py-2 bg-violet-950/30 border border-violet-500/25 rounded-lg text-[10px] text-slate-300">
+            <span className="font-semibold text-violet-200">AI編集者</span>
+            <button type="button" onClick={evaluateTopCandidatesWithAi}
+              className="px-2 py-1 rounded bg-violet-500/20 border border-violet-400/30 text-violet-100 hover:bg-violet-500/30">
+              {isJa ? "AIおすすめ順に並べ替え" : "AI rank Top 5"}
+            </button>
+            <button type="button" onClick={generatePostForSelected} disabled={!selectedCandidate}
+              className="px-2 py-1 rounded bg-cyan-500/15 border border-cyan-400/30 text-cyan-100 hover:bg-cyan-500/25 disabled:opacity-40">
+              {isJa ? "投稿文をAI生成" : "Generate post copy"}
+            </button>
+            {aiMessage && <span className="text-slate-400">{aiMessage}</span>}
+          </div>
+        )}
+
         {/* Advanced analysis settings (hidden tiny toggle) */}
         <div className="bg-slate-900/60 border border-slate-700/40 rounded-lg">
           <button type="button" onClick={() => setAdvancedAnalysisOpen(!advancedAnalysisOpen)}
@@ -635,6 +722,8 @@ export default function StudioClient() {
                 onExport={c => startRenderForCandidate(c)}
                 onFeedback={handleCandidateFeedback}
                 feedbackById={candidateFeedback}
+                onAiEvaluate={evaluateCandidateWithAi}
+                aiEvaluatingIds={aiEvaluatingIds}
               />
             </div>
 

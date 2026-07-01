@@ -14,6 +14,8 @@ interface Props {
   onExport: (c: Candidate) => void;
   onFeedback?: (candidateId: string, value: "good" | "bad" | "maybe") => void;
   feedbackById?: Record<string, "good" | "bad" | "maybe">;
+  onAiEvaluate?: (c: Candidate) => void;
+  aiEvaluatingIds?: Set<string>;
 }
 
 type Tab = "short" | "medium" | "long";
@@ -107,11 +109,13 @@ function getGrade(ratio: number): { label: string; color: string; bg: string } {
   return GRADE_CONFIG[GRADE_CONFIG.length - 1];
 }
 
-function CandidateCard({ c, isSelected, isExporting, isExported, maxScore, onSelect, onExport, onFeedback, feedback }: {
+function CandidateCard({ c, isSelected, isExporting, isExported, maxScore, onSelect, onExport, onFeedback, feedback, onAiEvaluate, isAiEvaluating }: {
   c: Candidate; isSelected: boolean; isExporting: boolean; isExported: boolean;
   maxScore: number; onSelect: () => void; onExport: () => void;
   onFeedback?: (value: "good" | "bad" | "maybe") => void;
   feedback?: "good" | "bad" | "maybe";
+  onAiEvaluate?: () => void;
+  isAiEvaluating?: boolean;
 }) {
   const { locale } = useI18n();
   const isJa = locale === "ja";
@@ -174,6 +178,37 @@ function CandidateCard({ c, isSelected, isExporting, isExported, maxScore, onSel
         <div className="mb-2 px-3 py-2 bg-slate-700/30 border border-slate-600/30 rounded-lg">
           <div className="text-[9px] text-slate-500 mb-0.5">{isJa ? "タイトル案" : "Title idea"}</div>
           <div className="text-[12px] text-slate-100 leading-relaxed">{title}</div>
+        </div>
+      )}
+
+      {c.llm_evaluation && (
+        <div className="mb-2 px-3 py-2 bg-violet-500/10 border border-violet-500/30 rounded-lg space-y-1">
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-[9px] text-violet-300 font-semibold">AI編集者</div>
+            <div className="text-[9px] text-slate-400">
+              面白さ {c.llm_evaluation.interestingness} / 拡散 {c.llm_evaluation.viralPotential}
+            </div>
+          </div>
+          <div className="text-[12px] text-slate-100 leading-relaxed">{c.llm_evaluation.title}</div>
+          <div className="text-[10px] text-slate-300 leading-relaxed">{c.llm_evaluation.reasoning || c.llm_evaluation.summary}</div>
+          <div className="flex flex-wrap gap-1">
+            <span className="text-[9px] text-cyan-200 bg-cyan-500/10 px-1.5 py-0.5 rounded-full">{c.llm_evaluation.recommendation}</span>
+            <span className="text-[9px] text-emerald-200 bg-emerald-500/10 px-1.5 py-0.5 rounded-full">{c.llm_evaluation.bestFormat}</span>
+            {c.llm_evaluation.fallback && <span className="text-[9px] text-amber-200 bg-amber-500/10 px-1.5 py-0.5 rounded-full">fallback</span>}
+          </div>
+        </div>
+      )}
+
+      {c.llm_post_package && (
+        <div className="mb-2 px-3 py-2 bg-cyan-500/10 border border-cyan-500/25 rounded-lg space-y-1">
+          <div className="text-[9px] text-cyan-300 font-semibold">{isJa ? "AI投稿パッケージ" : "AI post package"}</div>
+          <div className="text-[11px] text-slate-100">{c.llm_post_package.titles[0]}</div>
+          <div className="text-[10px] text-slate-400 line-clamp-2">{c.llm_post_package.socialPost}</div>
+          <div className="flex flex-wrap gap-1">
+            {c.llm_post_package.tags.slice(0, 5).map((tag) => (
+              <span key={tag} className="text-[9px] text-cyan-200 bg-cyan-500/10 px-1.5 py-0.5 rounded-full">#{tag}</span>
+            ))}
+          </div>
         </div>
       )}
 
@@ -282,6 +317,12 @@ function CandidateCard({ c, isSelected, isExporting, isExported, maxScore, onSel
           }`}>
           {isJa ? "プレビュー" : "Preview"}
         </button>
+        {onAiEvaluate && (
+          <button onClick={(e) => { e.stopPropagation(); onAiEvaluate(); }} disabled={isAiEvaluating}
+            className="px-3 py-2.5 text-xs font-semibold rounded-lg bg-violet-500/15 border border-violet-500/40 text-violet-200 hover:bg-violet-500/25 disabled:opacity-40 min-h-[40px]">
+            {isAiEvaluating ? "AI…" : "AI"}
+          </button>
+        )}
         <button onClick={(e) => { e.stopPropagation(); onExport(); }} disabled={isExporting}
           className="flex-[2] px-3 py-2.5 text-xs font-bold rounded-lg bg-gradient-to-r from-cyan-500 to-fuchsia-500 text-white shadow-lg shadow-cyan-500/20 hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed transition-all min-h-[40px]">
           {isExporting ? "⏳" : isJa ? "この候補を生成" : "Generate"}
@@ -317,7 +358,7 @@ function CandidateCard({ c, isSelected, isExporting, isExported, maxScore, onSel
   );
 }
 
-export default function CandidateTabs({ short, medium, long, selectedCandidateId, exportingCandidateIds, exportedCandidateIds, onSelect, onExport, onFeedback, feedbackById = {} }: Props) {
+export default function CandidateTabs({ short, medium, long, selectedCandidateId, exportingCandidateIds, exportedCandidateIds, onSelect, onExport, onFeedback, feedbackById = {}, onAiEvaluate, aiEvaluatingIds = new Set() }: Props) {
   const { locale } = useI18n();
   const isJa = locale === "ja";
   const [tab, setTab] = useState<Tab>("short");
@@ -362,7 +403,9 @@ export default function CandidateTabs({ short, medium, long, selectedCandidateId
             isExported={exportedCandidateIds.has(c.candidate_id)}
             maxScore={maxScore} onSelect={() => onSelect(c)} onExport={() => onExport(c)}
             onFeedback={onFeedback ? (value) => onFeedback(c.candidate_id, value) : undefined}
-            feedback={feedbackById[c.candidate_id]} />
+            feedback={feedbackById[c.candidate_id]}
+            onAiEvaluate={onAiEvaluate ? () => onAiEvaluate(c) : undefined}
+            isAiEvaluating={aiEvaluatingIds.has(c.candidate_id)} />
         ))
       )}
     </div>

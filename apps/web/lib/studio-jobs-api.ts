@@ -119,6 +119,16 @@ export interface Candidate {
   id?: string | number;
   title?: string;
   output_file?: string | null;
+  llm_evaluation?: import("@/lib/studio-llm-api").StudioLlmEvaluation;
+  llm_post_package?: {
+    titles: string[];
+    description: string;
+    tags: string[];
+    pinnedComment: string;
+    thumbnailText: string[];
+    socialPost: string;
+    fallback?: boolean;
+  };
 }
 
 export interface RenderRequest {
