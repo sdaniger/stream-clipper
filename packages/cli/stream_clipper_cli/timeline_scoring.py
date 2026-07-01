@@ -31,18 +31,22 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 LAUGH_KEYWORDS: List[str] = [
     "草", "ｗ", "www", "笑", "爆笑", "腹痛い", "おもろ", "lol", "lmao",
     "haha", "hh", "kusa", "笑う", "笑える", "草生える", "ワロタ", "wktk",
+    "しぬ", "死ぬ", "腹筋", "草すぎ", "おもろすぎ", "ワロ", "草ァ",
 ]
 
 SURPRISE_KEYWORDS: List[str] = [
     "え", "まじ", "マジ", "うそ", "嘘", "うそでしょ", "えっ", "え！？",
     "やば", "ヤバ", "やばい", "ヤバい", "びっくり", "驚",
     "wow", "woah", "omg", "OMG", "wtf", "WTF", "no way", "信じられ",
+    "は？", "えぐ", "エグ", "まって", "待って", "こわ", "怖", "なんで",
 ]
 
 CLIP_WORTHY_KEYWORDS: List[str] = [
     "神", "最高", "天才", "上手い", "上手すぎ", "すご", "すごい", "凄すぎ",
     "やばすぎ", "やばい", "ヤバい", "きた", "来た", "ｷﾀ", "キタ",
     "伝説", "神回", "ハイライト", "名場面",
+    "神展開", "撮れ高", "切り抜き", "ここ切り抜き", "ここ好き",
+    "事故", "放送事故", "かわいい", "可愛い", "尊い", "助かる", "鳥肌", "8888",
 ]
 
 REACTION_KEYWORDS: List[str] = [
@@ -52,6 +56,8 @@ REACTION_KEYWORDS: List[str] = [
     "神", "最高", "天才", "上手い", "すご",
     "きた", "来た", "ｷﾀ", "キタ",
     "やばい", "やば", "ヤバ",
+    "しぬ", "死ぬ", "腹筋", "えぐ", "エグ", "待って", "神展開", "撮れ高",
+    "切り抜き", "ここ好き", "事故", "放送事故", "かわいい", "可愛い", "尊い", "助かる",
 ]
 
 ALL_KEYWORD_GROUPS: Dict[str, List[str]] = {
@@ -86,7 +92,13 @@ class TimelineWindow:
     clip_worthy_score: float = 0.0
     reaction_score: float = 0.0
     burst_score: float = 0.0
+    burst_ratio: float = 1.0
+    author_diversity_score: float = 0.0
+    reaction_density_score: float = 0.0
     total_score: float = 0.0
+    normalized_score: float = 0.0
+    dominant_signal: str = "general"
+    representative_comments: List[dict] = field(default_factory=list)
     matched_keywords: List[str] = field(default_factory=list)
     matched_laughs: List[str] = field(default_factory=list)
     matched_surprises: List[str] = field(default_factory=list)
@@ -110,6 +122,8 @@ DEFAULT_WEIGHTS: Dict[str, float] = {
     "clip_worthy": 1.8,
     "reaction": 1.3,
     "burst": 1.5,
+    "author_diversity": 2.0,
+    "reaction_density": 1.7,
 }
 
 
@@ -134,6 +148,49 @@ def _count_group_hits(message: str, lowered_group: Sequence[str]) -> Tuple[int, 
             hits += occ
             matched.append(kw)
     return hits, matched
+
+
+def _message_signal_score(message: str, groups: Dict[str, Sequence[str]]) -> float:
+    laugh, _ = _count_group_hits(message, groups["laugh"])
+    surprise, _ = _count_group_hits(message, groups["surprise"])
+    clip, _ = _count_group_hits(message, groups["clip_worthy"])
+    reaction, _ = _count_group_hits(message, groups["reaction"])
+    return laugh * 1.2 + surprise * 1.5 + clip * 1.8 + reaction * 0.8
+
+
+def _representative_comments(msgs: Sequence[ChatMessage], groups: Dict[str, Sequence[str]], limit: int = 4) -> List[dict]:
+    scored = sorted(
+        ((m, _message_signal_score(m.message, groups)) for m in msgs),
+        key=lambda item: (-item[1], item[0].timestamp),
+    )
+    out: List[dict] = []
+    seen: Set[str] = set()
+    for m, score in scored:
+        text = " ".join(m.message.strip().split())
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "time_sec": round(float(m.timestamp), 3),
+            "author": m.author,
+            "message": text,
+            "signal_score": round(float(score), 3),
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _dominant_signal(laugh: float, surprise: float, clip_worthy: float, reaction: float, burst: float) -> str:
+    scores = {
+        "laugh": laugh,
+        "surprise": surprise,
+        "clip_worthy": clip_worthy,
+        "reaction": reaction,
+        "burst": burst,
+    }
+    return max(scores, key=scores.get) if any(v > 0 for v in scores.values()) else "general"
 
 
 # ─── Core scoring ────────────────────────────────────────────────────────────
@@ -261,11 +318,24 @@ def build_timeline(
             matched_reactions=sorted(set(reaction_m)),
         ))
 
+    counts = [w.chat_count for w in raw_windows]
+    positive_counts = sorted(c for c in counts if c > 0)
+    median_chat = positive_counts[len(positive_counts) // 2] if positive_counts else 0
+
     # burst_score: log1p(chat) * (1 + max(0, chat/avg(neighbors) - 1))
     for i, win in enumerate(raw_windows):
-        neighbor_idxs = [j for j in (i - 1, i + 1) if 0 <= j < len(raw_windows)]
+        neighbor_idxs = [j for j in range(max(0, i - 6), min(len(raw_windows), i + 7)) if j != i]
         neighbors = [raw_windows[j].chat_count for j in neighbor_idxs]
         win.burst_score = round(_burst_score_local(win.chat_count, neighbors), 3)
+        neighbor_avg = sum(neighbors) / max(1, len(neighbors)) if neighbors else float(median_chat or 1)
+        win.burst_ratio = round(win.chat_count / max(1.0, neighbor_avg), 3)
+        win.author_diversity_score = round(win.unique_author_count / max(1.0, win.chat_count), 3)
+        win.reaction_density_score = round(win.keyword_hits / max(1.0, win.chat_count), 3)
+        win.dominant_signal = _dominant_signal(
+            win.laugh_score, win.surprise_score, win.clip_worthy_score,
+            win.reaction_score, win.burst_score,
+        )
+        win.representative_comments = _representative_comments(by_window.get(i, []), groups)
 
     # total_score: weighted combination
     for win in raw_windows:
@@ -278,8 +348,16 @@ def build_timeline(
             + win.clip_worthy_score * w["clip_worthy"]
             + win.reaction_score * w["reaction"]
             + win.burst_score * w["burst"]
+            + win.author_diversity_score * w["author_diversity"]
+            + win.reaction_density_score * w["reaction_density"]
         )
+        if median_chat > 0:
+            total *= 1.0 + min(1.25, max(0.0, (win.chat_count - median_chat) / max(1.0, median_chat)) * 0.25)
         win.total_score = round(total, 3)
+
+    max_score = max((w.total_score for w in raw_windows), default=0.0)
+    for win in raw_windows:
+        win.normalized_score = round(win.total_score / max_score, 3) if max_score > 0 else 0.0
 
     # Filter zero-chat windows but keep the surrounding context for burst.
     # The candidate generators operate on this timeline directly.

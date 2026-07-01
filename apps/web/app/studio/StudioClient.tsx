@@ -70,6 +70,13 @@ export default function StudioClient() {
   const [selectedCandidate, setSelectedCandidate] = useState<Candidate | null>(null);
   const [exportedIds, setExportedIds] = useState<Set<string>>(new Set());
   const [exportingIds, setExportingIds] = useState<Set<string>>(new Set());
+  const [candidateFeedback, setCandidateFeedback] = useState<Record<string, "good" | "bad" | "maybe">>(() => {
+    if (typeof window === "undefined") return {};
+    try { return JSON.parse(window.localStorage.getItem("studio-candidate-feedback") || "{}"); } catch { return {}; }
+  });
+  useEffect(() => {
+    try { window.localStorage.setItem("studio-candidate-feedback", JSON.stringify(candidateFeedback)); } catch {}
+  }, [candidateFeedback]);
 
   // ─── Step 3: Render ─────────────────────────────────────────────────────
   const [currentRenderJob, setCurrentRenderJob] = useState<JobState | null>(null);
@@ -84,7 +91,7 @@ export default function StudioClient() {
   // Export settings
   const [exportSource, setExportSource] = useState<"twitch_vod" | "local_file" | "ass_only">("twitch_vod");
   const [withDanmaku, setWithDanmaku] = useState(true);
-  const [ffmpegPreset, setFfmpegPreset] = useState<"ultrafast" | "veryfast" | "fast" | "medium" | "slow">("veryfast");
+  const [ffmpegPreset, setFfmpegPreset] = useState<"ultrafast" | "veryfast" | "fast" | "medium" | "slow">("fast");
   const [ffmpegCrf, setFfmpegCrf] = useState(23);
   const [videoPath, setVideoPath] = useState("");
   const [outputDir, setOutputDir] = useState<string>(() => {
@@ -146,10 +153,20 @@ export default function StudioClient() {
     analyzeAbortRef.current = abortController;
     try {
       const custom_keywords = keywordsText.split(",").map(s => s.trim()).filter(Boolean);
+      const feedbackValues = Object.values(candidateFeedback);
+      const good = feedbackValues.filter(v => v === "good").length;
+      const bad = feedbackValues.filter(v => v === "bad").length;
+      const feedbackBias = Math.max(-0.2, Math.min(0.25, (good - bad) * 0.015));
+      const adaptiveWeights = {
+        ...scoringWeights,
+        keyword: scoringWeights.keyword + feedbackBias,
+        clip_worthy: scoringWeights.clip_worthy + feedbackBias,
+        unique_author: scoringWeights.unique_author + Math.max(0, feedbackBias * 0.5),
+      };
       const startResp = await startAnalyzeJob({
         vod_url: vodUrl, window: windowSec, step,
         top_short: topShort, top_medium: topMedium, top_long: topLong,
-        min_score: 0.0, custom_keywords, scoring_weights: scoringWeights,
+        min_score: 0.0, custom_keywords, scoring_weights: adaptiveWeights,
       });
       const state = await pollJobUntilDone(startResp.job_id, s => setAnalyzeJob(s), {
         intervalMs: 1000, signal: abortController.signal,
@@ -170,7 +187,7 @@ export default function StudioClient() {
         setAnalyzeError(e instanceof Error ? e.message : "Unknown error");
       }
     } finally { analyzeAbortRef.current = null; }
-  }, [vodUrl, windowSec, step, topShort, topMedium, topLong, keywordsText, scoringWeights, isJa, vodTitle]);
+  }, [vodUrl, windowSec, step, topShort, topMedium, topLong, keywordsText, scoringWeights, candidateFeedback, isJa, vodTitle]);
 
   // Player actions
   const seekToPlayer = useCallback((timeSeconds: number) => {
@@ -185,6 +202,10 @@ export default function StudioClient() {
     const targetTime = c.peak_time ?? c.clip_start ?? 0;
     seekToPlayer(targetTime);
   }, [seekToPlayer]);
+
+  const handleCandidateFeedback = useCallback((candidateId: string, value: "good" | "bad" | "maybe") => {
+    setCandidateFeedback(prev => ({ ...prev, [candidateId]: value }));
+  }, []);
 
   // Convert job-API candidates to the legacy HighlightCandidate shape
   // for the TimelineGraph component. We memoize per render so the
@@ -612,6 +633,8 @@ export default function StudioClient() {
                 exportedCandidateIds={exportedIds}
                 onSelect={handleSelectCandidate}
                 onExport={c => startRenderForCandidate(c)}
+                onFeedback={handleCandidateFeedback}
+                feedbackById={candidateFeedback}
               />
             </div>
 

@@ -12,6 +12,8 @@ interface Props {
   exportedCandidateIds: Set<string>;
   onSelect: (c: Candidate) => void;
   onExport: (c: Candidate) => void;
+  onFeedback?: (candidateId: string, value: "good" | "bad" | "maybe") => void;
+  feedbackById?: Record<string, "good" | "bad" | "maybe">;
 }
 
 type Tab = "short" | "medium" | "long";
@@ -47,6 +49,19 @@ function kindLabel(kind: string, isJa: boolean): string {
   if (kind === "short") return isJa ? "Shorts" : "Shorts";
   if (kind === "medium") return isJa ? "通常" : "Standard";
   return isJa ? "長尺" : "Long";
+}
+
+function categoryLabel(category: string | undefined, isJa: boolean): string {
+  const c = category || "general";
+  const ja: Record<string, string> = {
+    funny: "爆笑", surprise: "驚き", clip_worthy: "切り抜き向き", hype: "神展開",
+    accident: "事故/ハプニング", cute: "かわいい", chat_spike: "盛り上がり", general: "総合",
+  };
+  const en: Record<string, string> = {
+    funny: "Funny", surprise: "Surprise", clip_worthy: "Clip-worthy", hype: "Hype",
+    accident: "Accident", cute: "Cute", chat_spike: "Chat spike", general: "General",
+  };
+  return (isJa ? ja[c] : en[c]) || c;
 }
 
 const TAB_LABELS_JA: Record<Tab, string> = { short: "Shorts", medium: "通常", long: "長尺" };
@@ -92,9 +107,11 @@ function getGrade(ratio: number): { label: string; color: string; bg: string } {
   return GRADE_CONFIG[GRADE_CONFIG.length - 1];
 }
 
-function CandidateCard({ c, isSelected, isExporting, isExported, maxScore, onSelect, onExport }: {
+function CandidateCard({ c, isSelected, isExporting, isExported, maxScore, onSelect, onExport, onFeedback, feedback }: {
   c: Candidate; isSelected: boolean; isExporting: boolean; isExported: boolean;
   maxScore: number; onSelect: () => void; onExport: () => void;
+  onFeedback?: (value: "good" | "bad" | "maybe") => void;
+  feedback?: "good" | "bad" | "maybe";
 }) {
   const { locale } = useI18n();
   const isJa = locale === "ja";
@@ -103,7 +120,7 @@ function CandidateCard({ c, isSelected, isExporting, isExported, maxScore, onSel
   const ratio = maxScore > 0 ? c.score / maxScore : 0;
   const grade = getGrade(ratio);
   const stars = Math.round(ratio * 5);
-  const pct = Math.round(ratio * 100);
+  const pct = Math.round(c.confidence ?? ratio * 100);
   const title = extractTitle(c);
   const reasons = getNonTitleReasons(c);
   const peakCount = c.peak_count || c.peak_centers?.length || 1;
@@ -135,6 +152,9 @@ function CandidateCard({ c, isSelected, isExporting, isExported, maxScore, onSel
               ✓ {isJa ? "生成済み" : "Done"}
             </span>
           )}
+          <span className="text-[9px] text-violet-300 bg-violet-500/10 px-1.5 py-0.5 rounded-full shrink-0">
+            {categoryLabel(c.category, isJa)}
+          </span>
         </div>
         <div className={`text-lg font-bold ${grade.color} shrink-0`}>{grade.label}</div>
       </div>
@@ -208,12 +228,49 @@ function CandidateCard({ c, isSelected, isExporting, isExported, maxScore, onSel
         </div>
       )}
 
+      {c.representative_comments && c.representative_comments.length > 0 && (
+        <div className="mb-2 space-y-1">
+          <div className="text-[9px] text-slate-500">{isJa ? "代表コメント" : "Representative comments"}</div>
+          {c.representative_comments.slice(0, 3).map((comment, i) => (
+            <div key={`${comment.time_sec}-${i}`} className="text-[10px] text-slate-300 bg-slate-900/40 border border-slate-700/40 rounded px-2 py-1 leading-snug">
+              <span className="text-cyan-300 font-mono mr-1">{fmtClock(comment.time_sec)}</span>
+              {comment.author && <span className="text-slate-500 mr-1">{comment.author}:</span>}
+              <span>{comment.message}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Quick stat row (subtle) */}
       <div className="flex items-center gap-2 text-[9px] text-slate-600 mb-2">
         <span>💬 {c.chat_count}</span>
         <span>👤 {c.unique_author_count}</span>
         <span>🔥 {c.keyword_hits}{isJa ? "反応" : " reactions"}</span>
+        {c.overlap_group && <span>🔗 {c.overlap_group}</span>}
       </div>
+
+      {onFeedback && (
+        <div className="flex gap-1 mb-2">
+          {([
+            ["good", isJa ? "良い" : "Good"],
+            ["maybe", isJa ? "微妙" : "Maybe"],
+            ["bad", isJa ? "違う" : "Bad"],
+          ] as const).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onFeedback(value); }}
+              className={`px-2 py-1 rounded-full text-[9px] border transition-colors ${
+                feedback === value
+                  ? "border-cyan-400/70 bg-cyan-500/15 text-cyan-200"
+                  : "border-slate-700/50 bg-slate-900/30 text-slate-500 hover:text-slate-300"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* Action buttons */}
       <div className="flex gap-2">
@@ -260,7 +317,7 @@ function CandidateCard({ c, isSelected, isExporting, isExported, maxScore, onSel
   );
 }
 
-export default function CandidateTabs({ short, medium, long, selectedCandidateId, exportingCandidateIds, exportedCandidateIds, onSelect, onExport }: Props) {
+export default function CandidateTabs({ short, medium, long, selectedCandidateId, exportingCandidateIds, exportedCandidateIds, onSelect, onExport, onFeedback, feedbackById = {} }: Props) {
   const { locale } = useI18n();
   const isJa = locale === "ja";
   const [tab, setTab] = useState<Tab>("short");
@@ -303,7 +360,9 @@ export default function CandidateTabs({ short, medium, long, selectedCandidateId
             isSelected={selectedCandidateId === c.candidate_id}
             isExporting={exportingCandidateIds.has(c.candidate_id)}
             isExported={exportedCandidateIds.has(c.candidate_id)}
-            maxScore={maxScore} onSelect={() => onSelect(c)} onExport={() => onExport(c)} />
+            maxScore={maxScore} onSelect={() => onSelect(c)} onExport={() => onExport(c)}
+            onFeedback={onFeedback ? (value) => onFeedback(c.candidate_id, value) : undefined}
+            feedback={feedbackById[c.candidate_id]} />
         ))
       )}
     </div>

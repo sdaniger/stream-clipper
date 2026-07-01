@@ -202,6 +202,21 @@ def test_generate_all_candidates_keys():
     assert isinstance(result["long"], list)
 
 
+def test_candidates_include_quality_metadata():
+    msgs = [
+        ChatMessage(timestamp=100 + i * 0.5, author=f"u{i}", message="ここ切り抜き 草 えぐ 神展開")
+        for i in range(20)
+    ]
+    timeline = build_timeline(msgs, window=30, step=10)
+    cands = generate_short_candidates(timeline, top_n=1, vod_duration=300)
+    assert cands
+    c = cands[0]
+    assert c.category in {"funny", "surprise", "clip_worthy", "hype"}
+    assert c.confidence > 0
+    assert c.representative_comments
+    assert c.overlap_group
+
+
 def test_short_candidates_include_high_score_peak():
     msgs = _mk_messages([600], chat_per_window=80, dur=1800)
     timeline = build_timeline(msgs, window=30, step=10)

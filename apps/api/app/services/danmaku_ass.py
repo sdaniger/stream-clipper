@@ -238,7 +238,7 @@ def estimate_text_width(text: str, font_size: int) -> int:
     """
     Approximate the rendered pixel width of a comment.
 
-    Heuristic (close enough for ASS \move end_x):
+    Heuristic (close enough for ASS \\move end_x):
     - CJK and full-width characters: ~ 0.60 * font_size
     - Latin / half-width:           ~ 0.35 * font_size
     - Emoji:                        ~ 0.85 * font_size

@@ -50,6 +50,9 @@ def _extract_video_id(url: str) -> Optional[str]:
     m = re.search(r"/videos?/(\d+)", url)
     if m:
         return m.group(1)
+    m = re.search(r"/[^/]+/video/(\d+)", url)
+    if m:
+        return m.group(1)
     m = re.search(r"[?&]video=(\d+)", url)
     if m:
         return m.group(1)
@@ -168,6 +171,8 @@ def _fetch_twitch_chat_direct(vod_id: str, max_messages: int = 50000,
     # Check cache first
     cached = _cache_get(vod_id)
     if cached is not None:
+        if on_progress:
+            on_progress(len(cached), 1, 1)
         return {"ok": True, "messages": cached, "cached": True}
 
     import requests as req
@@ -180,6 +185,7 @@ def _fetch_twitch_chat_direct(vod_id: str, max_messages: int = 50000,
         "Content-Type": "text/plain;charset=UTF-8",
         "Origin": "https://www.twitch.tv",
         "Referer": "https://www.twitch.tv/",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
     }
 
     # Get integrity token
@@ -200,10 +206,8 @@ def _fetch_twitch_chat_direct(vod_id: str, max_messages: int = 50000,
 
     # Dynamic thread count: 4 for short VODs, up to 16 for long ones.
     thread_count = max(4, min(16, int((duration + 299) // 300)))
-    segment_count = min(max_messages // 200, 100)
-    if segment_count < 1:
-        segment_count = 1
-    comments_per_segment = max(200, max_messages // segment_count)
+    segment_count = max(1, min(max_messages // 200, 100))
+    comments_per_segment = max(1, max_messages // segment_count)
 
     shared_seen: Set[str] = set()
     seen_lock = threading.Lock()
@@ -259,6 +263,9 @@ def _fetch_twitch_chat_direct(vod_id: str, max_messages: int = 50000,
         while fetched < seg_limit:
             if time.time() >= deadline:
                 break
+            with total_lock:
+                if total[0] >= max_messages:
+                    break
             try:
                 data = _gql_page(page_offset)
             except Exception:
@@ -287,6 +294,7 @@ def _fetch_twitch_chat_direct(vod_id: str, max_messages: int = 50000,
             stale = 0
             parsed = _parse_edges(edges)
             max_os = page_offset
+            appended = 0
             for item in parsed:
                 cid = item.pop("_cid", "")
                 ts = item["timestamp"]
@@ -303,12 +311,19 @@ def _fetch_twitch_chat_direct(vod_id: str, max_messages: int = 50000,
                 with results_lock:
                     all_messages.append(item)
                 fetched += 1
+                appended += 1
                 if ts > max_os:
                     max_os = ts
                 if on_progress and (current % progress_interval == 0 or current <= 100):
-                    on_progress(min(current, max_messages))
+                    on_progress(min(current, max_messages), None, segment_count)
                 if fetched >= seg_limit:
                     break
+            if appended == 0:
+                stale += 1
+                if stale >= 3:
+                    break
+            else:
+                stale = 0
             if fetched < seg_limit:
                 page_offset = int(max_os) + 3
         return fetched
@@ -320,13 +335,15 @@ def _fetch_twitch_chat_direct(vod_id: str, max_messages: int = 50000,
             seg_offset = int(seg * duration / segment_count)
             futures[executor.submit(fetch_segment, seg_offset, comments_per_segment)] = seg
 
+        completed_segments = 0
         for future in as_completed(futures):
             try:
                 future.result()
+                completed_segments += 1
                 if on_progress:
                     with total_lock:
                         current = total[0]
-                    on_progress(min(current, max_messages))
+                    on_progress(min(current, max_messages), completed_segments, segment_count)
             except Exception as e:
                 import logging
                 logging.getLogger("analyze_job").warning("Chat segment fetch failed: %s", e)
@@ -341,7 +358,7 @@ def _fetch_twitch_chat_direct(vod_id: str, max_messages: int = 50000,
     if not all_messages:
         return {"ok": False, "error_code": "TWITCH_CHAT_FAILED", "message": "No chat messages could be fetched"}
     if on_progress:
-        on_progress(len(all_messages))
+        on_progress(len(all_messages), segment_count, segment_count)
 
     # Cache
     _cache_set(vod_id, all_messages)
@@ -362,7 +379,7 @@ def _fetch_chat_with_chat_downloader(
     """
     # For Twitch VODs, go directly to API (skip broken chat-downloader CLI)
     import re as _re
-    m = _re.search(r'(?:twitch\.tv/videos/|videos/)(\d+)', url)
+    m = _re.search(r'(?:twitch\.tv/videos?/|videos?/)(\d+)', url) or _re.search(r'/[^/]+/video/(\d+)', url)
     if m:
         vid = m.group(1)
         result = _fetch_twitch_chat_direct(vid, max_messages, on_progress=on_progress, duration_seconds=duration_seconds)
@@ -531,13 +548,19 @@ def run_analyze_job(
     elif vod_url:
         vod_dur = (metadata.get("duration_seconds") if metadata else None)
         max_messages = _default_chat_limit_for_duration(int(vod_dur) if vod_dur else None)
+        def _chat_progress(n: int, completed_segments: Optional[int] = None, total_segments: Optional[int] = None) -> None:
+            segment_text = ""
+            if completed_segments is not None and total_segments:
+                segment_text = f" / segments {completed_segments}/{total_segments}"
+            update_stage(
+                job, JobStage.CHAT_FETCHING,
+                f"Twitchチャット取得中: {n} メッセージ{segment_text}",
+                compute_stage_progress(JobStage.CHAT_FETCHING, min(0.95, n / max_messages)),
+            )
+
         result = _fetch_chat_with_chat_downloader(
             vod_url, max_messages,
-            on_progress=lambda n: update_stage(
-                job, JobStage.CHAT_FETCHING,
-                f"Twitchチャット取得中: {n} メッセージ",
-                compute_stage_progress(JobStage.CHAT_FETCHING, min(0.95, n / max_messages)),
-            ),
+            on_progress=_chat_progress,
             duration_seconds=int(vod_dur) if vod_dur else None,
         )
         if not result.get("ok"):
@@ -673,6 +696,11 @@ def run_analyze_job(
     serialized = {
         kind: [c.to_dict() for c in cands] for kind, cands in all_cands.items()
     }
+    category_counts: Dict[str, int] = {}
+    for cands in serialized.values():
+        for c in cands:
+            cat = str(c.get("category") or "general")
+            category_counts[cat] = category_counts.get(cat, 0) + 1
     timeline_dicts = [w.to_dict() for w in timeline]
 
     # Include normalized chat (compact) so the client can compute
@@ -688,6 +716,7 @@ def run_analyze_job(
         compute_stage_progress(JobStage.CANDIDATE_GENERATION, 1.0),
         result_patch={
             "candidates": serialized,
+            "category_counts": category_counts,
             "timeline": timeline_dicts,
             "vod_title": vod_title,
             "streamer": streamer,

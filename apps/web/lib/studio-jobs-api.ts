@@ -111,6 +111,10 @@ export interface Candidate {
   sustained_chat_score?: number;
   dead_air_penalty?: number;
   long_score?: number;
+  category?: "funny" | "surprise" | "clip_worthy" | "hype" | "accident" | "cute" | "chat_spike" | "general" | string;
+  confidence?: number;
+  representative_comments?: Array<{ time_sec: number; author?: string; message: string; signal_score?: number }>;
+  overlap_group?: string | null;
   // Back-compat with the old HighlightCandidate used by VideoArea
   id?: string | number;
   title?: string;

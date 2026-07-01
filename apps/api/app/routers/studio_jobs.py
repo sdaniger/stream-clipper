@@ -123,7 +123,7 @@ class RenderJobRequest(BaseModel):
         default=None,
         description="Style preset name: niconico_classic | twitch_extension_like | minimal | dense",
     )
-    ffmpeg_preset: str = "veryfast"
+    ffmpeg_preset: str = "fast"
     ffmpeg_crf: int = 23
     target_aspect: str = "16:9"
     streamer_name: Optional[str] = None
@@ -216,7 +216,7 @@ async def start_render(req: RenderJobRequest) -> AnalyzeJobResponse:
         comment_burn_in_mode=req.comment_burn_in_mode,
         danmaku_style_preset=req.danmaku_style_preset,
     )
-    asyncio.create_task(run_render_job_async(job, rr))
+    _track_task(asyncio.create_task(run_render_job_async(job, rr)))
     return AnalyzeJobResponse(
         job_id=job.job_id,
         status=job.status.value,
@@ -246,17 +246,11 @@ async def start_preview_render(req: PreviewJobRequest) -> AnalyzeJobResponse:
         preview_width=req.preview_width,
         preview_height=req.preview_height,
     )
-    asyncio.create_task(run_preview_job_async(job, pr))
+    _track_task(asyncio.create_task(run_preview_job_async(job, pr)))
     return AnalyzeJobResponse(
         job_id=job.job_id,
         status=job.status.value,
         message="preview job started",
-    )
-    _track_task(asyncio.create_task(run_render_job_async(job, rr)))
-    return AnalyzeJobResponse(
-        job_id=job.job_id,
-        status=job.status.value,
-        message="render job started",
     )
 
 

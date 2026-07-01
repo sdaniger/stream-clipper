@@ -421,9 +421,10 @@ export default function Step3ExportPanel({
                       setFfmpegPreset(p as any);
                       setFfmpegCrf(Number(c));
                     }} className="bg-slate-900/60 border border-slate-700/40 rounded text-[10px] px-1 py-0.5 flex-1 text-slate-200">
-                      <option value="ultrafast/26">{isJa ? "高速" : "Fast"}</option>
-                      <option value="veryfast/23">{isJa ? "標準" : "Standard"}</option>
-                      <option value="medium/20">{isJa ? "高品質" : "High Quality"}</option>
+                      <option value="veryfast/24">{isJa ? "高速" : "Fast"}</option>
+                      <option value="fast/23">{isJa ? "標準・省容量" : "Balanced compact"}</option>
+                      <option value="medium/22">{isJa ? "高品質・省容量" : "High quality compact"}</option>
+                      <option value="slow/21">{isJa ? "最小容量" : "Smallest file"}</option>
                     </select>
                   </div>
                   <div className="flex items-center gap-1.5 px-2 py-1.5 rounded bg-slate-800/40">

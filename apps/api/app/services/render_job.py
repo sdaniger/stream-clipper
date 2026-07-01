@@ -83,6 +83,7 @@ def _fetch_twitch_range(
     start: float,
     end: float,
     output_dir: Path,
+    target_aspect: str = "16:9",
 ) -> Dict[str, Any]:
     """
     Use twitch_range_fetcher to download a Twitch VOD time range.
@@ -99,7 +100,7 @@ def _fetch_twitch_range(
         start_seconds=start,
         end_seconds=end,
         output_dir=str(output_dir),
-        format="bv*[height<=1080]+ba/best",
+        format="bv*[height<=1080]+ba/best" if target_aspect == "9:16" else "bv*[height<=720]+ba/best[height<=720]/best",
     )
     result = fetch_twitch_range(req)
     if result.ok:
@@ -213,7 +214,7 @@ def _ffmpeg_burn_ass(
     ass_path: Optional[Path],
     start: float,
     duration: float,
-    preset: str = "veryfast",
+    preset: str = "fast",
     crf: int = 23,
     with_danmaku: bool = True,
     target_aspect: str = "16:9",  # "16:9" | "9:16"
@@ -232,11 +233,25 @@ def _ffmpeg_burn_ass(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if target_aspect == "9:16":
-        # Shorts: 9:16 (608x1080) with crop
-        vf_parts = ["crop=ih*9/16:ih:(in_w-ih*9/16)/2:0"]
+        # Shorts: crop center then produce a standard 1080x1920 vertical MP4.
+        vf_parts = ["crop=ih*9/16:ih:(in_w-ih*9/16)/2:0", "scale=1080:1920"]
     else:
         # 16:9 - no transform
         vf_parts = []
+
+    audio_bitrate = "96k" if duration >= 180 else "128k"
+    encode_args = [
+        "-c:v", "libx264",
+        "-preset", preset,
+        "-crf", str(crf),
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "high",
+        "-x264-params", "keyint=120:min-keyint=24:scenecut=40",
+        "-threads", "0",
+        "-c:a", "aac",
+        "-b:a", audio_bitrate,
+        "-movflags", "+faststart",
+    ]
 
     if with_danmaku and ass_path is not None:
         ass_filter_value = str(ass_path).replace("\\", "/").replace(":", "\\:")
@@ -256,18 +271,20 @@ def _ffmpeg_burn_ass(
         args += ["-t", f"{duration:.3f}"]
         if vf_parts:
             args += ["-vf", ",".join(vf_parts)]
-        args += [
-            "-c:v", "libx264",
-            "-preset", preset,
-            "-crf", str(crf),
-            "-threads", "0",
-            "-c:a", "aac",
-            "-b:a", "128k",
+        args += [*encode_args, str(output_path)]
+    elif not vf_parts:
+        # No visual filter: stream copy is both faster and lossless.
+        args = [
+            "ffmpeg", "-y",
+            "-ss", f"{start:.3f}",
+            "-i", str(input_path),
+            "-t", f"{duration:.3f}",
+            "-c", "copy",
             "-movflags", "+faststart",
             str(output_path),
         ]
     else:
-        # No danmaku: reencode to MP4
+        # Visual transform without danmaku: reencode to MP4.
         args = [
             "ffmpeg", "-y",
             "-ss", f"{start:.3f}",
@@ -276,16 +293,7 @@ def _ffmpeg_burn_ass(
         ]
         if vf_parts:
             args += ["-vf", ",".join(vf_parts)]
-        args += [
-            "-c:v", "libx264",
-            "-preset", preset,
-            "-crf", str(crf),
-            "-threads", "0",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-movflags", "+faststart",
-            str(output_path),
-        ]
+        args += [*encode_args, str(output_path)]
 
     try:
         proc = subprocess.run(args, capture_output=True, text=True, timeout=1800)
@@ -332,7 +340,7 @@ class RenderRequest:
     options: Optional[Dict[str, Any]] = None
     output_dir: str = "output/clips"
     with_danmaku: bool = True
-    ffmpeg_preset: str = "veryfast"
+    ffmpeg_preset: str = "fast"
     ffmpeg_crf: int = 23
     target_aspect: str = "16:9"  # "16:9" | "9:16"
     streamer_name: Optional[str] = None
@@ -416,6 +424,12 @@ def _run_render_job_inner(
     # Resolve effective comment burn-in mode (handles new + legacy fields)
     effective_burn_in = _resolve_burn_in_mode(req)
     should_burn_danmaku = effective_burn_in in ("hard_burn", "preview_overlay")
+    allowed_presets = {"ultrafast", "veryfast", "fast", "medium", "slow"}
+    if req.ffmpeg_preset not in allowed_presets:
+        req.ffmpeg_preset = "fast"
+    req.ffmpeg_crf = max(18, min(30, int(req.ffmpeg_crf)))
+    if req.target_aspect not in ("16:9", "9:16"):
+        req.target_aspect = "16:9"
     update_stage(
         job, job.current_stage, f"コメント: {effective_burn_in}",
         result_patch={"comment_burn_in_mode": effective_burn_in},
@@ -449,7 +463,7 @@ def _run_render_job_inner(
         else:
             tmp_dir = output_dir / "tmp"
             fetch = _fetch_twitch_range(
-                req.vod_url, req.video_id or "", clip_start, clip_end, tmp_dir,
+                req.vod_url, req.video_id or "", clip_start, clip_end, tmp_dir, req.target_aspect,
             )
             if not fetch.get("ok"):
                 # If a local file is available, fall back to it.

@@ -72,6 +72,10 @@ class Candidate:
     sustained_chat_score: float = 0.0
     dead_air_penalty: float = 0.0
     long_score: float = 0.0
+    category: str = "general"
+    confidence: float = 0.0
+    representative_comments: List[dict] = field(default_factory=list)
+    overlap_group: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -146,7 +150,75 @@ def _aggregate_windows(
         "burst_score": burst,
         "total_score": total,
         "matched_keywords": list(set(matched)),
+        "representative_comments": _merge_representative_comments(windows, indices),
     }
+
+
+def _merge_representative_comments(windows: Sequence[TimelineWindow], indices: Sequence[int], limit: int = 5) -> List[dict]:
+    out: List[dict] = []
+    seen: Set[str] = set()
+    for i in sorted(indices, key=lambda k: windows[k].total_score, reverse=True):
+        for c in getattr(windows[i], "representative_comments", []) or []:
+            msg = str(c.get("message", "")).strip()
+            key = msg.lower()
+            if not msg or key in seen:
+                continue
+            seen.add(key)
+            out.append(c)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def _candidate_category(laugh: float, surprise: float, clip_worthy: float, burst: float, matched: Sequence[str]) -> str:
+    joined = " ".join(matched).lower()
+    if any(k in joined for k in ("事故", "放送事故", "bug", "バグ", "落ちた")):
+        return "accident"
+    if any(k in joined for k in ("かわいい", "可愛い", "尊い", "助かる")):
+        return "cute"
+    scores = {
+        "funny": laugh,
+        "surprise": surprise,
+        "clip_worthy": clip_worthy,
+        "hype": clip_worthy + burst * 0.4,
+    }
+    return max(scores, key=scores.get) if any(v > 0 for v in scores.values()) else "chat_spike"
+
+
+def _confidence(score: float, max_score: float, unique_authors: int, reaction_hits: int, peak_count: int = 1) -> float:
+    ratio = score / max(1.0, max_score)
+    value = 45.0 + ratio * 35.0 + min(15.0, unique_authors * 1.2) + min(10.0, reaction_hits * 0.4) + min(8.0, (peak_count - 1) * 3.0)
+    return round(max(0.0, min(99.0, value)), 1)
+
+
+def _adjust_short_range(windows: Sequence[TimelineWindow], peak_index: int, start: float, end: float, vod_duration: Optional[float]) -> Tuple[float, float]:
+    peak = windows[peak_index]
+    threshold = max(1.0, peak.total_score * 0.35)
+    left = peak_index
+    while left > 0 and peak.center - windows[left - 1].center <= 45 and windows[left - 1].total_score >= threshold:
+        left -= 1
+    right = peak_index
+    while right + 1 < len(windows) and windows[right + 1].center - peak.center <= 60 and windows[right + 1].total_score >= threshold:
+        right += 1
+    req_start = min(start, max(0.0, windows[left].start - 8.0))
+    req_end = max(end, windows[right].end + 12.0)
+    return _safe_clip_range(req_start, req_end, SHORT_MIN, SHORT_MAX, vod_duration)
+
+
+def _assign_overlap_groups(candidates: List[Candidate]) -> None:
+    groups: List[Tuple[str, float, float]] = []
+    for c in sorted(candidates, key=lambda item: item.clip_start):
+        assigned = None
+        for group_id, start, end in groups:
+            overlap = max(0.0, min(c.clip_end, end) - max(c.clip_start, start))
+            denom = max(1.0, min(c.clip_duration, end - start))
+            if overlap / denom >= 0.5:
+                assigned = group_id
+                break
+        if assigned is None:
+            assigned = f"scene_{len(groups) + 1:03d}"
+            groups.append((assigned, c.clip_start, c.clip_end))
+        c.overlap_group = assigned
 
 
 def _topic_coherence(
@@ -235,6 +307,7 @@ def generate_short_candidates(
       - Enforce min_gap between candidate centers
     """
     candidates: List[Candidate] = []
+    max_score = max((w.total_score for w in windows), default=0.0)
     ranked = sorted(
         [i for i, w in enumerate(windows) if w.total_score > min_score],
         key=lambda i: windows[i].total_score,
@@ -258,6 +331,7 @@ def generate_short_candidates(
         clip_start, clip_end = _safe_clip_range(
             req_start, req_end, SHORT_MIN, SHORT_MAX, vod_duration
         )
+        clip_start, clip_end = _adjust_short_range(windows, i, clip_start, clip_end, vod_duration)
 
         agg = _aggregate_windows(windows, [i])
         reasons = _build_short_reasons(w, agg)
@@ -287,8 +361,12 @@ def generate_short_candidates(
             peak_centers=[w.center],
             matched_keywords=agg["matched_keywords"],
             reasons=reasons,
+            category=_candidate_category(agg["laugh_score"], agg["surprise_score"], agg["clip_worthy_score"], agg["burst_score"], agg["matched_keywords"]),
+            confidence=_confidence(w.total_score, max_score, int(agg["unique_author_count_max"]), int(agg["keyword_hits"])),
+            representative_comments=agg["representative_comments"],
         ))
 
+    _assign_overlap_groups(candidates)
     return candidates
 
 
@@ -340,6 +418,7 @@ def generate_medium_candidates(
 
     used: Set[int] = set()
     candidates: List[Candidate] = []
+    max_score = max((w.total_score for w in windows), default=0.0)
 
     for i in indices:
         if i in used:
@@ -421,6 +500,9 @@ def generate_medium_candidates(
             topic_coherence_score=round(coherence, 3),
             sustained_chat_score=round(_sustained_chat_score(windows, cluster), 3),
             dead_air_penalty=round(dead_air, 3),
+            category=_candidate_category(agg["laugh_score"], agg["surprise_score"], agg["clip_worthy_score"], agg["burst_score"], agg["matched_keywords"]),
+            confidence=_confidence(score, max_score * max(1, len(cluster)), int(agg["unique_author_count_max"]), int(agg["keyword_hits"]), len(cluster)),
+            representative_comments=agg["representative_comments"],
         ))
 
         if len(candidates) >= top_n:
@@ -431,6 +513,7 @@ def generate_medium_candidates(
     for idx, c in enumerate(candidates, 1):
         c.rank = idx
         c.candidate_id = f"medium_{idx:03d}"
+    _assign_overlap_groups(candidates)
     return candidates
 
 
@@ -556,6 +639,7 @@ def generate_long_candidates(
         runs.append(run)
 
     candidates: List[Candidate] = []
+    max_score = max((w.total_score for w in windows), default=0.0)
 
     for run in runs:
         if not run:
@@ -636,6 +720,9 @@ def generate_long_candidates(
             sustained_chat_score=round(sustained, 3),
             dead_air_penalty=round(dead_air, 3),
             long_score=round(long_score, 3),
+            category=_candidate_category(agg["laugh_score"], agg["surprise_score"], agg["clip_worthy_score"], agg["burst_score"], agg["matched_keywords"]),
+            confidence=_confidence(long_score, max_score * max(1, peak_count), int(agg["unique_author_count_max"]), int(agg["keyword_hits"]), peak_count),
+            representative_comments=agg["representative_comments"],
         ))
 
         if len(candidates) >= top_n:
@@ -645,6 +732,7 @@ def generate_long_candidates(
     for idx, c in enumerate(candidates, 1):
         c.rank = idx
         c.candidate_id = f"long_{idx:03d}"
+    _assign_overlap_groups(candidates)
     return candidates
 
 
@@ -688,7 +776,7 @@ def generate_all_candidates(
     """
     Run all three candidate generators and return a dict keyed by kind.
     """
-    return {
+    result = {
         "short": generate_short_candidates(
             windows, top_n=short_top, vod_duration=vod_duration, min_score=min_score,
         ),
@@ -699,3 +787,6 @@ def generate_all_candidates(
             windows, top_n=long_top, vod_duration=vod_duration, min_score=min_score,
         ),
     }
+    all_candidates = result["short"] + result["medium"] + result["long"]
+    _assign_overlap_groups(all_candidates)
+    return result

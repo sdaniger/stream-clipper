@@ -78,10 +78,10 @@ function contextAfterSeconds(windowSeconds: number) {
 }
 
 const reactionRules: Record<Exclude<ReactionKind, "general">, RegExp[]> = {
-  laughter: [/草+/, /w{2,}/i, /ｗ{2,}/, /笑+/, /爆笑/, /lol/i, /lmao/i, /haha/i, /ハハ/],
-  surprise: [/え[!?！？]?/, /待って/, /まじ|マジ/, /やば|ヤバ/, /うそ|嘘/, /no way/i, /what/i, /wtf/i, /omg/i, /[!?！？]{2,}/],
-  praise: [/うま|上手|うますぎ/, /すご|凄/, /神/, /天才/, /かわいい|可愛い/, /nice/i, /clutch/i, /gg/i, /beautiful/i, /泣|cry/i],
-  clip: [/clip/i, /クリップ/, /切り抜き|切抜き/, /タイムスタンプ|timestamp/i, /ここ好き/]
+  laughter: [/草+/, /w{2,}/i, /ｗ{2,}/, /笑+/, /爆笑/, /lol/i, /lmao/i, /haha/i, /ハハ/, /しぬ|死ぬ/, /腹筋/, /おもろすぎ/, /ワロ/, /草ァ/],
+  surprise: [/え[!?！？]?/, /待って|まって/, /まじ|マジ/, /やば|ヤバ/, /うそ|嘘/, /no way/i, /what/i, /wtf/i, /omg/i, /[!?！？]{2,}/, /は？/, /えぐ|エグ/, /こわ|怖/, /なんで/],
+  praise: [/うま|上手|うますぎ/, /すご|凄/, /神/, /天才/, /かわいい|可愛い/, /尊い/, /助かる/, /鳥肌/, /8888/, /nice/i, /clutch/i, /gg/i, /beautiful/i, /泣|cry/i],
+  clip: [/clip/i, /クリップ/, /切り抜き|切抜き/, /タイムスタンプ|timestamp/i, /ここ好き/, /ここ切り抜き/, /撮れ高/, /神展開/, /神回/, /放送事故|事故/]
 };
 
 const reactionLabels: Record<ReactionKind, string> = {
@@ -270,7 +270,8 @@ function buildBuckets(entries: ChatLogEntry[], windowSec: number, keywordWeight 
     const bucketEntries = bucketMap.get(index) ?? [];
     const reactionCounts = countReactions(bucketEntries);
     const uniqueAuthors = new Set(bucketEntries.map((entry) => entry.author_name)).size;
-    const keywordScore = reactionCounts.laughter * 1.8 + reactionCounts.surprise * 2 + reactionCounts.praise * 1.5 + reactionCounts.clip * 2.5;
+  const repeatedAuthorPenalty = bucketEntries.length > 0 ? uniqueAuthors / bucketEntries.length : 0;
+  const keywordScore = reactionCounts.laughter * 1.8 + reactionCounts.surprise * 2 + reactionCounts.praise * 1.5 + reactionCounts.clip * 2.5;
 
     buckets.push({
       index,
@@ -279,7 +280,7 @@ function buildBuckets(entries: ChatLogEntry[], windowSec: number, keywordWeight 
       entries: bucketEntries,
       uniqueAuthors,
       reactionCounts,
-      signalScore: bucketEntries.length + uniqueAuthors * 0.8 + keywordScore * keywordWeight
+      signalScore: bucketEntries.length + uniqueAuthors * 1.1 + keywordScore * keywordWeight + repeatedAuthorPenalty * 3
     });
   }
 
@@ -802,4 +803,3 @@ export function exportChatAnalysisCsv(
 
   return rows;
 }
-

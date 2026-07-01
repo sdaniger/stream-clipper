@@ -1,14 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
+import { getStudioApiBaseUrl, ensureStudioBackendAvailable, studioApiUnreachableResponse } from "@/lib/server/studio-jobs-proxy";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const API_BASE = process.env.STUDIO_API_BASE_URL ?? "http://127.0.0.1:8000";
-
 export async function POST(_request: NextRequest, ctx: { params: Promise<{ jobId: string }> }) {
   const { jobId } = await ctx.params;
+  await ensureStudioBackendAvailable();
+  const apiBase = getStudioApiBaseUrl();
   try {
-    const res = await fetch(`${API_BASE}/studio/jobs/${jobId}/cancel`, {
+    const res = await fetch(`${apiBase}/studio/jobs/${jobId}/cancel`, {
       method: "POST",
     });
     const text = await res.text();
@@ -17,7 +18,6 @@ export async function POST(_request: NextRequest, ctx: { params: Promise<{ jobId
       headers: { "Content-Type": "application/json" },
     });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "unknown";
-    return NextResponse.json({ ok: false, error_code: "API_UNREACHABLE", message: msg }, { status: 502 });
+    return studioApiUnreachableResponse(e);
   }
 }
