@@ -1,5 +1,6 @@
 import { getBackendApiBaseUrl } from "./api-proxy";
 import { spawn } from "node:child_process";
+import { access } from "node:fs/promises";
 import path from "node:path";
 
 let spawnAttempted = false;
@@ -54,7 +55,7 @@ export async function spawnBackend(): Promise<boolean> {
     spawnAttempted = true;
 
     const apiRoot = findApiRoot();
-    const venvPython = path.join(apiRoot, ".venv", "bin", "uvicorn");
+    const venvUvicorn = path.join(apiRoot, ".venv", "bin", "uvicorn");
     const envFile = path.join(apiRoot, ".env");
 
     try {
@@ -73,11 +74,17 @@ export async function spawnBackend(): Promise<boolean> {
         }
       } catch { /* .env not found, use process.env */ }
 
-      const child = spawn(venvPython, [
-        "app.main:app",
-        "--host", "0.0.0.0",
-        "--port", "8000",
-      ], {
+      let command = "uvicorn";
+      let args = ["app.main:app", "--host", "0.0.0.0", "--port", "8000"];
+      try {
+        await access(venvUvicorn);
+        command = venvUvicorn;
+        args = ["app.main:app", "--host", "0.0.0.0", "--port", "8000"];
+      } catch {
+        // Fall back to the uvicorn executable on PATH when the project venv is absent.
+      }
+
+      const child = spawn(command, args, {
         cwd: apiRoot,
         env: envVars,
         stdio: "ignore",

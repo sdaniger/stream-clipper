@@ -466,7 +466,7 @@ export async function runArchiveAutoAnalysis(
       if (spawned) {
         backendAvailable = true;
       } else {
-        warnings.push({ stage: "transcription", message: "Python transcription backend is not running and could not be auto-started. Transcription will be skipped for all candidates. Start the backend with: cd apps/api && .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000" });
+        warnings.push({ stage: "transcription", message: "Python transcription backend is not running and could not be auto-started. Transcription will be skipped for all candidates. Start the backend with: cd apps/api && uvicorn app.main:app --host 127.0.0.1 --port 8000" });
         shouldTranscribe = false;
       }
     } else {
